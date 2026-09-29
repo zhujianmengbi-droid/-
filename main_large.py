@@ -55,7 +55,7 @@ from main import App, STYLE, Backdrop, TitleBar, label, panel
 
 # The version is also used as the GitHub release tag (for example, v2026.09.29).
 # Bump it when publishing a new release so existing installations can discover it.
-APP_VERSION = '2026.09.30.5'
+APP_VERSION = '2026.09.30.6'
 GITHUB_REPOSITORY = 'zhujianmengbi-droid/-'
 GITHUB_REPOSITORY_URL = f'https://github.com/{GITHUB_REPOSITORY}'
 GITHUB_LATEST_RELEASE_API = (
@@ -5493,6 +5493,12 @@ class LargeApp(App):
 
     def _chat_bound_game_id(self):
         value = str(self._settings.value(GAME_ID_SETTINGS_KEY, self._game_id) or '').strip()
+        # Keep the legacy chat key in lockstep with the verified login key.
+        # Older builds could leave these two settings different after a
+        # rebind, which made the visible identity and WebSocket identity drift.
+        if value and str(self._settings.value('chat/gameId', '') or '').strip() != value:
+            self._settings.setValue('chat/gameId', value)
+            self._settings.sync()
         return value
 
     def game_id(self):
@@ -5502,6 +5508,7 @@ class LargeApp(App):
     def set_game_id(self, game_id):
         """统一写入启动登录和大厅聊天共用的游戏 ID。"""
         game_id = str(game_id or '').strip()
+        identity_changed = game_id != self._game_id
         self._game_id = game_id
         if hasattr(self, '_player_id'):
             self._player_id = game_id
@@ -5513,7 +5520,17 @@ class LargeApp(App):
             self.match_player_input.setText(game_id)
         if hasattr(self, 'chat_account_input'):
             self.chat_account_input.setText(game_id)
+        if identity_changed and hasattr(self, '_chat_client'):
+            self._chat_client.stop()
+            self._chat_pending_message = ''
+            self._chat_sending_message = ''
+            if hasattr(self, 'chat_input'):
+                self.chat_input.clear()
+            self._chat_messages = []
+            self._chat_message_keys.clear()
         self._refresh_chat_identity()
+        if identity_changed and game_id and hasattr(self, 'chat_input'):
+            self._poll_lobby_chat()
 
     def _refresh_chat_identity(self, preserve_status=False):
         if not hasattr(self, 'chat_input'):
@@ -5606,6 +5623,14 @@ class LargeApp(App):
             self.chat_input.setFocus()
             return
         if self._chat_sending_message:
+            return
+        self._refresh_chat_identity(preserve_status=True)
+        # A rebind can happen while the old socket is still connected. Never
+        # let that socket publish under the previous player's ID.
+        if self._chat_client.player_id != player_id:
+            self._chat_pending_message = message
+            self.chat_status.setText('正在切换大厅身份…')
+            self._chat_client.start(player_id)
             return
         if not self._chat_client.joined:
             self._chat_pending_message = message
