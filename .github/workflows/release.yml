@@ -31,17 +31,17 @@ jobs:
         run: Expand-Archive -LiteralPath "source/逐渐优化器-v2026.09.30.2-source.zip" -DestinationPath "build-source" -Force
 
       - name: Install application dependencies
-        run: python -m pip install --upgrade -r build-source/源码/requirements.txt
+        run: python -m pip install --upgrade -r build-source/requirements.txt
 
       - name: Build Windows executable
-        working-directory: build-source/源码
+        working-directory: build-source
         run: python build_large.py
 
       - name: Create or update GitHub Release
         shell: pwsh
         run: |
           $tag = "v2026.09.30.2"
-          $asset = "build-source/源码/dist/逐渐优化器.exe"
+          $asset = "build-source/dist/逐渐优化器.exe"
           $downloadAsset = "build-source/DEV-King-Optimizer-v2026.09.30.2.exe"
           $sourceAsset = "build-source/逐渐优化器-v2026.09.30.2-source.zip"
           if (!(Test-Path -LiteralPath $asset)) { throw "Build output not found: $asset" }
