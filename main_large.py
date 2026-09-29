@@ -10,6 +10,7 @@ import time
 import json
 import re
 import ctypes
+import uuid
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from functools import lru_cache
@@ -17,10 +18,12 @@ from collections import deque
 from datetime import datetime
 
 from PySide6.QtCore import (
-    QByteArray, QEasingCurve, QPropertyAnimation, QSettings, QThread, QTimer, QSize, Qt, QRect, QRectF, QPoint, QPointF, QUrl, Signal, QEvent,
+    QByteArray, QEasingCurve, QPropertyAnimation, QSettings, QThread, QTimer, QSize, Qt, QRect, QRectF, QPoint, QPointF, QUrl, Signal, QEvent, QObject,
 )
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QKeySequence, QLinearGradient, QPainter, QPalette, QPainterPath, QPen, QPixmap, QRadialGradient
 from PySide6.QtSvg import QSvgRenderer
+from PySide6.QtNetwork import QAbstractSocket
+from PySide6.QtWebSockets import QWebSocket
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -52,18 +55,21 @@ from main import App, STYLE, Backdrop, TitleBar, label, panel
 
 # The version is also used as the GitHub release tag (for example, v2026.09.29).
 # Bump it when publishing a new release so existing installations can discover it.
-APP_VERSION = '2026.09.30.3'
+APP_VERSION = '2026.09.30.5'
 GITHUB_REPOSITORY = 'zhujianmengbi-droid/-'
 GITHUB_REPOSITORY_URL = f'https://github.com/{GITHUB_REPOSITORY}'
 GITHUB_LATEST_RELEASE_API = (
     f'https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest')
-# 大厅聊天服务只需要提供三个轻量 HTTP 接口：
-#   GET  /api/chat/messages?limit=60   -> {messages: [...], online: 12}
-#   GET  /api/chat/presence             -> {online: 12}
-#   POST /api/chat/messages             <- {player_id: '...', message: '...'}
-# 将这个地址替换为部署在 Render 等平台上的服务即可。客户端不把地址写死在
-# UI 中，同时也允许用户在 QSettings 中覆盖 ``chat/serverUrl`` 做自托管。
-LOBBY_CHAT_SERVER_URL = 'https://dev-king-lobby.onrender.com'
+# 大厅聊天使用 Supabase Realtime 公共频道。Broadcast 只经过 Realtime 转发，
+# 不写入应用自己的数据库表；消息列表和在线状态都只存在本次运行的客户端内存。
+# publishable key 设计上允许随桌面客户端发布，绝不在客户端放置 secret key。
+SUPABASE_PROJECT_REF = 'jhgkpxuaaakgdjfbnurp'
+SUPABASE_PROJECT_URL = f'https://{SUPABASE_PROJECT_REF}.supabase.co'
+SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_uhS8jC6RrSmUSEblKfeyYw_cZdhk7RH'
+SUPABASE_REALTIME_URL = (
+    f'wss://{SUPABASE_PROJECT_REF}.supabase.co/realtime/v1/websocket')
+SUPABASE_CHAT_TOPIC = 'realtime:public-lobby'
+LOBBY_CHAT_SERVER_URL = SUPABASE_REALTIME_URL
 LOBBY_CHAT_JOIN_PATH = '/api/join'
 LOBBY_CHAT_MESSAGES_PATH = '/api/chat/messages'
 LOBBY_CHAT_PRESENCE_PATH = '/api/chat/presence'
@@ -706,6 +712,423 @@ QLineEdit#themedInput:focus {{ border-color: {colors['focus']}; }}
             event.ignore()
             return
         super().closeEvent(event)
+
+
+class SupabaseRealtimeChatClient(QObject):
+    """Supabase Realtime Phoenix v1 客户端，用于公共大厅群聊。
+
+    只使用 Broadcast 和 Presence：消息不写入 Supabase 表，关闭软件后
+    客户端内存中的消息也会被清空。网络事件在 Qt 主线程异步处理，避免
+    阻塞主窗口；断线会用有限退避自动重连。
+    """
+
+    statusChanged = Signal(str)
+    messageReceived = Signal(object)
+    # Emitted once a broadcast is confirmed by either the server ACK or the
+    # client's self echo.  The payload is the original message dictionary.
+    messageSent = Signal(object)
+    # Emitted once when a message cannot be confirmed.  The payload remains
+    # available to the UI so it can restore the editor without re-sending it.
+    messageFailed = Signal(object, str)
+    presenceChanged = Signal(int)
+    error = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._socket = QWebSocket()
+        self._socket.connected.connect(self._on_connected)
+        self._socket.textMessageReceived.connect(self._on_message)
+        self._socket.disconnected.connect(self._on_disconnected)
+        self._socket.errorOccurred.connect(self._on_socket_error)
+        self._reconnect_timer = QTimer(self)
+        self._reconnect_timer.setSingleShot(True)
+        self._reconnect_timer.timeout.connect(self._open_socket)
+        self._heartbeat_timer = QTimer(self)
+        self._heartbeat_timer.setInterval(20_000)
+        self._heartbeat_timer.timeout.connect(self._send_heartbeat)
+        self._player_id = ''
+        # Presence key must be unique per running client.  The displayed ID is
+        # still included in the track payload, but two windows using the same
+        # game ID count as two online clients.
+        self._presence_key = uuid.uuid4().hex
+        self._topic = SUPABASE_CHAT_TOPIC
+        self._join_ref = None
+        self._ref = 0
+        self._joined = False
+        self._wanted = False
+        self._backoff_ms = 1000
+        self._presence_state = {}
+        # ref -> {'id': str, 'payload': dict}.  A broadcast is kept here until
+        # its ACK or self echo arrives; no automatic retry is performed because
+        # a retry could duplicate a message that was accepted by Realtime.
+        self._pending_messages = {}
+        # Insertion-ordered dict gives bounded FIFO de-duplication without
+        # risking removal of the just-added id (set.pop() is arbitrary).
+        self._seen_message_ids = {}
+        self._max_seen_message_ids = 512
+
+    @property
+    def player_id(self):
+        return self._player_id
+
+    @property
+    def joined(self):
+        return self._joined
+
+    def start(self, player_id):
+        player_id = str(player_id or '').strip()
+        if not player_id:
+            self.stop()
+            return
+        identity_changed = player_id != self._player_id
+        self._player_id = player_id
+        self._wanted = True
+        self._reconnect_timer.stop()
+        self._backoff_ms = 1000
+        if identity_changed and self._socket.isValid():
+            self._fail_pending('身份已切换，消息未确认。')
+            self._close_socket()
+        if self._socket.state() in {
+            QAbstractSocket.SocketState.ConnectedState,
+            QAbstractSocket.SocketState.ConnectingState,
+        }:
+            return
+        self._open_socket()
+
+    def stop(self):
+        self._wanted = False
+        self._reconnect_timer.stop()
+        self._heartbeat_timer.stop()
+        self._fail_pending('大厅连接已停止，消息未确认。')
+        if self._socket.state() == QAbstractSocket.SocketState.ConnectedState:
+            self._send({
+                'topic': self._topic,
+                'event': 'phx_leave',
+                'payload': {},
+                'ref': self._next_ref(),
+                'join_ref': self._join_ref,
+            })
+        self._close_socket()
+        self._joined = False
+        self._join_ref = None
+        self._presence_state = {}
+        self.presenceChanged.emit(0)
+
+    def send_message(self, text):
+        text = str(text or '').strip()
+        if not text or not self._joined:
+            return False
+        message_id = uuid.uuid4().hex
+        payload = {
+            'id': message_id,
+            'message': text,
+            'text': text,
+            'player_id': self._player_id,
+            'username': self._player_id,
+            'created_at': datetime.now().astimezone().isoformat(timespec='seconds'),
+        }
+        ref = self._next_ref()
+        self._pending_messages[ref] = {
+            'id': message_id,
+            'payload': dict(payload),
+        }
+        sent = self._send({
+            'topic': self._topic,
+            'event': 'broadcast',
+            'payload': {'type': 'broadcast', 'event': 'chat', 'payload': payload},
+            'ref': ref,
+            'join_ref': self._join_ref,
+        })
+        if not sent:
+            self._fail_pending_ref(ref, '消息未写入连接。')
+            return False
+        # Use the message id as well as the ref so a stale timeout from an old
+        # connection cannot expire a newer message after refs are reset.
+        QTimer.singleShot(
+            10_000,
+            lambda pending_ref=ref, pending_id=message_id:
+                self._expire_pending(pending_ref, pending_id))
+        return True
+
+    def _next_ref(self):
+        self._ref += 1
+        return str(self._ref)
+
+    def _open_socket(self):
+        if not self._wanted or not self._player_id:
+            return
+        if self._socket.state() in {
+            QAbstractSocket.SocketState.ConnectedState,
+            QAbstractSocket.SocketState.ConnectingState,
+        }:
+            return
+        self._joined = False
+        self._join_ref = None
+        self.statusChanged.emit('连接中…')
+        url = (SUPABASE_REALTIME_URL + '?apikey=' + SUPABASE_PUBLISHABLE_KEY +
+               '&vsn=1.0.0')
+        self._socket.open(QUrl(url))
+
+    def _close_socket(self):
+        if self._socket.state() != QAbstractSocket.SocketState.UnconnectedState:
+            self._socket.abort()
+
+    def _send(self, message):
+        if (not isinstance(message, dict) or
+                self._socket.state() != QAbstractSocket.SocketState.ConnectedState):
+            return False
+        try:
+            encoded = json.dumps(message, ensure_ascii=False,
+                                 separators=(',', ':'))
+            queued = self._socket.sendTextMessage(encoded)
+        except (TypeError, ValueError, RuntimeError):
+            return False
+        # QWebSocket returns the number of queued bytes.  A chat frame is never
+        # empty, so zero, a negative value, or a missing result is a write
+        # failure; only a positive count is accepted.
+        try:
+            return bool(queued is not None and int(queued) > 0)
+        except (TypeError, ValueError):
+            return False
+
+    def _on_connected(self):
+        self._ref = 0
+        self._join_ref = self._next_ref()
+        self._send({
+            'topic': self._topic,
+            'event': 'phx_join',
+            'payload': {
+                'config': {
+                    'broadcast': {'ack': True, 'self': True},
+                    'presence': {'enabled': True, 'key': self._presence_key},
+                    'postgres_changes': [],
+                    'private': False,
+                }
+            },
+            'ref': self._join_ref,
+            'join_ref': self._join_ref,
+        })
+
+    def _track_presence(self):
+        self._send({
+            'topic': self._topic,
+            'event': 'presence',
+            'payload': {
+                'type': 'presence',
+                'event': 'track',
+                'payload': {
+                    'user_id': self._player_id,
+                    'name': self._player_id,
+                },
+            },
+            'ref': self._next_ref(),
+            'join_ref': self._join_ref,
+        })
+
+    def _send_heartbeat(self):
+        if self._socket.state() == QAbstractSocket.SocketState.ConnectedState:
+            self._send({
+                'topic': 'phoenix',
+                'event': 'heartbeat',
+                'payload': {},
+                'ref': self._next_ref(),
+                'join_ref': None,
+            })
+
+    def _on_message(self, raw):
+        if not isinstance(raw, (str, bytes, bytearray)):
+            return
+        try:
+            message = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return
+        if not isinstance(message, dict):
+            return
+        event = message.get('event')
+        payload = message.get('payload')
+        if not isinstance(payload, dict):
+            payload = {}
+        if event == 'phx_reply':
+            status = payload.get('status')
+            ref = str(message.get('ref') or '')
+            if ref == self._join_ref:
+                if status == 'ok':
+                    self._joined = True
+                    self._backoff_ms = 1000
+                    self._heartbeat_timer.start()
+                    self._track_presence()
+                    self.statusChanged.emit('在线')
+                else:
+                    reason = payload.get('response')
+                    if isinstance(reason, dict):
+                        reason = reason.get('reason')
+                    reason = reason or '加入大厅失败'
+                    self.error.emit(str(reason))
+                    self._fail_pending('加入大厅失败，消息未确认。')
+                    self._close_socket()
+            elif ref in self._pending_messages:
+                if status == 'ok':
+                    pending = self._pending_messages.get(ref)
+                    self._complete_pending(ref, pending)
+                else:
+                    reason = payload.get('response')
+                    if isinstance(reason, dict):
+                        reason = reason.get('reason')
+                    self._fail_pending_ref(
+                        ref, str(reason or '服务器未确认消息。'))
+            return
+        if event == 'presence_state':
+            self._presence_state = dict(payload)
+            self._emit_presence_count()
+            return
+        if event == 'presence_diff':
+            self._apply_presence_diff(payload)
+            self._emit_presence_count()
+            return
+        if event == 'broadcast':
+            incoming = payload.get('payload')
+            if payload.get('event') == 'chat' and isinstance(incoming, dict):
+                item = dict(incoming)
+                message_id = str(item.get('id') or '').strip()
+                if not message_id:
+                    message_id = uuid.uuid4().hex
+                    item['id'] = message_id
+                pending_ref = self._pending_ref_for_id(message_id)
+                self._emit_message_once(item)
+                if pending_ref is not None:
+                    self._complete_pending(
+                        pending_ref, self._pending_messages.get(pending_ref),
+                        emit_message=False)
+            return
+        if event in {'phx_error', 'phx_close'}:
+            detail = payload.get('reason') if isinstance(payload, dict) else ''
+            self.error.emit(str(detail or '大厅连接已关闭'))
+            self._fail_pending('大厅连接已关闭，消息未确认。')
+            self._close_socket()
+
+    def _remember_message_id(self, message_id):
+        message_id = str(message_id or '').strip()
+        if not message_id or message_id in self._seen_message_ids:
+            return False
+        self._seen_message_ids[message_id] = None
+        if len(self._seen_message_ids) > self._max_seen_message_ids:
+            oldest = next(iter(self._seen_message_ids), None)
+            if oldest is not None:
+                self._seen_message_ids.pop(oldest, None)
+        return True
+
+    def _emit_message_once(self, payload):
+        if not isinstance(payload, dict):
+            return False
+        message_id = str(payload.get('id') or '').strip()
+        if not message_id:
+            message_id = uuid.uuid4().hex
+            payload = dict(payload)
+            payload['id'] = message_id
+        if not self._remember_message_id(message_id):
+            return False
+        self.messageReceived.emit(dict(payload))
+        return True
+
+    def _pending_ref_for_id(self, message_id):
+        message_id = str(message_id or '').strip()
+        for ref, pending in self._pending_messages.items():
+            if isinstance(pending, dict) and pending.get('id') == message_id:
+                return ref
+        return None
+
+    def _complete_pending(self, ref, pending, emit_message=True):
+        if not isinstance(pending, dict):
+            return False
+        current = self._pending_messages.get(ref)
+        if current is not pending:
+            return False
+        self._pending_messages.pop(ref, None)
+        payload = dict(pending.get('payload') or {})
+        if emit_message:
+            self._emit_message_once(payload)
+        self.messageSent.emit(payload)
+        return True
+
+    def _fail_pending_ref(self, ref, reason):
+        pending = self._pending_messages.pop(ref, None)
+        if not isinstance(pending, dict):
+            return False
+        payload = dict(pending.get('payload') or {})
+        self.messageFailed.emit(payload, str(reason or '消息未确认。'))
+        return True
+
+    def _fail_pending(self, reason):
+        for ref in list(self._pending_messages):
+            self._fail_pending_ref(ref, reason)
+
+    def _expire_pending(self, ref, message_id):
+        pending = self._pending_messages.get(ref)
+        if not isinstance(pending, dict) or pending.get('id') != message_id:
+            return
+        self._fail_pending_ref(ref, '消息确认超时（服务器未返回 ACK）。')
+
+    def _apply_presence_diff(self, payload):
+        if not isinstance(payload, dict):
+            return
+        joins = payload.get('joins')
+        if not isinstance(joins, dict):
+            joins = {}
+        leaves = payload.get('leaves')
+        if not isinstance(leaves, dict):
+            leaves = {}
+        for key, value in joins.items():
+            if isinstance(value, dict):
+                self._presence_state[str(key)] = value
+        for key, value in leaves.items():
+            key = str(key)
+            current = self._presence_state.get(key)
+            if not isinstance(current, dict) or not isinstance(value, dict):
+                self._presence_state.pop(key, None)
+                continue
+            metas = value.get('metas')
+            if not isinstance(metas, list):
+                metas = []
+            leaving = {str(item.get('phx_ref')) for item in metas
+                       if isinstance(item, dict)}
+            current_metas = current.get('metas')
+            if not isinstance(current_metas, list):
+                current_metas = []
+            kept = [item for item in current_metas
+                    if isinstance(item, dict) and
+                    str(item.get('phx_ref')) not in leaving]
+            if kept:
+                current['metas'] = kept
+            else:
+                self._presence_state.pop(key, None)
+
+    def _emit_presence_count(self):
+        count = sum(1 for value in self._presence_state.values()
+                    if isinstance(value, dict) and value.get('metas'))
+        self.presenceChanged.emit(count)
+
+    def _schedule_reconnect(self):
+        if self._wanted and not self._reconnect_timer.isActive():
+            self._reconnect_timer.start(self._backoff_ms)
+            self._backoff_ms = min(self._backoff_ms * 2, 10_000)
+
+    def _on_disconnected(self):
+        self._heartbeat_timer.stop()
+        self._fail_pending('连接已断开，消息未确认。')
+        was_joined = self._joined
+        self._joined = False
+        self._join_ref = None
+        if was_joined:
+            self.statusChanged.emit('已断开，正在重连…')
+        self.presenceChanged.emit(0)
+        self._presence_state = {}
+        self._schedule_reconnect()
+
+    def _on_socket_error(self, _error):
+        detail = self._socket.errorString() or '无法连接 Supabase Realtime。'
+        self.error.emit(detail)
+        self._fail_pending('连接发生错误，消息未确认。')
+        self._close_socket()
 
 
 class LobbyChatWorker(QThread):
@@ -2277,9 +2700,11 @@ class LargeApp(App):
         self._chat_message_keys = set()
         self._chat_session_id = ''
         self._chat_pending_message = ''
+        self._chat_sending_message = ''
         self._chat_poll_timer = None
-        self._chat_server_url = str(settings.value(
-            'chat/serverUrl', LOBBY_CHAT_SERVER_URL) or LOBBY_CHAT_SERVER_URL).strip()
+        # 旧版本保存过 Render HTTP 地址；聊天现在直接使用项目的 Realtime
+        # WebSocket，忽略旧地址，避免把 WebSocket 协议误发到 HTTP 服务。
+        self._chat_server_url = LOBBY_CHAT_SERVER_URL
         self._game_id = str(settings.value(GAME_ID_SETTINGS_KEY, '') or '').strip()
         # ``chat/gameId`` was used by an earlier preview build.  Migrate it
         # once so an existing login is not lost when the shared profile key is
@@ -2300,6 +2725,13 @@ class LargeApp(App):
         self._match_overscroll_hint_animation = None
 
         super().__init__()
+        self._chat_client = SupabaseRealtimeChatClient(self)
+        self._chat_client.statusChanged.connect(self._on_supabase_chat_status)
+        self._chat_client.messageReceived.connect(self._on_supabase_chat_message)
+        self._chat_client.messageSent.connect(self._on_supabase_message_sent)
+        self._chat_client.messageFailed.connect(self._on_supabase_message_failed)
+        self._chat_client.presenceChanged.connect(self._on_supabase_presence_changed)
+        self._chat_client.error.connect(self._on_supabase_chat_error)
         self.setWindowTitle('逐渐优化器 · 逐渐工具中心')
         self.resize(1180, 800)
         # 留出标题、指标和两张功能卡的完整空间，避免缩放到窄窗口时说明文字被挤成一行。
@@ -5090,11 +5522,21 @@ class LargeApp(App):
         if player_id != self._game_id:
             self._game_id = player_id
             self._chat_session_id = ''
+            self._chat_client.stop()
+            # A message typed under the previous identity must never be sent
+            # after a rebind.  The transport stop above may synchronously
+            # report a failure; clear the editor after that callback returns.
+            self._chat_pending_message = ''
+            self._chat_sending_message = ''
+            self.chat_input.clear()
+            self._chat_messages = []
+            self._chat_message_keys.clear()
         configured = bool(player_id)
-        self.chat_input.setEnabled(configured)
-        self.chat_send_button.setEnabled(configured)
+        busy = bool(self._chat_sending_message or self._chat_pending_message)
+        self.chat_input.setEnabled(configured and not busy)
+        self.chat_send_button.setEnabled(configured and not busy)
         if hasattr(self, 'chat_emoji_button'):
-            self.chat_emoji_button.setEnabled(configured)
+            self.chat_emoji_button.setEnabled(configured and not busy)
         connection_state = self.chat_connection_badge.text()
         if configured:
             self.chat_input.setPlaceholderText(f'以 {player_id} 发言 · 输入大厅消息')
@@ -5107,7 +5549,7 @@ class LargeApp(App):
             self.chat_status.setText('请先登录游戏 ID 后加入大厅。')
             self.chat_connection_badge.setText('未登录')
         self.chat_server_hint.setText(
-            f'服务器：{self._chat_server_url or "未配置"} · 消息会公开展示')
+            'Supabase Realtime 公共频道 · 消息仅在各客户端内存中显示')
 
     @staticmethod
     def _chat_payload_messages(payload):
@@ -5141,24 +5583,19 @@ class LargeApp(App):
         return '|'.join(str(item.get(key) or '') for key in ('player_id', 'username', 'message', 'created_at'))
 
     def _poll_lobby_chat(self):
-        if self._closing or self._chat_worker is not None:
+        if self._closing:
             return
-        self._refresh_chat_identity()
+        self._refresh_chat_identity(preserve_status=True)
         player_id = self._chat_bound_game_id()
         if not player_id:
             self.chat_connection_badge.setText('未登录')
+            self._chat_client.stop()
             return
-        action = 'poll' if self._chat_session_id else 'join'
-        worker = LobbyChatWorker(action, self._chat_server_url, player_id,
-                                 session_id=self._chat_session_id, parent=self)
-        worker.completed.connect(self._on_lobby_chat_completed)
-        worker.finished.connect(self._on_lobby_chat_finished)
-        self._chat_worker = worker
-        self.chat_connection_badge.setText('连接中…')
-        worker.start()
+        if self._chat_client.player_id != player_id or not self._chat_client.joined:
+            self._chat_client.start(player_id)
 
     def _send_lobby_chat(self):
-        if self._closing or self._chat_worker is not None:
+        if self._closing:
             return
         player_id = self._chat_bound_game_id()
         message = self.chat_input.text().strip()
@@ -5168,70 +5605,109 @@ class LargeApp(App):
         if not message:
             self.chat_input.setFocus()
             return
-        if not self._chat_session_id:
+        if self._chat_sending_message:
+            return
+        if not self._chat_client.joined:
             self._chat_pending_message = message
+            self._refresh_chat_identity(preserve_status=True)
             self.chat_status.setText('正在加入公共大厅…')
             self._poll_lobby_chat()
             return
-        self._start_lobby_chat_send(message)
+        self._begin_chat_message_send(message)
 
-    def _start_lobby_chat_send(self, message):
-        player_id = self._chat_bound_game_id()
+    def _begin_chat_message_send(self, message):
         message = str(message or '').strip()
-        if not player_id or not message or self._chat_worker is not None:
-            return
-        worker = LobbyChatWorker('send', self._chat_server_url, player_id, message,
-                                 session_id=self._chat_session_id, parent=self)
-        worker.completed.connect(self._on_lobby_chat_completed)
-        worker.finished.connect(self._on_lobby_chat_finished)
-        self._chat_worker = worker
-        self.chat_send_button.setEnabled(False)
-        self.chat_status.setText('正在发送…')
-        worker.start()
+        if not message or self._chat_sending_message:
+            return False
+        self._chat_sending_message = message
+        self._refresh_chat_identity(preserve_status=True)
+        self.chat_status.setText('正在发送消息……')
+        if self._chat_client.send_message(message):
+            return True
+        self._chat_sending_message = ''
+        self._refresh_chat_identity(preserve_status=True)
+        self.chat_status.setText('发送失败：当前大厅连接尚未就绪。')
+        return False
 
-    def _on_lobby_chat_completed(self, action, payload, error):
-        if self._closing:
+    def _on_supabase_chat_status(self, status):
+        if self._closing or not hasattr(self, 'chat_connection_badge'):
             return
-        if error:
-            self.chat_connection_badge.setText('离线')
-            self.chat_status.setText(error)
-            return
-        if action == 'join':
-            if isinstance(payload, dict):
-                session_id = payload.get('session_id') or payload.get('sessionId')
-                if session_id:
-                    self._chat_session_id = str(session_id)
-                online = payload.get('online', payload.get('online_count'))
-                if online is not None:
-                    self.chat_online_count.setText(str(online))
-            self.chat_connection_badge.setText('在线')
-            self.chat_status.setText('已加入公共大厅，正在同步消息…')
+        self.chat_connection_badge.setText(str(status))
+        if status == '在线':
+            self.chat_status.setText('已连接 Supabase Realtime · 公共频道')
             pending = self._chat_pending_message
             self._chat_pending_message = ''
             if pending:
-                QTimer.singleShot(50, lambda text=pending: self._start_lobby_chat_send(text))
-            else:
-                QTimer.singleShot(50, self._poll_lobby_chat)
-            return
-        if action == 'send':
-            self.chat_input.clear()
-            self.chat_status.setText('消息已发送 · 公共大厅可见')
-            # 发送成功后立即拉取一次，兼容服务端补充时间戳/消息 ID。
-            QTimer.singleShot(120, self._poll_lobby_chat)
-            return
-        messages, online = self._chat_payload_messages(payload)
-        if online is not None:
-            self.chat_online_count.setText(str(max(0, online)))
-        self._render_lobby_messages(messages)
-        self.chat_connection_badge.setText('在线')
-        self.chat_status.setText(f'已同步 {len(messages)} 条公开消息')
+                self._begin_chat_message_send(pending)
+        elif status == '连接中…':
+            self.chat_status.setText('正在连接 Supabase Realtime…')
+        elif '重连' in status:
+            self.chat_status.setText('大厅连接暂时中断，正在自动重连…')
 
-    def _on_lobby_chat_finished(self):
-        worker = self._chat_worker
-        self._chat_worker = None
-        if worker is not None:
-            worker.deleteLater()
+    def _on_supabase_chat_error(self, message):
+        if self._closing or not hasattr(self, 'chat_status'):
+            return
+        self.chat_connection_badge.setText('离线')
+        if self._chat_pending_message and not self._chat_sending_message:
+            pending = self._chat_pending_message
+            self._chat_pending_message = ''
+            self.chat_input.setText(pending)
+            self._refresh_chat_identity(preserve_status=True)
+        self.chat_status.setText(str(message or '暂时无法连接大厅。')[:180])
+
+    def _on_supabase_message_sent(self, payload):
+        if self._closing or not isinstance(payload, dict):
+            return
+        text = str(payload.get('message') or payload.get('text') or '').strip()
+        if not self._chat_sending_message or text != self._chat_sending_message:
+            return
+        self._chat_sending_message = ''
+        self.chat_input.clear()
         self._refresh_chat_identity(preserve_status=True)
+        self.chat_status.setText('消息已发送 · 公共大厅可见')
+
+    def _on_supabase_message_failed(self, payload, reason):
+        if self._closing:
+            return
+        text = ''
+        if isinstance(payload, dict):
+            text = str(payload.get('message') or payload.get('text') or '').strip()
+        if ((self._chat_sending_message or self._chat_pending_message) and text and
+                text != (self._chat_sending_message or self._chat_pending_message)):
+            return
+        restore = text or self._chat_sending_message or self._chat_pending_message
+        self._chat_sending_message = ''
+        self._chat_pending_message = ''
+        if restore:
+            self.chat_input.setText(restore)
+        self._refresh_chat_identity(preserve_status=True)
+        self.chat_status.setText(f'发送失败：{str(reason or "消息未确认。")[:150]}')
+
+    def _on_supabase_presence_changed(self, count):
+        if hasattr(self, 'chat_online_count'):
+            self.chat_online_count.setText(str(max(0, int(count))))
+
+    def _on_supabase_chat_message(self, payload):
+        if self._closing or not isinstance(payload, dict):
+            return
+        # Realtime 没有历史消息；只把当前进程收到的消息留在本地内存，
+        # 关闭软件或重新启动后自然清空。
+        item = dict(payload)
+        item.setdefault('message', item.get('text', ''))
+        item.setdefault('player_id', item.get('username', '未知玩家'))
+        item.setdefault('created_at', datetime.now().astimezone().isoformat(timespec='seconds'))
+        key = self._chat_message_key(item)
+        if key in self._chat_message_keys:
+            return
+        self._chat_message_keys.add(key)
+        self._chat_messages.append(item)
+        # Keep the canonical payloads intact.  Rendering must not replace
+        # these with presentation-only dictionaries and lose IDs/timestamps.
+        self._chat_messages = self._chat_messages[-80:]
+        self._chat_message_keys = {
+            self._chat_message_key(message) for message in self._chat_messages}
+        self._render_lobby_messages(self._chat_messages)
+        self.chat_status.setText('已同步实时消息 · 公共大厅可见')
 
     def _render_lobby_messages(self, messages):
         if not hasattr(self, 'chat_messages_layout'):
@@ -5247,11 +5723,14 @@ class LargeApp(App):
                 text, sender, stamp, key = str(item).strip(), '未知玩家', '', str(item)
             if text:
                 normalized.append({'text': text, 'sender': sender or '未知玩家', 'stamp': stamp, 'key': key})
-        self._chat_messages = normalized
+        # The empty-state label is reused; deleting it here makes the next
+        # message fail once Qt processes DeferredDelete after startup.
+        self.chat_messages_host.setUpdatesEnabled(False)
         while self.chat_messages_layout.count():
             item = self.chat_messages_layout.takeAt(0)
             widget = item.widget()
-            if widget is not None:
+            if widget is not None and widget is not self.chat_empty_label:
+                widget.hide()
                 widget.deleteLater()
         self.chat_empty_label.setVisible(not normalized)
         if not normalized:
@@ -5269,6 +5748,7 @@ class LargeApp(App):
             meta = QHBoxLayout()
             meta.setSpacing(7)
             author = label(item['sender'], 'chatMessageAuthor')
+            author.setTextFormat(Qt.TextFormat.PlainText)
             author.setObjectName('chatMessageAuthor')
             meta.addWidget(author)
             if item['stamp']:
@@ -5281,11 +5761,13 @@ class LargeApp(App):
             meta.addStretch(1)
             bubble_layout.addLayout(meta)
             body = label(item['text'], 'chatMessageText')
+            body.setTextFormat(Qt.TextFormat.PlainText)
             body.setWordWrap(True)
             body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             bubble_layout.addWidget(body)
             self.chat_messages_layout.addWidget(bubble)
         self.chat_messages_layout.addStretch(1)
+        self.chat_messages_host.setUpdatesEnabled(True)
         QTimer.singleShot(0, lambda: self.chat_scroll.verticalScrollBar().setValue(
             self.chat_scroll.verticalScrollBar().maximum()))
 
@@ -5715,13 +6197,14 @@ class LargeApp(App):
         server_layout.addLayout(server_copy, 1)
         self.chat_server_url_input = QLineEdit()
         self.chat_server_url_input.setObjectName('themedInput')
-        self.chat_server_url_input.setPlaceholderText('https://你的大厅服务地址')
-        self.chat_server_url_input.setText(self._chat_server_url)
+        self.chat_server_url_input.setPlaceholderText('Supabase Realtime 地址')
+        self.chat_server_url_input.setText(SUPABASE_REALTIME_URL)
+        self.chat_server_url_input.setReadOnly(True)
         self.chat_server_url_input.setMinimumWidth(300)
         self.chat_server_url_input.setClearButtonEnabled(True)
         self.chat_server_url_input.returnPressed.connect(self._save_chat_server_url)
         server_layout.addWidget(self.chat_server_url_input)
-        server_save = self.button('保存并连接', self._save_chat_server_url, True)
+        server_save = self.button('重新连接', self._save_chat_server_url, True)
         server_save.setObjectName('chatSaveServer')
         server_layout.addWidget(server_save)
         card_layout.addWidget(server_row)
@@ -5739,21 +6222,12 @@ class LargeApp(App):
         self._open_player_login_dialog(value)
 
     def _save_chat_server_url(self):
-        value = self.chat_server_url_input.text().strip().rstrip('/')
-        if not value:
-            self.chat_server_url_input.setText(self._chat_server_url or LOBBY_CHAT_SERVER_URL)
-            return
-        if not re.match(r'^https?://[^\s]+$', value, re.IGNORECASE):
-            self.chat_status.setText('服务器地址需要以 http:// 或 https:// 开头。')
-            self.chat_server_url_input.setFocus()
-            return
-        self._chat_server_url = value
-        self._settings.setValue('chat/serverUrl', value)
-        self._settings.sync()
-        self._chat_session_id = ''
+        self._chat_server_url = SUPABASE_REALTIME_URL
+        self.chat_server_url_input.setText(SUPABASE_REALTIME_URL)
+        self._chat_client.stop()
         self.chat_connection_badge.setText('准备连接')
         self._refresh_chat_identity()
-        self.chat_status.setText('服务器地址已保存，正在连接公共大厅……')
+        self.chat_status.setText('正在重新连接 Supabase Realtime 公共大厅……')
         self._poll_lobby_chat()
 
     def _build_taskbar_hotkey_settings(self):
@@ -6316,6 +6790,8 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
         self._finish_window_drag()
         self._stop_ui_animations()
         self._stop_detail_animations()
+        if hasattr(self, '_chat_client'):
+            self._chat_client.stop()
         if self.match_detail_dialog is not None:
             self._close_match_detail()
         if self._taskbar_hotkey_worker is not None and self._taskbar_hotkey_worker.isRunning():
