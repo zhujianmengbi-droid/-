@@ -25,7 +25,9 @@ from datetime import datetime
 from PySide6.QtCore import (
     QByteArray, QEasingCurve, QPropertyAnimation, QSettings, QThread, QTimer, QSize, Qt, QRect, QRectF, QPoint, QPointF, QUrl, Signal, QEvent, QObject,
 )
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QKeySequence, QLinearGradient, QPainter, QPalette, QPainterPath, QPen, QPixmap, QRadialGradient
+from PySide6.QtGui import (QColor, QDesktopServices, QFont, QIcon, QKeySequence,
+                           QImage, QLinearGradient, QPainter, QPalette,
+                           QPainterPath, QPen, QPixmap, QRadialGradient)
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtNetwork import QAbstractSocket
 from PySide6.QtWebSockets import QWebSocket
@@ -66,7 +68,7 @@ from main import App, STYLE, Backdrop, TitleBar, label, panel
 
 # The version is also used as the GitHub release tag (for example, v2026.09.29).
 # Bump it when publishing a new release so existing installations can discover it.
-APP_VERSION = '2026.09.30.13'
+APP_VERSION = '2026.09.30.14'
 GITHUB_REPOSITORY = 'zhujianmengbi-droid/-'
 GITHUB_REPOSITORY_URL = f'https://github.com/{GITHUB_REPOSITORY}'
 GITHUB_LATEST_RELEASE_API = (
@@ -139,6 +141,100 @@ def _is_newer_release(tag_name):
     current = _release_version_tuple(APP_VERSION)
     width = max(len(remote), len(current))
     return remote + (0,) * (width - len(remote)) > current + (0,) * (width - len(current))
+
+
+class GlassFrame(QFrame):
+    """QFrame with a synchronized, low-alpha liquid-glass sheen.
+
+    The backdrop publishes one phase for the whole window. Surface frames use
+    that same phase for their rim and light sweep, so cards, sidebar and detail
+    panels feel like one material instead of unrelated gray rectangles.
+    """
+
+    def __init__(self, parent=None, flags=Qt.WindowFlags()):
+        super().__init__(parent, flags)
+        self._glass_phase = 0.0
+
+    # Only the actual material surfaces participate in the optical pass.  A
+    # previous version let every helper frame shimmer, which made small icon
+    # tiles and layout rows look noisy and forced Qt to repaint far more than
+    # the user can see.  Keeping the list explicit also makes the hierarchy
+    # predictable when a new page is added.
+    _LIQUID_SURFACES = frozenset({
+        'sidebar', 'glass', 'hero', 'featureCard', 'metricCard',
+        'updateBanner', 'playerLoginCard',
+        'leaderboardHero', 'leaderboardCard', 'leaderboardRow',
+        'matchDetailPanel', 'matchDetailHero', 'matchDetailRibbon',
+        'matchRecord', 'dailySummary', 'dailyStatChip', 'statChip',
+        'teamOverviewCard', 'teamOverviewItem', 'placeholder',
+        'chatOverviewCard', 'chatOnlineCard', 'chatCard',
+        'chatMessageBubble', 'taskbarInfoCard', 'taskbarListCard',
+        'settingsSidebar', 'settingsCard', 'settingsOverlay',
+    })
+
+    def set_glass_phase(self, phase):
+        phase = float(phase)
+        if abs(phase - self._glass_phase) < 0.006:
+            return
+        self._glass_phase = phase
+        self.update()
+
+    def _liquid_active(self):
+        app = QApplication.instance()
+        return bool(app is not None and app.property('_themeKey') == 'liquid')
+
+    def _should_shimmer(self):
+        if self.width() < 70 or self.height() < 28:
+            return False
+        if self.windowFlags() & Qt.WindowType.Popup:
+            return False
+        return self.objectName() in self._LIQUID_SURFACES
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._liquid_active() or not self._should_shimmer():
+            return
+        rect = QRectF(self.rect()).adjusted(0.8, 0.8, -0.8, -0.8)
+        radius = min(22.0, max(7.0, min(rect.width(), rect.height()) * 0.16))
+        path = QPainterPath()
+        path.addRoundedRect(rect, radius, radius)
+        phase = self._glass_phase
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setClipPath(path)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Screen)
+
+        # A narrow highlight travels through every surface with the same phase
+        # as the backdrop. The alpha stays low so text and team colours remain
+        # readable. A second, tinted pass follows it very softly; it is the
+        # optical colour picked up from the live background rather than a
+        # static blue/purple panel fill.
+        travel = ((phase * 0.085 + (id(self) % 97) / 97.0) % 1.35) - 0.18
+        x = rect.left() + rect.width() * travel
+        sheen = QLinearGradient(x - rect.width() * 0.17, rect.top(),
+                                x + rect.width() * 0.17, rect.bottom())
+        sheen.setColorAt(0.0, QColor(255, 255, 255, 0))
+        sheen.setColorAt(0.48, QColor(255, 255, 255, 17))
+        sheen.setColorAt(0.52, QColor(255, 255, 255, 26))
+        sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
+        painter.fillPath(path, sheen)
+
+        optical = QLinearGradient(rect.left(), rect.top(),
+                                  rect.right(), rect.bottom())
+        cool_alpha = 8 + int(4 * (0.5 + 0.5 * math.sin(phase + id(self) * 0.002)))
+        warm_alpha = 6 + int(3 * (0.5 + 0.5 * math.cos(phase * 0.83 + id(self) * 0.001)))
+        optical.setColorAt(0.0, QColor(173, 211, 247, cool_alpha))
+        optical.setColorAt(0.52, QColor(255, 255, 255, 0))
+        optical.setColorAt(1.0, QColor(246, 205, 222, warm_alpha))
+        painter.fillPath(path, optical)
+
+        # A moving rim light gives small cards a visible material edge without
+        # adding the heavy static borders that previously looked rough.
+        rim_alpha = 24 + int(10.0 * (0.5 + 0.5 * math.sin(phase + id(self) * 0.001)))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(255, 255, 255, rim_alpha), 1.0))
+        painter.drawPath(path)
+        painter.end()
 
 
 class ThemedComboBox(QComboBox):
@@ -579,7 +675,7 @@ class PlayerLoginDialog(QDialog):
         heading.addLayout(copy, 1)
         outer.addLayout(heading)
 
-        card = QFrame()
+        card = GlassFrame()
         card.setObjectName('playerLoginCard')
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(16, 14, 16, 14)
@@ -630,8 +726,8 @@ class PlayerLoginDialog(QDialog):
             dialog_bg, text, muted, card_bg = '#171b21', '#f1f2f4', '#b2b6be', '#252a32'
             accent, accent_text = '#cfd2d8', '#202124'
         elif self._theme == 'liquid':
-            dialog_bg, text, muted, card_bg = '#102638', '#effeff', '#a4cad6', '#1a5062'
-            accent, accent_text = '#9cefff', '#082c3b'
+            dialog_bg, text, muted, card_bg = '#171a20', '#f5f7fb', '#b9c0cb', '#292d34'
+            accent, accent_text = '#edf1f7', '#1d2025'
         elif self._theme == 'blue':
             dialog_bg, text, muted, card_bg = '#082650', '#eef7ff', '#b8cce5', '#0b2e5e'
             accent, accent_text = '#a9d0fa', '#092448'
@@ -1476,9 +1572,9 @@ class ZJStartupSplash(QWidget):
             'muted': '#a4aab3',
         },
         'liquid': {
-            'top': '#303542', 'bottom': '#151923', 'ink': '#f5f7fb',
-            'accent': '#b9d6ff', 'edge': '#ffffff', 'glow': '#8b9fd0',
-            'muted': '#b6bfce',
+            'top': '#2d3036', 'bottom': '#121519', 'ink': '#f5f7fb',
+            'accent': '#e7ecf4', 'edge': '#ffffff', 'glow': '#aeb8c7',
+            'muted': '#b9c0cb',
         },
         'dark': {
             'top': '#141d29', 'bottom': '#080e16', 'ink': '#edf4fd',
@@ -1846,41 +1942,40 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
 """,
     'liquid': """
-/* The reference uses a neutral frosted pane and a white specular rim; the
-   wallpaper supplies the colour.  Keep text and controls on this quiet gray
-   scale, with one restrained iOS-like blue accent. */
-QWidget { color: #f4f6fb; }
-QDialog { color: #f4f6fb; background: #1a1d25; }
-QMessageBox { color: #f4f6fb; background: #1a1d25; }
-QToolTip { color: #f4f6fb; background: #2b303b; border: 1px solid #b7c8df; border-radius: 9px; padding: 6px; }
-QFrame#updateBanner { background: rgba(112,157,216,58); border-color: rgba(222,237,255,172); }
+/* InfiniteGUI-inspired material: neutral gray glass over the transparent
+   animated canvas. Saturated colour is reserved for the moving optical pass. */
+QWidget { color: #f5f7fb; }
+QDialog { color: #f5f7fb; background: #171a20; }
+QMessageBox { color: #f5f7fb; background: #171a20; }
+QToolTip { color: #f5f7fb; background: #252a31; border: 1px solid rgba(255,255,255,135); border-radius: 9px; padding: 6px; }
+QFrame#updateBanner { background: rgba(255,255,255,26); border-color: rgba(255,255,255,112); }
 QLabel#updateTitle { color: #ffffff; }
-QLabel#updateHint, QLabel#muted, QLabel#pageHint, QLabel#brandHint, QLabel#metricLabel, QLabel#cardHint { color: #bac4d3; }
-QLabel#statLabel { color: #a5b0c0; }
-QLineEdit { color: #f4f6fb; background: #252a35; border: 1px solid #9eafc7; selection-background-color: #426c9e; border-radius: 11px; }
-QLineEdit:focus { color: #ffffff; background: #2a303c; border: 1px solid #dceaff; }
-QPushButton { color: #f4f6fb; background: rgba(230,235,244,32); border-color: rgba(239,245,255,132); }
-QPushButton:hover { background: rgba(230,238,250,64); border-color: #ffffff; }
-QPushButton:pressed { background: rgba(202,219,242,86); }
-QPushButton#primary { color: #102039; background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #f7f9ff, stop:0.55 #d4e4fb, stop:1 #aac9f4); border-color: #ffffff; }
+QLabel#updateHint, QLabel#muted, QLabel#pageHint, QLabel#brandHint, QLabel#metricLabel, QLabel#cardHint { color: #bcc3ce; }
+QLabel#statLabel { color: #aeb6c2; }
+QLineEdit { color: #f5f7fb; background: #292d34; border: 1px solid rgba(255,255,255,112); selection-background-color: #606b7a; border-radius: 11px; }
+QLineEdit:focus { color: #ffffff; background: #2d323a; border: 1px solid #ffffff; }
+QPushButton { color: #f5f7fb; background: rgba(255,255,255,18); border-color: rgba(255,255,255,76); }
+QPushButton:hover { background: rgba(255,255,255,42); border-color: rgba(255,255,255,170); }
+QPushButton:pressed { background: rgba(255,255,255,60); }
+QPushButton#primary { color: #1d2025; background: #edf1f7; border-color: #ffffff; }
 QPushButton#primary:hover { background: #ffffff; }
-QPushButton#navButton, QPushButton#settingsButton, QPushButton#settingsCategory, QPushButton#themeOption { color: #cbd4e1; }
-QPushButton#navButton:hover, QPushButton#settingsButton:hover, QPushButton#settingsCategory:hover, QPushButton#themeOption:hover { color: #ffffff; background: rgba(221,232,249,58); }
-QPushButton#navButton:checked, QPushButton#settingsButton:checked, QPushButton#settingsCategory:checked, QPushButton#themeOption:checked { color: #15243a; background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #d5e8ff, stop:1 #abc8ee); border-color: #ffffff; }
-QPushButton#windowControl { background: rgba(226,235,247,38); border-color: rgba(239,245,255,90); }
-QPushButton#windowControl:hover { background: rgba(245,249,255,110); }
-QCheckBox::indicator:unchecked { background: #252a35; border: 1px solid #9eafc7; border-radius: 5px; }
-QCheckBox::indicator:checked { background: #b8d3f4; border: 1px solid #ffffff; border-radius: 5px; }
-QPlainTextEdit { color: #c2cbd8; }
-QProgressBar { background: rgba(220,230,244,40); border-radius: 4px; }
-QProgressBar::chunk { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #a8c8f0, stop:1 #e6edfa); border-radius: 4px; }
+QPushButton#navButton, QPushButton#settingsButton, QPushButton#settingsCategory, QPushButton#themeOption { color: #d1d6df; }
+QPushButton#navButton:hover, QPushButton#settingsButton:hover, QPushButton#settingsCategory:hover, QPushButton#themeOption:hover { color: #ffffff; background: rgba(255,255,255,38); }
+QPushButton#navButton:checked, QPushButton#settingsButton:checked, QPushButton#settingsCategory:checked, QPushButton#themeOption:checked { color: #171a20; background: #e9edf4; border-color: #ffffff; }
+QPushButton#windowControl { background: rgba(255,255,255,20); border-color: rgba(255,255,255,68); }
+QPushButton#windowControl:hover { background: rgba(255,255,255,62); }
+QCheckBox::indicator:unchecked { background: #292d34; border: 1px solid rgba(255,255,255,120); border-radius: 5px; }
+QCheckBox::indicator:checked { background: #e9edf4; border: 1px solid #ffffff; border-radius: 5px; }
+QPlainTextEdit { color: #c7ced9; }
+QProgressBar { background: rgba(255,255,255,30); border-radius: 4px; }
+QProgressBar::chunk { background: #e7ecf4; border-radius: 4px; }
 QScrollBar:vertical { width: 9px; margin: 4px 1px 4px 1px; background: transparent; }
-QScrollBar::handle:vertical { min-height: 26px; background: rgba(220,232,249,110); border-radius: 4px; }
-QScrollBar::handle:vertical:hover { background: rgba(247,250,255,190); }
+QScrollBar::handle:vertical { min-height: 26px; background: rgba(255,255,255,78); border-radius: 4px; }
+QScrollBar::handle:vertical:hover { background: rgba(255,255,255,150); }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
 """,
-    'dark': """
+    'dark':"""
 QWidget { color: #e8eef8; }
 QDialog { color: #e8eef8; background: #111923; }
 QMessageBox { background: #111923; }
@@ -2046,36 +2141,35 @@ QPushButton#themeOption { border: 1px solid rgba(255,255,255,54); }
 QPushButton#themeOption:checked { border: 1px solid rgba(255,255,255,105); border-left: 3px solid #dcecff; background: rgba(255,255,255,48); color: #f7f7f8; }
 """,
     'liquid': """
-/* The pane hierarchy is intentionally neutral gray/white like the reference
-   material.  Wallpaper colour remains visible behind it while the crisp rim
-   and the tiny blue accent provide depth and focus. */
-QFrame#sidebar { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(45,49,61,224), stop:0.55 rgba(30,34,45,216), stop:1 rgba(59,48,68,208)); border: 1px solid rgba(245,248,255,176); border-radius: 20px; }
-QFrame#glass { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(236,240,248,92), stop:0.38 rgba(176,188,208,70), stop:0.72 rgba(111,125,151,76), stop:1 rgba(239,226,239,72)); border: 1px solid rgba(255,255,255,198); border-radius: 20px; }
-QFrame#matchDetailPanel { background: rgba(37,42,53,164); border: 1px solid rgba(241,246,255,144); border-radius: 20px; }
-QFrame#hero { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(242,246,253,132), stop:0.48 rgba(174,193,222,108), stop:1 rgba(228,211,229,108)); border: 1px solid rgba(255,255,255,230); border-left: 4px solid #dceaff; border-radius: 20px; }
-QFrame#metricCard { background: rgba(226,232,243,82); border: 1px solid rgba(255,255,255,165); border-radius: 16px; }
-QFrame#featureCard { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(208,216,231,76), stop:0.6 rgba(135,149,174,70), stop:1 rgba(214,195,218,66)); border: 1px solid rgba(255,255,255,158); border-radius: 20px; }
-QFrame#featureRow { background: rgba(229,235,245,66); border: 1px solid rgba(255,255,255,135); border-radius: 14px; }
-QFrame#matchRecord { background: rgba(231,236,246,56); border: 1px solid rgba(255,255,255,102); border-radius: 14px; }
-QFrame#matchRecord:hover { background: rgba(245,248,255,86); }
-QFrame#matchRecord[selected="true"] { background: rgba(212,229,251,112); border-left-color: #f8fbff; }
-QFrame#statChip { background: rgba(242,246,253,70); border: 1px solid rgba(255,255,255,98); border-radius: 10px; }
-QFrame#matchDetailHero { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(241,245,253,126), stop:0.48 rgba(178,197,225,104), stop:1 rgba(226,209,229,102)); border: 1px solid rgba(255,255,255,215); border-radius: 19px; }
-QFrame#placeholder { background: rgba(209,218,233,76); border: 1px solid rgba(255,255,255,150); border-radius: 20px; }
-QFrame#settingsSidebar { background: rgba(44,49,61,230); border: 1px solid rgba(245,248,255,178); border-radius: 20px; }
-QFrame#settingsCard { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(221,228,240,92), stop:0.65 rgba(128,143,170,86), stop:1 rgba(214,193,220,78)); border: 1px solid rgba(255,255,255,180); border-radius: 20px; }
-QFrame#settingsOverlay { background: rgba(27,30,38,248); border: 1px solid rgba(255,255,255,205); }
-QFrame#row { background: rgba(235,240,248,24); border-bottom: 1px solid rgba(255,255,255,74); }
-QPushButton { border: 1px solid rgba(255,255,255,138); border-radius: 12px; }
+/* Neutral panes let the live blur and shader remain visible. Each layer only
+   changes alpha and edge light, so the hierarchy comes from translucency. */
+QFrame#sidebar { background: rgba(18,21,26,128); border: 1px solid rgba(255,255,255,112); border-radius: 20px; }
+QFrame#glass { background: rgba(235,240,248,38); border: 1px solid rgba(255,255,255,118); border-radius: 20px; }
+QFrame#matchDetailPanel { background: rgba(20,23,29,102); border: 1px solid rgba(255,255,255,88); border-radius: 20px; }
+QFrame#hero { background: rgba(248,250,253,52); border: 1px solid rgba(255,255,255,148); border-left: 4px solid rgba(255,255,255,206); border-radius: 20px; }
+QFrame#metricCard { background: rgba(236,241,248,36); border: 1px solid rgba(255,255,255,98); border-radius: 16px; }
+QFrame#featureCard { background: rgba(222,228,238,28); border: 1px solid rgba(255,255,255,86); border-radius: 20px; }
+QFrame#featureRow { background: rgba(244,247,252,28); border: 1px solid rgba(255,255,255,78); border-radius: 14px; }
+QFrame#matchRecord { background: rgba(235,240,248,26); border: 1px solid rgba(255,255,255,70); border-radius: 14px; }
+QFrame#matchRecord:hover { background: rgba(255,255,255,48); }
+QFrame#matchRecord[selected="true"] { background: rgba(255,255,255,64); border-left-color: #ffffff; }
+QFrame#statChip { background: rgba(245,248,252,36); border: 1px solid rgba(255,255,255,70); border-radius: 10px; }
+QFrame#matchDetailHero { background: rgba(239,244,250,48); border: 1px solid rgba(255,255,255,142); border-radius: 19px; }
+QFrame#placeholder { background: rgba(223,229,239,32); border: 1px solid rgba(255,255,255,96); border-radius: 20px; }
+QFrame#settingsSidebar { background: rgba(18,21,26,148); border: 1px solid rgba(255,255,255,110); border-radius: 20px; }
+QFrame#settingsCard { background: rgba(229,235,244,40); border: 1px solid rgba(255,255,255,118); border-radius: 20px; }
+QFrame#settingsOverlay { background: rgba(22,25,31,248); border: 1px solid rgba(255,255,255,156); }
+QFrame#row { background: rgba(235,240,248,20); border-bottom: 1px solid rgba(255,255,255,50); }
+QPushButton { border: 1px solid rgba(255,255,255,90); border-radius: 12px; }
 QPushButton#navButton { border: none; border-left: 4px solid transparent; border-radius: 9px; }
-QPushButton#navButton:hover { background: rgba(240,246,255,70); border-radius: 9px; color: #ffffff; }
-QPushButton#navButton:checked { border: none; border-left: 4px solid #ffffff; border-radius: 9px; background: rgba(208,226,250,116); color: #ffffff; }
+QPushButton#navButton:hover { background: rgba(255,255,255,38); border-radius: 9px; color: #ffffff; }
+QPushButton#navButton:checked { border: none; border-left: 4px solid #ffffff; border-radius: 9px; background: rgba(255,255,255,64); color: #ffffff; }
 QPushButton#settingsButton { border: none; border-radius: 9px; }
-QPushButton#settingsButton:hover { background: rgba(240,246,255,70); border-radius: 9px; color: #ffffff; }
-QPushButton#settingsButton:checked { border: none; border-left: 4px solid #ffffff; border-radius: 9px; background: rgba(208,226,250,104); color: #ffffff; }
-QPushButton#settingsCategory:checked { border: none; border-left: 3px solid #ffffff; background: rgba(208,226,250,88); }
-QPushButton#themeOption { border: 1px solid rgba(255,255,255,128); border-radius: 13px; }
-QPushButton#themeOption:checked { border: 1px solid rgba(255,255,255,225); border-left: 3px solid #ffffff; background: rgba(208,226,250,98); color: #ffffff; }
+QPushButton#settingsButton:hover { background: rgba(255,255,255,38); border-radius: 9px; color: #ffffff; }
+QPushButton#settingsButton:checked { border: none; border-left: 4px solid #ffffff; border-radius: 9px; background: rgba(255,255,255,64); color: #ffffff; }
+QPushButton#settingsCategory:checked { border: none; border-left: 3px solid #ffffff; background: rgba(255,255,255,54); }
+QPushButton#themeOption { border: 1px solid rgba(255,255,255,90); border-radius: 13px; }
+QPushButton#themeOption:checked { border: 1px solid rgba(255,255,255,190); border-left: 3px solid #ffffff; background: rgba(255,255,255,64); color: #ffffff; }
 """,
     'dark': """
 QFrame#sidebar { background: rgba(7,13,22,248); border: 1px solid rgba(122,155,194,52); border-radius: 18px; }
@@ -2719,7 +2813,7 @@ def resolve_icon_name(name):
 
 def icon_tile(name, object_name='moduleIconTile', color='#a9d4ff', size=24, tile_size=48):
     """创建统一的线性图标容器，页面模块和状态行共用同一套视觉语言。"""
-    tile = QFrame()
+    tile = GlassFrame()
     tile.setObjectName(object_name)
     tile.setFixedSize(tile_size, tile_size)
     tile_layout = QHBoxLayout(tile)
@@ -2738,51 +2832,222 @@ def icon_tile(name, object_name='moduleIconTile', color='#a9d4ff', size=24, tile
     return tile
 
 
-class ThemeBackdrop(Backdrop):
-    """主题背景。
 
-    The WebGL reference renders each pane from a live scene texture and adds
-    refraction, a bevel highlight and a slow specular pass.  A translucent
-    Qt window cannot safely host a second full-screen OpenGL surface on every
-    Windows compositor, so the native implementation keeps the same visual
-    ingredients in a bounded paint pass: a cached optical base plus a small
-    animated light field, caustic ribbons and a moving rim sheen.  Only this
-    one background widget repaints at 30 fps while the liquid theme is active;
-    child widgets keep their normal cached backing stores.
+class DynamicGlassOverlay(QWidget):
+    """透明动态折射层，负责光场、高光和玻璃边缘动画。
+
+    InfiniteGUI 的动态模糊运行在宿主游戏的 OpenGL 帧缓冲上。这里由
+    Windows DWM 提供实时模糊场景，Qt 只更新一个低分辨率光学层；这样
+    不需要注入、屏幕抓取或额外运行时，同时避免透明 Qt 窗口的黑块合成。
+    所有绘制都带透明度，绝不铺静态背板颜色。
     """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAutoFillBackground(False)
+        self._phase = 0.0
+        self._field_image = None
+        self._field_key = None
+        self._surface_frames = []
+        self._surface_refresh_tick = 0
+        self._timer = QTimer(self)
+        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._timer.setInterval(33)
+        self._timer.timeout.connect(self._advance)
+        self._timer.start()
+
+    def _advance(self):
+        host = self.window()
+        if (not self.isVisible() or host is None or host.isMinimized()
+                or getattr(host, '_dragging', False)):
+            return
+        self._phase = (self._phase + 0.038) % math.tau
+        # Every surface frame receives the same phase, so the shimmer flows
+        # through the sidebar, cards and detail panels as one material.
+        root = self.parentWidget()
+        if root is not None:
+            # Page switches can add/remove panels. Refresh the list a few
+            # times per second, while avoiding a full QObject tree walk for
+            # every 30 fps optical frame.
+            self._surface_refresh_tick = (self._surface_refresh_tick + 1) % 12
+            if self._surface_refresh_tick == 0 or not self._surface_frames:
+                self._surface_frames = root.findChildren(GlassFrame)
+            for frame in tuple(self._surface_frames):
+                frame.set_glass_phase(self._phase)
+        app = QApplication.instance()
+        if app is not None:
+            app.setProperty('_liquidPhase', self._phase)
+        self.update()
+
+    def _render_field(self, width, height):
+        # Work at roughly half resolution.  Gradients do the softening, and
+        # the final smooth upscale keeps the background animation inexpensive.
+        field_width = max(1, int(width * 0.48))
+        field_height = max(1, int(height * 0.48))
+        key = (field_width, field_height)
+        if self._field_image is None or self._field_key != key:
+            self._field_image = QImage(field_width, field_height,
+                                        QImage.Format.Format_ARGB32_Premultiplied)
+            self._field_key = key
+        image = self._field_image
+        image.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        iw, ih = float(field_width), float(field_height)
+        short = min(iw, ih)
+        phase = self._phase
+        # These volumes are deliberately low-alpha.  They move independently
+        # so the DWM blur underneath reads as refraction instead of a painted
+        # colour wash.
+        volumes = [
+            (0.20 + 0.14 * math.sin(phase * 0.74),
+             0.19 + 0.16 * math.cos(phase * 0.51),
+             0.66 * short, QColor(147, 183, 231, 34)),
+            (0.79 + 0.12 * math.cos(phase * 0.43),
+             0.36 + 0.13 * math.sin(phase * 0.62),
+             0.57 * short, QColor(215, 193, 224, 27)),
+            (0.52 + 0.16 * math.sin(phase * 0.37),
+             0.86 + 0.09 * math.cos(phase * 0.57),
+             0.45 * short, QColor(239, 213, 185, 23)),
+            (0.30 + 0.10 * math.cos(phase * 0.33),
+             0.68 + 0.11 * math.sin(phase * 0.47),
+             0.38 * short, QColor(198, 220, 220, 20)),
+        ]
+        for x, y, radius, color in volumes:
+            center = QPointF(iw * x, ih * y)
+            gradient = QRadialGradient(center, radius)
+            gradient.setColorAt(0.0, color)
+            gradient.setColorAt(0.34, QColor(color.red(), color.green(), color.blue(), int(color.alpha() * 0.48)))
+            gradient.setColorAt(0.76, QColor(color.red(), color.green(), color.blue(), int(color.alpha() * 0.10)))
+            gradient.setColorAt(1.0, QColor(0, 0, 0, 0))
+            painter.setBrush(gradient)
+            painter.drawEllipse(center, radius, radius)
+
+        # Wide ribbons imitate the reference's moving blur bands.  The broad
+        # pass is almost transparent; a one-pixel rim makes the movement read
+        # as a light reflection rather than a coloured line.
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        ribbons = [
+            (0.16 + 0.05 * math.sin(phase * 0.31), 0.22, 0.20, 24, 64),
+            (0.57 + 0.04 * math.cos(phase * 0.27), -0.16, 0.18, 18, 50),
+            (0.82 + 0.03 * math.sin(phase * 0.43), 0.10, 0.14, 14, 42),
+        ]
+        for index, (anchor, slope, curve, broad_alpha, edge_alpha) in enumerate(ribbons):
+            path = QPainterPath()
+            y0 = ih * (anchor + 0.10 * math.sin(phase * (0.20 + index * 0.07)))
+            path.moveTo(-iw * 0.18, y0 + ih * slope)
+            path.cubicTo(iw * 0.20, y0 - ih * curve,
+                         iw * 0.56, y0 + ih * curve,
+                         iw * 1.18, y0 - ih * slope)
+            painter.setPen(QPen(QColor(239, 246, 255, broad_alpha),
+                                max(8.0, short * 0.052),
+                                Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                                Qt.PenJoinStyle.RoundJoin))
+            painter.drawPath(path)
+            painter.setPen(QPen(QColor(255, 255, 255, edge_alpha),
+                                max(0.7, short * 0.004),
+                                Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                                Qt.PenJoinStyle.RoundJoin))
+            painter.drawPath(path)
+        painter.end()
+        return image
+
+    def paintEvent(self, event):
+        width, height = self.width(), self.height()
+        if width <= 0 or height <= 0:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        field = self._render_field(width, height)
+        painter.drawImage(self.rect(), field)
+
+        # Full-resolution specular pass: a slow white sheen and two meniscus
+        # arcs give each frame a clear motion cue without static fill.
+        phase = self._phase
+        sheen_x = -width * 0.28 + ((phase / math.tau) % 1.0) * width * 1.55
+        sheen = QLinearGradient(sheen_x - width * 0.16, 0,
+                                sheen_x + width * 0.16, 0)
+        sheen.setColorAt(0.0, QColor(255, 255, 255, 0))
+        sheen.setColorAt(0.5, QColor(255, 255, 255, 34))
+        sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(sheen)
+        painter.drawRect(self.rect())
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        short = float(min(width, height))
+        for index in range(2):
+            cx = width * (0.22 + index * 0.56) + math.sin(phase * 0.41 + index) * width * 0.07
+            cy = height * (0.28 + index * 0.44) + math.cos(phase * 0.34 + index) * height * 0.06
+            radius = short * (0.23 + index * 0.045)
+            painter.setPen(QPen(QColor(246, 250, 255, 31 + index * 8),
+                                max(1.0, short * 0.0018)))
+            painter.drawArc(QRectF(cx - radius, cy - radius, radius * 2, radius * 2),
+                            int((phase * 180 / math.pi + index * 88) * 16), 118 * 16)
+        painter.end()
+
+    def closeEvent(self, event):
+        self._timer.stop()
+        super().closeEvent(event)
+
+
+class ThemeBackdrop(Backdrop):
+    """主题背景与透明动态液态玻璃层。"""
 
     def __init__(self, theme='light', parent=None):
         self.theme = theme
+        self._liquid_overlay = None
         super().__init__(parent)
-        self._liquid_phase = 0.0
-        self._liquid_timer = QTimer(self)
-        self._liquid_timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._liquid_timer.setInterval(33)
-        self._liquid_timer.timeout.connect(self._advance_liquid)
         self.setMouseTracking(True)
         if self.theme == 'liquid':
-            self._liquid_timer.start()
+            self._create_liquid_overlay()
 
-    def _advance_liquid(self):
-        # Window dragging is deliberately quiet: the compositor already has
-        # more work to do while moving a frameless window, and a frozen frame
-        # looks steadier than a competing animation during the gesture.
-        host = self.window()
-        if not self.isVisible() or host is None or host.isMinimized():
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self.theme == 'liquid':
+            self._create_liquid_overlay()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._liquid_overlay is not None:
+            self._liquid_overlay.setGeometry(self.rect())
+
+    def _create_liquid_overlay(self):
+        if self._liquid_overlay is not None:
+            self._liquid_overlay.setGeometry(self.rect())
+            self._liquid_overlay.show()
+            self._liquid_overlay.lower()
             return
-        if getattr(host, '_dragging', False):
-            return
-        self._liquid_phase = (self._liquid_phase + 0.024) % (math.tau)
-        self.update()
+        overlay = DynamicGlassOverlay(self)
+        overlay.setObjectName('liquidGlassOverlay')
+        overlay.setGeometry(self.rect())
+        overlay.show()
+        overlay.lower()
+        self._liquid_overlay = overlay
+
+    def _remove_liquid_overlay(self):
+        overlay = self._liquid_overlay
+        self._liquid_overlay = None
+        if overlay is not None:
+            overlay.hide()
+            overlay.close()
+            overlay.deleteLater()
 
     def set_theme(self, theme):
-        if theme not in THEME_PALETTES or theme == self.theme:
+        if theme not in THEME_PALETTES:
+            return
+        if theme == self.theme:
+            if theme == 'liquid':
+                self._create_liquid_overlay()
             return
         self.theme = theme
         if theme == 'liquid':
-            self._liquid_timer.start()
+            self._create_liquid_overlay()
         else:
-            self._liquid_timer.stop()
+            self._remove_liquid_overlay()
         self._background_cache = None
         self._cache_key = None
         self.update()
@@ -2793,16 +3058,15 @@ class ThemeBackdrop(Backdrop):
             self._background_cache = None
             self._cache_key = None
             return
-        palette = THEME_PALETTES[self.theme]
         cache = QPixmap(width, height)
         cache.fill(Qt.GlobalColor.transparent)
         if self.theme == 'liquid':
-            # Do not paint a charcoal or coloured base under the live field.
-            # Keeping a real transparent pixmap also avoids the opaque
-            # fallback path while Windows DWM supplies the frosted glass.
+            # The redesigned liquid theme has no static backplate. Windows
+            # DWM owns the frosted scene; the child overlay owns the motion.
             self._background_cache = cache
             self._cache_key = (width, height, round(self.devicePixelRatioF(), 2))
             return
+        palette = THEME_PALETTES[self.theme]
         painter = QPainter(cache)
         base = QLinearGradient(0, 0, width, height)
         base.setColorAt(0, QColor(*palette['start']))
@@ -2818,119 +3082,17 @@ class ThemeBackdrop(Backdrop):
             painter.fillRect(0, 0, width, height, glow)
         painter.end()
         self._background_cache = cache
-        # ThemeBackdrop 在切换主题时会清空缓存；这里保持与父类相同的 key
-        # 结构，避免每次普通 paintEvent 都重复重建渐变。
         self._cache_key = (width, height, round(self.devicePixelRatioF(), 2))
-
-    @staticmethod
-    def _rgba(values, alpha_scale=1.0):
-        """Convert a theme tuple into a QColor without leaking alpha math."""
-        r, g, b, a = values
-        return QColor(int(r), int(g), int(b), max(0, min(255, int(a * alpha_scale))))
-
-    def _paint_liquid_layers(self, painter):
-        """Paint the animated optical field over the cached background."""
-        width, height = self.width(), self.height()
-        if width <= 0 or height <= 0:
-            return
-        phase = self._liquid_phase
-        short = float(min(width, height))
-        # Two broad colour volumes move on different orbits.  The overlap is
-        # what gives the background the soft cyan-to-violet dispersion visible
-        # through the semi-transparent cards.
-        blobs = [
-            (0.16 + 0.08 * math.sin(phase * 0.71),
-             0.20 + 0.12 * math.cos(phase * 0.53),
-             0.60, (79, 155, 235, 62)),
-            (0.82 + 0.10 * math.cos(phase * 0.47),
-             0.30 + 0.14 * math.sin(phase * 0.63),
-             0.53, (210, 73, 181, 48)),
-            (0.58 + 0.12 * math.sin(phase * 0.38),
-             0.88 + 0.08 * math.cos(phase * 0.59),
-             0.44, (235, 137, 104, 40)),
-            (0.28 + 0.10 * math.cos(phase * 0.31),
-             0.68 + 0.10 * math.sin(phase * 0.43),
-             0.36, (104, 204, 208, 32)),
-        ]
-        painter.save()
-        painter.setPen(Qt.PenStyle.NoPen)
-        for x, y, radius_factor, color in blobs:
-            cx, cy = width * x, height * y
-            radius = short * radius_factor
-            glow = QRadialGradient(QPointF(cx, cy), radius)
-            glow.setColorAt(0.0, self._rgba(color, 1.0))
-            glow.setColorAt(0.34, self._rgba(color, 0.58))
-            glow.setColorAt(0.72, self._rgba(color, 0.16))
-            glow.setColorAt(1.0, QColor(0, 0, 0, 0))
-            painter.setBrush(glow)
-            painter.drawEllipse(QPointF(cx, cy), radius, radius)
-
-        # Broad, low-alpha ribbons imitate the distortion bands of a liquid
-        # lens.  Their paths stay inside the backdrop so no child widget is
-        # repainted and no clipping artifacts appear at panel edges.
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        ribbon_specs = [
-            (0.16 + 0.035 * math.sin(phase * 0.45), 0.22, 0.22,
-             QColor(228, 237, 255, 18), QColor(246, 250, 255, 62)),
-            (0.64 + 0.045 * math.cos(phase * 0.36), -0.12, 0.20,
-             QColor(245, 216, 255, 14), QColor(255, 241, 250, 48)),
-            (0.44 + 0.04 * math.sin(phase * 0.57), 0.70, 0.16,
-             QColor(255, 222, 197, 12), QColor(255, 245, 225, 42)),
-        ]
-        for index, (anchor, slope, curve, broad, edge) in enumerate(ribbon_specs):
-            path = QPainterPath()
-            y0 = height * (anchor + 0.12 * math.sin(phase * (0.24 + index * 0.07)))
-            path.moveTo(-width * 0.15, y0 + height * slope)
-            path.cubicTo(width * 0.18, y0 - height * curve,
-                         width * 0.55, y0 + height * curve,
-                         width * 1.15, y0 - height * slope)
-            painter.setPen(QPen(broad, max(18.0, short * 0.045),
-                                Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
-                                Qt.PenJoinStyle.RoundJoin))
-            painter.drawPath(path)
-            painter.setPen(QPen(edge, max(1.0, short * 0.0022),
-                                Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
-                                Qt.PenJoinStyle.RoundJoin))
-            painter.drawPath(path)
-
-        # A narrow specular band slowly travels across the scene.  It is kept
-        # below the opaque text/cards and reads as reflected light rather than
-        # a noisy animation.
-        sheen_x = -width * 0.3 + ((phase / math.tau) % 1.0) * width * 1.6
-        sheen = QLinearGradient(sheen_x - width * 0.18, 0,
-                                sheen_x + width * 0.18, 0)
-        sheen.setColorAt(0.0, QColor(240, 244, 255, 0))
-        sheen.setColorAt(0.5, QColor(255, 255, 255, 30))
-        sheen.setColorAt(1.0, QColor(221, 231, 255, 0))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(sheen)
-        painter.drawRect(0, 0, width, height)
-
-        # Fine arcs add a meniscus-like edge cue without drawing literal
-        # outlines around every widget.
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        for i in range(3):
-            cx = width * (0.18 + i * 0.37) + math.sin(phase * 0.4 + i) * width * 0.06
-            cy = height * (0.25 + i * 0.28) + math.cos(phase * 0.32 + i) * height * 0.05
-            radius = short * (0.22 + i * 0.035)
-            pen_color = QColor(237, 244, 255, 30 if i != 1 else 40)
-            painter.setPen(QPen(pen_color, max(1.0, short * 0.0018)))
-            painter.drawArc(QRectF(cx - radius, cy - radius, radius * 2, radius * 2),
-                            int((phase * 180 / math.pi + i * 72) * 16), 94 * 16)
-        painter.restore()
 
     def paintEvent(self, event):
         cache_key = (self.width(), self.height(), round(self.devicePixelRatioF(), 2))
         if self._background_cache is None or self._cache_key != cache_key:
             self._rebuild_cache()
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, self.theme == 'liquid')
         if self._background_cache is not None:
             painter.drawPixmap(0, 0, self._background_cache)
         else:
             painter.fillRect(self.rect(), QColor(0, 0, 0, 0))
-        if self.theme == 'liquid':
-            self._paint_liquid_layers(painter)
         painter.end()
 
 
@@ -3290,7 +3452,7 @@ class LargeApp(App):
         self.switch_section('overview')
 
     def _build_update_banner(self):
-        banner = QFrame()
+        banner = GlassFrame()
         banner.setObjectName('updateBanner')
         banner_layout = QHBoxLayout(banner)
         banner_layout.setContentsMargins(14, 7, 8, 7)
@@ -3358,7 +3520,7 @@ class LargeApp(App):
         QDesktopServices.openUrl(QUrl(url))
 
     def _build_sidebar(self):
-        sidebar = QFrame()
+        sidebar = GlassFrame()
         sidebar.setObjectName('sidebar')
         sidebar.setMinimumWidth(218)
         sidebar.setMaximumWidth(244)
@@ -3379,7 +3541,7 @@ class LargeApp(App):
         brand_copy.addWidget(label('DEV King', 'brandHint'))
         brand_row.addLayout(brand_copy)
         layout.addLayout(brand_row)
-        line = QFrame()
+        line = GlassFrame()
         line.setObjectName('navLine')
         line.setFixedHeight(1)
         layout.addWidget(line)
@@ -3476,7 +3638,7 @@ class LargeApp(App):
         heading.addWidget(label('查看起床战争工具状态，选择对应功能开始使用。', 'pageHint'))
         layout.addLayout(heading)
 
-        hero = QFrame()
+        hero = GlassFrame()
         hero.setObjectName('hero')
         hero_layout = QHBoxLayout(hero)
         hero_layout.setContentsMargins(22, 20, 22, 20)
@@ -3549,7 +3711,7 @@ class LargeApp(App):
         return page
 
     def _feature_row(self, parent_layout, title, description, mark='●'):
-        row = QFrame()
+        row = GlassFrame()
         row.setObjectName('featureRow')
         row.setMinimumHeight(42)
         row_layout = QHBoxLayout(row)
@@ -3576,7 +3738,7 @@ class LargeApp(App):
         parent_layout.addLayout(header)
 
     def _metric_card(self, parent_layout, title, value, icon_name='command', compact=False):
-        card = QFrame()
+        card = GlassFrame()
         card.setObjectName('metricCard')
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(15, 13, 15, 13)
@@ -3689,7 +3851,7 @@ class LargeApp(App):
         rows_layout.setContentsMargins(0, 0, 4, 0)
         rows_layout.setSpacing(0)
         for target in self.targets:
-            row = QFrame()
+            row = GlassFrame()
             row.setObjectName('row')
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(0, 10, 0, 10)
@@ -3939,7 +4101,7 @@ class LargeApp(App):
                 if widget is not None:
                     widget.deleteLater()
             for index, entry in enumerate(entries[:100]):
-                row = QFrame()
+                row = GlassFrame()
                 row.setObjectName('leaderboardRow')
                 # 将官方名次归一为五档视觉层级：1/2/3 使用金银铜高光，
                 # 4 与 5+ 逐渐降低对比度，确保榜单从上往下自然收束。
@@ -4134,7 +4296,7 @@ class LargeApp(App):
         self.match_scroll.setWidget(self.match_rows_widget)
         result_layout.addWidget(self.match_scroll, 1)
 
-        daily_summary = QFrame()
+        daily_summary = GlassFrame()
         daily_summary.setObjectName('dailySummary')
         daily_summary_layout = QVBoxLayout(daily_summary)
         daily_summary_layout.setContentsMargins(0, 2, 0, 0)
@@ -4151,7 +4313,7 @@ class LargeApp(App):
         for key, title in (
                 ('win_rate', '胜率'), ('final_kills', '最终击杀'),
                 ('beds', '最终拆床'), ('final_deaths', '最终死亡')):
-            chip = QFrame()
+            chip = GlassFrame()
             chip.setObjectName('dailyStatChip')
             chip.setMinimumHeight(42)
             chip_layout = QVBoxLayout(chip)
@@ -4172,7 +4334,7 @@ class LargeApp(App):
 
         # Details stay inside the selected page so the main GUI does not
         # spawn a separate window.  The panel is populated lazily on demand.
-        self.match_detail_panel = QFrame(page)
+        self.match_detail_panel = GlassFrame(page)
         self.match_detail_panel.setObjectName('matchDetailPanel')
         self.match_detail_panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.match_detail_panel.setVisible(False)
@@ -5002,7 +5164,7 @@ class LargeApp(App):
             summary_bits.append(f'胜方：{winner_name}')
         self.match_detail_state.setText('  ·  '.join(summary_bits))
 
-        hero = QFrame()
+        hero = GlassFrame()
         hero.setObjectName('matchDetailHero')
         hero.setProperty('recordOutcome', outcome or 'unknown')
         hero_layout = QVBoxLayout(hero)
@@ -5063,7 +5225,7 @@ class LargeApp(App):
             queried_player or {}, 'bed_destory', 'bed_destroy', 'bedDestroy'))
         query_final_deaths = self._display_stat_value(self._numeric_stat(
             queried_player or {}, 'final_death', 'finalDeath'))
-        ribbon = QFrame()
+        ribbon = GlassFrame()
         ribbon.setObjectName('matchDetailRibbon')
         ribbon.setProperty('recordOutcome', outcome or 'unknown')
         ribbon_layout = QVBoxLayout(ribbon)
@@ -5111,7 +5273,7 @@ class LargeApp(App):
         # A compact team overview gives the detail view a clear second level:
         # team identity and aggregate performance are separated from the
         # player-level positive/negative metric colors below.
-        team_overview = QFrame()
+        team_overview = GlassFrame()
         team_overview.setObjectName('teamOverviewCard')
         team_overview_layout = QVBoxLayout(team_overview)
         team_overview_layout.setContentsMargins(13, 12, 13, 13)
@@ -5130,7 +5292,7 @@ class LargeApp(App):
             if not isinstance(team_players, list):
                 continue
             team_name = str(team_name)
-            team_item = QFrame()
+            team_item = GlassFrame()
             team_item.setObjectName('teamOverviewItem')
             team_item.setProperty('teamTint', team_tints[team_index % len(team_tints)])
             team_item.setProperty('teamResult', 'win' if winner_team and team_name == winner_team
@@ -5200,7 +5362,7 @@ class LargeApp(App):
                     (self._match_player_name and player_name.casefold() == self._match_player_name.casefold())
                     or (self._match_player_uuid and player_uuid.casefold() == self._match_player_uuid.casefold())
                 )
-                player_row = QFrame()
+                player_row = GlassFrame()
                 player_row.setObjectName('featureRow')
                 player_row.setProperty('teamTint', team_tint)
                 player_row.setProperty('queryTarget', 'true' if player_is_target else 'false')
@@ -5308,7 +5470,7 @@ class LargeApp(App):
             return
         self._clear_detail_layout()
         self.match_detail_title.setText(title)
-        placeholder = QFrame()
+        placeholder = GlassFrame()
         placeholder.setObjectName('featureCard')
         placeholder_layout = QVBoxLayout(placeholder)
         placeholder_layout.setContentsMargins(20, 24, 20, 24)
@@ -5482,7 +5644,7 @@ class LargeApp(App):
         return str(value)
 
     def _stat_chip(self, title, value):
-        chip = QFrame()
+        chip = GlassFrame()
         chip.setObjectName('statChip')
         chip_layout = QVBoxLayout(chip)
         chip_layout.setContentsMargins(9, 7, 9, 7)
@@ -5655,7 +5817,7 @@ class LargeApp(App):
         heading.addWidget(label('公共大厅频道 · 仅使用登录游戏 ID 发言，没有私聊。', 'pageHint'))
         layout.addLayout(heading)
 
-        overview = QFrame()
+        overview = GlassFrame()
         overview.setObjectName('chatOverviewCard')
         overview_layout = QHBoxLayout(overview)
         overview_layout.setContentsMargins(16, 12, 16, 12)
@@ -5675,7 +5837,7 @@ class LargeApp(App):
         self.chat_server_hint.setObjectName('chatServerHint')
         status_copy.addWidget(self.chat_server_hint)
         overview_layout.addLayout(status_copy, 1)
-        online_box = QFrame()
+        online_box = GlassFrame()
         online_box.setObjectName('chatOnlineCard')
         online_layout = QVBoxLayout(online_box)
         online_layout.setContentsMargins(12, 7, 12, 7)
@@ -5693,7 +5855,7 @@ class LargeApp(App):
         overview_layout.addWidget(refresh)
         layout.addWidget(overview)
 
-        chat_card = QFrame()
+        chat_card = GlassFrame()
         chat_card.setObjectName('chatCard')
         chat_layout = QVBoxLayout(chat_card)
         chat_layout.setContentsMargins(14, 13, 14, 14)
@@ -5758,7 +5920,7 @@ class LargeApp(App):
         popup = getattr(self, 'chat_emoji_popup', None)
         if popup is not None:
             return popup
-        popup = QFrame(self, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        popup = GlassFrame(self, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
         popup.setObjectName('chatEmojiPopup')
         popup.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         popup.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
@@ -6214,7 +6376,7 @@ class LargeApp(App):
         if not normalized:
             self.chat_messages_layout.addWidget(self.chat_empty_label)
         for item in normalized:
-            bubble = QFrame()
+            bubble = GlassFrame()
             bubble.setObjectName('chatMessageBubble')
             bubble.setProperty(
                 'mine', 'true' if str(item['sender']).casefold() ==
@@ -6261,7 +6423,7 @@ class LargeApp(App):
         heading.addWidget(label(description, 'pageHint'))
         layout.addLayout(heading)
 
-        card = QFrame()
+        card = GlassFrame()
         card.setObjectName('placeholder')
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(30, 28, 30, 28)
@@ -6293,7 +6455,7 @@ class LargeApp(App):
         heading.addWidget(label('按主任务栏从右往左列出运行中的窗口，双击即可快速切换。', 'pageHint'))
         layout.addLayout(heading)
 
-        info_card = QFrame()
+        info_card = GlassFrame()
         info_card.setObjectName('taskbarInfoCard')
         info_layout = QVBoxLayout(info_card)
         info_layout.setContentsMargins(18, 15, 18, 15)
@@ -6314,7 +6476,7 @@ class LargeApp(App):
         info_layout.addWidget(self.taskbar_hotkey_hint)
         layout.addWidget(info_card)
 
-        list_card = QFrame()
+        list_card = GlassFrame()
         list_card.setObjectName('taskbarListCard')
         list_layout = QVBoxLayout(list_card)
         list_layout.setContentsMargins(18, 15, 18, 15)
@@ -6570,7 +6732,7 @@ class LargeApp(App):
         body.setSpacing(14)
         layout.addLayout(body, 1)
 
-        category_panel = QFrame()
+        category_panel = GlassFrame()
         category_panel.setObjectName('settingsSidebar')
         category_panel.setMinimumWidth(218)
         category_panel.setMaximumWidth(244)
@@ -6628,7 +6790,7 @@ class LargeApp(App):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
-        card = QFrame()
+        card = GlassFrame()
         card.setObjectName('settingsCard')
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(22, 20, 22, 18)
@@ -6636,7 +6798,7 @@ class LargeApp(App):
         self._section_header(card_layout, '常规设置', 'settings')
         card_layout.addWidget(label('调整消息反馈和常用行为。', 'muted'))
 
-        sound_row = QFrame()
+        sound_row = GlassFrame()
         sound_row.setObjectName('featureRow')
         sound_layout = QHBoxLayout(sound_row)
         sound_layout.setContentsMargins(14, 11, 14, 11)
@@ -6657,7 +6819,7 @@ class LargeApp(App):
         sound_layout.addWidget(toggle)
         card_layout.addWidget(sound_row)
 
-        volume_row = QFrame()
+        volume_row = GlassFrame()
         volume_row.setObjectName('featureRow')
         volume_layout = QHBoxLayout(volume_row)
         volume_layout.setContentsMargins(14, 11, 14, 11)
@@ -6695,7 +6857,7 @@ class LargeApp(App):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
-        card = QFrame()
+        card = GlassFrame()
         card.setObjectName('settingsCard')
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(22, 20, 22, 18)
@@ -6704,7 +6866,7 @@ class LargeApp(App):
         hint = label('登录游戏 ID 后，战局查询和大厅聊天会共用这个身份。换绑后下次发送消息立即生效。', 'muted')
         hint.setWordWrap(True)
         card_layout.addWidget(hint)
-        row = QFrame()
+        row = GlassFrame()
         row.setObjectName('featureRow')
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(14, 11, 14, 11)
@@ -6726,7 +6888,7 @@ class LargeApp(App):
         save.setObjectName('chatSaveIdentity')
         row_layout.addWidget(save)
         card_layout.addWidget(row)
-        server_row = QFrame()
+        server_row = GlassFrame()
         server_row.setObjectName('featureRow')
         server_layout = QHBoxLayout(server_row)
         server_layout.setContentsMargins(14, 11, 14, 11)
@@ -6751,7 +6913,7 @@ class LargeApp(App):
         server_save.setObjectName('chatSaveServer')
         server_layout.addWidget(server_save)
         card_layout.addWidget(server_row)
-        sound_row = QFrame()
+        sound_row = GlassFrame()
         sound_row.setObjectName('featureRow')
         sound_layout = QHBoxLayout(sound_row)
         sound_layout.setContentsMargins(14, 10, 14, 10)
@@ -6811,7 +6973,7 @@ class LargeApp(App):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
-        card = QFrame()
+        card = GlassFrame()
         card.setObjectName('settingsCard')
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(22, 20, 22, 18)
@@ -6829,7 +6991,7 @@ class LargeApp(App):
         bindings_grid.setVerticalSpacing(8)
         self._taskbar_hotkey_edits = {}
         for index in range(10):
-            row = QFrame()
+            row = GlassFrame()
             row.setObjectName('featureRow')
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(11, 7, 11, 7)
@@ -6930,14 +7092,14 @@ class LargeApp(App):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
-        card = QFrame()
+        card = GlassFrame()
         card.setObjectName('settingsCard')
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(24, 22, 24, 22)
         card_layout.setSpacing(12)
         self._section_header(card_layout, '动画与反馈', 'sparkles')
         card_layout.addWidget(label('控制页面切换、按钮反馈和对局详情展开的过渡速度。', 'muted'))
-        row = QFrame()
+        row = GlassFrame()
         row.setObjectName('featureRow')
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(14, 12, 14, 12)
@@ -6968,7 +7130,7 @@ class LargeApp(App):
 
     def _build_settings_overlay(self, root):
         """创建覆盖整个客户端区域的设置层，背景使用不透明主题色。"""
-        overlay = QFrame(root)
+        overlay = GlassFrame(root)
         overlay.setObjectName('settingsOverlay')
         overlay.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
         overlay.setGeometry(root.rect())
@@ -7025,7 +7187,7 @@ class LargeApp(App):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
 
-        card = QFrame()
+        card = GlassFrame()
         card.setObjectName('settingsCard')
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(22, 20, 22, 20)
@@ -7070,7 +7232,7 @@ class LargeApp(App):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
-        card = QFrame()
+        card = GlassFrame()
         card.setObjectName('settingsCard')
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(24, 22, 24, 22)
@@ -7165,7 +7327,7 @@ class LargeApp(App):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
-        card = QFrame()
+        card = GlassFrame()
         card.setObjectName('settingsCard')
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(26, 24, 26, 24)
@@ -7268,7 +7430,7 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
         elif self.current_theme == 'glass':
             normal, active, metric = '#c4c6ca', '#f7f7f8', '#d0d2d6'
         elif self.current_theme == 'liquid':
-            normal, active, metric = '#c7d1df', '#ffffff', '#b7d3f5'
+            normal, active, metric = '#d1d6df', '#ffffff', '#e7ecf4'
         else:
             normal, active, metric = '#b8c8dc', '#eff7ff', '#a9d4ff'
         for button in self.nav_buttons.values():
@@ -7281,7 +7443,7 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
         theme_active = (
             '#ffffff' if self.current_theme == 'light'
             else '#202124' if self.current_theme == 'glass'
-            else '#18263b' if self.current_theme == 'liquid'
+            else '#1d2025' if self.current_theme == 'liquid'
             else '#102640'
         )
         for key, button in getattr(self, 'theme_buttons', {}).items():
@@ -7306,7 +7468,7 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
         tile_color = (
             '#3f79b4' if self.current_theme == 'light'
             else '#c9cbd0' if self.current_theme == 'glass'
-            else '#b7d3f5' if self.current_theme == 'liquid'
+            else '#e7ecf4' if self.current_theme == 'liquid'
             else '#bfe1ff'
         )
         status_color = '#287c68' if self.current_theme == 'light' else '#b9f1e4'
