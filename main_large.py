@@ -66,7 +66,7 @@ from main import App, STYLE, Backdrop, TitleBar, label, panel
 
 # The version is also used as the GitHub release tag (for example, v2026.09.29).
 # Bump it when publishing a new release so existing installations can discover it.
-APP_VERSION = '2026.09.30.12'
+APP_VERSION = '2026.09.30.13'
 GITHUB_REPOSITORY = 'zhujianmengbi-droid/-'
 GITHUB_REPOSITORY_URL = f'https://github.com/{GITHUB_REPOSITORY}'
 GITHUB_LATEST_RELEASE_API = (
@@ -1726,15 +1726,15 @@ THEME_PALETTES = {
     },
     'liquid': {
         'name': '液态玻璃',
-        'description': '中性雾化玻璃、动态折射光场与白色高光边缘',
+        'description': '透明动态光场、系统模糊玻璃与白色高光边缘',
         'icon': 'waves',
-        # The reference keeps the panes close to neutral gray and lets the
-        # wallpaper carry the colour.  Keep the base charcoal and reserve
-        # saturation for the slow light field painted above it.
-        'start': (20, 24, 35, 250),
-        'end': (11, 15, 27, 252),
-        'glow1': (81, 133, 218, 50),
-        'glow2': (201, 87, 170, 42),
+        # Liquid glass has no static backplate.  The native DWM blur shows
+        # the desktop through the transparent window while the animated
+        # optical field below supplies all of the motion and colour.
+        'start': (0, 0, 0, 0),
+        'end': (0, 0, 0, 0),
+        'glow1': (0, 0, 0, 0),
+        'glow2': (0, 0, 0, 0),
     },
     'dark': {
         'name': '暗色',
@@ -2796,6 +2796,13 @@ class ThemeBackdrop(Backdrop):
         palette = THEME_PALETTES[self.theme]
         cache = QPixmap(width, height)
         cache.fill(Qt.GlobalColor.transparent)
+        if self.theme == 'liquid':
+            # Do not paint a charcoal or coloured base under the live field.
+            # Keeping a real transparent pixmap also avoids the opaque
+            # fallback path while Windows DWM supplies the frosted glass.
+            self._background_cache = cache
+            self._cache_key = (width, height, round(self.devicePixelRatioF(), 2))
+            return
         painter = QPainter(cache)
         base = QLinearGradient(0, 0, width, height)
         base.setColorAt(0, QColor(*palette['start']))
@@ -2921,7 +2928,7 @@ class ThemeBackdrop(Backdrop):
         if self._background_cache is not None:
             painter.drawPixmap(0, 0, self._background_cache)
         else:
-            painter.fillRect(self.rect(), QColor(12, 21, 37, 140))
+            painter.fillRect(self.rect(), QColor(0, 0, 0, 0))
         if self.theme == 'liquid':
             self._paint_liquid_layers(painter)
         painter.end()
