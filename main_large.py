@@ -55,7 +55,7 @@ from main import App, STYLE, Backdrop, TitleBar, label, panel
 
 # The version is also used as the GitHub release tag (for example, v2026.09.29).
 # Bump it when publishing a new release so existing installations can discover it.
-APP_VERSION = '2026.09.30.6'
+APP_VERSION = '2026.09.30.7'
 GITHUB_REPOSITORY = 'zhujianmengbi-droid/-'
 GITHUB_REPOSITORY_URL = f'https://github.com/{GITHUB_REPOSITORY}'
 GITHUB_LATEST_RELEASE_API = (
@@ -74,6 +74,7 @@ LOBBY_CHAT_JOIN_PATH = '/api/join'
 LOBBY_CHAT_MESSAGES_PATH = '/api/chat/messages'
 LOBBY_CHAT_PRESENCE_PATH = '/api/chat/presence'
 GAME_ID_SETTINGS_KEY = 'profile/gameId'
+CHAT_SESSION_CACHE_KEY = 'chat/sessionMessages'
 TASKBAR_DEFAULT_BINDINGS = {
     index: f'Alt+{digit}'
     for index, digit in enumerate('1234567890')
@@ -2732,6 +2733,10 @@ class LargeApp(App):
         self._chat_client.messageFailed.connect(self._on_supabase_message_failed)
         self._chat_client.presenceChanged.connect(self._on_supabase_presence_changed)
         self._chat_client.error.connect(self._on_supabase_chat_error)
+        # Restore the current session cache after the chat page has been built.
+        # It is removed in closeEvent, so a normal restart starts with a clean
+        # room while navigating between pages does not lose visible messages.
+        self._restore_chat_session_cache()
         self.setWindowTitle('逐渐优化器 · 逐渐工具中心')
         self.resize(1180, 800)
         # 留出标题、指标和两张功能卡的完整空间，避免缩放到窄窗口时说明文字被挤成一行。
@@ -3130,7 +3135,11 @@ class LargeApp(App):
             self.settings_overlay.hide()
         self._active_section = key
         self.page_stack.setCurrentIndex(index)
-        self._animate_widget(self.page_stack.currentWidget(), 210)
+        # TaskbarSwitcher 页面包含原生 QTableWidget viewport。对整页施加
+        # QGraphicsOpacityEffect 时，Windows 合成器会在首帧把 viewport
+        # 画成黑色镂空条；页面本身保持稳定，内部控件仍可正常交互。
+        if key != 'startup':
+            self._animate_widget(self.page_stack.currentWidget(), 210)
         for name, button in self.nav_buttons.items():
             button.setChecked(name == key)
         if hasattr(self, 'settings_button'):
@@ -5501,6 +5510,42 @@ class LargeApp(App):
             self._settings.sync()
         return value
 
+    def _restore_chat_session_cache(self):
+        raw = self._settings.value(CHAT_SESSION_CACHE_KEY, '')
+        if isinstance(raw, QByteArray):
+            raw = bytes(raw).decode('utf-8', errors='ignore')
+        if not raw:
+            return
+        try:
+            payload = json.loads(str(raw))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, list):
+            return
+        messages = [item for item in payload[-80:] if isinstance(item, dict)]
+        if not messages:
+            return
+        self._chat_messages = messages
+        self._chat_message_keys = {
+            self._chat_message_key(item) for item in messages}
+        self._render_lobby_messages(messages)
+
+    def _save_chat_session_cache(self):
+        if not self._chat_messages:
+            self._settings.remove(CHAT_SESSION_CACHE_KEY)
+            return
+        try:
+            raw = json.dumps(self._chat_messages[-80:], ensure_ascii=False,
+                             separators=(',', ':'))
+        except (TypeError, ValueError):
+            return
+        self._settings.setValue(CHAT_SESSION_CACHE_KEY, raw)
+        self._settings.sync()
+
+    def _clear_chat_session_cache(self):
+        self._settings.remove(CHAT_SESSION_CACHE_KEY)
+        self._settings.sync()
+
     def game_id(self):
         """返回当前绑定的布吉岛游戏 ID，供启动登录流程复用。"""
         return self._chat_bound_game_id()
@@ -5528,6 +5573,7 @@ class LargeApp(App):
                 self.chat_input.clear()
             self._chat_messages = []
             self._chat_message_keys.clear()
+            self._clear_chat_session_cache()
         self._refresh_chat_identity()
         if identity_changed and game_id and hasattr(self, 'chat_input'):
             self._poll_lobby_chat()
@@ -5548,6 +5594,7 @@ class LargeApp(App):
             self.chat_input.clear()
             self._chat_messages = []
             self._chat_message_keys.clear()
+            self._clear_chat_session_cache()
         configured = bool(player_id)
         busy = bool(self._chat_sending_message or self._chat_pending_message)
         self.chat_input.setEnabled(configured and not busy)
@@ -5566,7 +5613,7 @@ class LargeApp(App):
             self.chat_status.setText('请先登录游戏 ID 后加入大厅。')
             self.chat_connection_badge.setText('未登录')
         self.chat_server_hint.setText(
-            'Supabase Realtime 公共频道 · 消息仅在各客户端内存中显示')
+            'Supabase Realtime 公共频道 · 本次运行缓存，关闭软件后清除')
 
     @staticmethod
     def _chat_payload_messages(payload):
@@ -5715,8 +5762,8 @@ class LargeApp(App):
     def _on_supabase_chat_message(self, payload):
         if self._closing or not isinstance(payload, dict):
             return
-        # Realtime 没有历史消息；只把当前进程收到的消息留在本地内存，
-        # 关闭软件或重新启动后自然清空。
+        # Realtime 没有历史消息；把当前运行收到的消息写入本机临时缓存，
+        # 方便页面重绘或切换后恢复，关闭软件时会主动清除。
         item = dict(payload)
         item.setdefault('message', item.get('text', ''))
         item.setdefault('player_id', item.get('username', '未知玩家'))
@@ -5731,6 +5778,7 @@ class LargeApp(App):
         self._chat_messages = self._chat_messages[-80:]
         self._chat_message_keys = {
             self._chat_message_key(message) for message in self._chat_messages}
+        self._save_chat_session_cache()
         self._render_lobby_messages(self._chat_messages)
         self.chat_status.setText('已同步实时消息 · 公共大厅可见')
 
@@ -6804,10 +6852,14 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
             self._set_if_changed(self.dashboard_state, text)
 
     def closeEvent(self, event):
+        # The cache belongs to this process only. Clear it before handling
+        # either the idle or busy shutdown path so a close request can never
+        # resurrect the previous room on the next launch.
+        self._closing = True
+        self._clear_chat_session_cache()
         if self.busy:
             super().closeEvent(event)
             return
-        self._closing = True
         if hasattr(self, '_taskbar_auto_refresh_timer'):
             self._taskbar_auto_refresh_timer.stop()
         self._api_queue.clear()
