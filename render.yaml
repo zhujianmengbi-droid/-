@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: dev-king-lobby
+    runtime: python
+    region: singapore
+    plan: free
+    buildCommand: pip install -r requirements-chat.txt
+    startCommand: gunicorn lobby_server:app --bind 0.0.0.0:$PORT --workers 1 --threads 4
+    healthCheckPath: /health
