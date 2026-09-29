@@ -4,7 +4,7 @@
 
 ## 下载
 
-前往 [GitHub Releases](https://github.com/zhujianmengbi-droid/-/releases) 获取 Windows EXE；当前版本为 `ZJ-HUB-v2026.09.30.14.exe`，源码包为 `source/ZJ-HUB-v2026.09.30.14-source.zip`。
+前往 [GitHub Releases](https://github.com/zhujianmengbi-droid/-/releases) 获取 Windows EXE；当前版本为 `ZJ-HUB-v2026.09.30.15.exe`，源码包为 `source/ZJ-HUB-v2026.09.30.15-source.zip`。
 
 ## 游戏 ID 登录
 
@@ -26,12 +26,12 @@
 
 ## 主题与系统
 
-支持明亮、玻璃、液态玻璃、暗色和深海蓝主题；需要 Windows 10 或 Windows 11。液态玻璃主题参考 [liquid-glass-webgl](https://github.com/martin65536/liquid-glass-webgl) 与 [InfiniteGUI-Minecraft-DLL](https://github.com/QCMaxcer/InfiniteGUI-Minecraft-DLL) 的动态模糊思路：背板保持透明，由 Windows DWM 提供实时模糊；低分辨率折射光场、移动高光和弧形反射与侧栏、主卡片、战局详情、排行榜、聊天、快捷工具和设置共享同一动画相位，统一成一套材质。
+支持明亮、玻璃、暗色和深海蓝主题；需要 Windows 10 或 Windows 11。四套主题共用统一圆角、透明层级和控件状态，按钮采用短时可中断的透明度反馈，保持界面清晰和交互流畅。
 
 
 
 
 
 
-- v2026.09.30.14 重做液态玻璃材质：透明 DWM 模糊背板承接桌面，低分辨率折射光场、移动高光和弧形反射与主要 UI 表面共享同一相位；移除上一版静态背板色，不增加新的运行时前置。
+- v2026.09.30.15 删除液态玻璃主题及其动态背景层；保留明亮、玻璃、暗色、深海蓝四套主题，按钮交互采用 125ms 可中断反馈，减少重绘并提升流畅度。
 
