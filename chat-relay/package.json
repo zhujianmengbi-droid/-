@@ -1,0 +1,16 @@
+{
+  "name": "temporary-chat-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Ephemeral in-memory WebSocket relay for small game chat rooms",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
