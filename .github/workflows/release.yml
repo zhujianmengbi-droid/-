@@ -28,7 +28,7 @@ jobs:
 
       - name: Extract source archive
         shell: pwsh
-        run: Expand-Archive -LiteralPath "source/逐渐优化器-v2026.09.30.7-source.zip" -DestinationPath "build-source" -Force
+        run: Expand-Archive -LiteralPath "source/逐渐优化器-v2026.09.30.9-source.zip" -DestinationPath "build-source" -Force
 
       - name: Install application dependencies
         run: python -m pip install --upgrade -r build-source/requirements.txt
@@ -40,20 +40,21 @@ jobs:
       - name: Create or update GitHub Release
         shell: pwsh
         run: |
-          $tag = "v2026.09.30.7"
+          $tag = "v2026.09.30.9"
           $asset = "build-source/dist/逐渐优化器.exe"
-          $downloadAsset = "build-source/DEV-King-Optimizer-v2026.09.30.7.exe"
-          $sourceAsset = "build-source/逐渐优化器-v2026.09.30.7-source.zip"
+          $downloadAsset = "build-source/DEV-King-Optimizer-v2026.09.30.9.exe"
+          $sourceAsset = "build-source/逐渐优化器-v2026.09.30.9-source.zip"
           if (!(Test-Path -LiteralPath $asset)) { throw "Build output not found: $asset" }
           Copy-Item -LiteralPath $asset -Destination $downloadAsset -Force
-          Copy-Item -LiteralPath "source/逐渐优化器-v2026.09.30.7-source.zip" -Destination $sourceAsset -Force
+          Copy-Item -LiteralPath "source/逐渐优化器-v2026.09.30.9-source.zip" -Destination $sourceAsset -Force
           gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag $downloadAsset $sourceAsset --clobber --repo $env:GITHUB_REPOSITORY
-            gh release edit $tag --notes-file "release-notes/2026.09.30.7.txt" --latest --repo $env:GITHUB_REPOSITORY
+            gh release edit $tag --notes-file "release-notes/2026.09.30.9.txt" --latest --repo $env:GITHUB_REPOSITORY
           } else {
-            gh release create $tag $downloadAsset $sourceAsset --title "逐渐优化器 $tag" --notes-file "release-notes/2026.09.30.7.txt" --latest --repo $env:GITHUB_REPOSITORY
+            gh release create $tag $downloadAsset $sourceAsset --title "逐渐优化器 $tag" --notes-file "release-notes/2026.09.30.9.txt" --latest --repo $env:GITHUB_REPOSITORY
           }
+
 
 
 

@@ -11,6 +11,11 @@ import json
 import re
 import ctypes
 import uuid
+import math
+import os
+import struct
+import tempfile
+import wave
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from functools import lru_cache
@@ -24,6 +29,10 @@ from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QKeySequence, 
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtNetwork import QAbstractSocket
 from PySide6.QtWebSockets import QWebSocket
+try:
+    from PySide6.QtMultimedia import QSoundEffect
+except Exception:  # pragma: no cover - portable builds may omit Multimedia
+    QSoundEffect = None
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -35,9 +44,11 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QComboBox,
     QAbstractItemView,
+    QCheckBox,
     QHeaderView,
     QProgressBar,
     QPushButton,
+    QSlider,
     QScrollArea,
     QStackedWidget,
     QTableWidget,
@@ -55,7 +66,7 @@ from main import App, STYLE, Backdrop, TitleBar, label, panel
 
 # The version is also used as the GitHub release tag (for example, v2026.09.29).
 # Bump it when publishing a new release so existing installations can discover it.
-APP_VERSION = '2026.09.30.7'
+APP_VERSION = '2026.09.30.9'
 GITHUB_REPOSITORY = 'zhujianmengbi-droid/-'
 GITHUB_REPOSITORY_URL = f'https://github.com/{GITHUB_REPOSITORY}'
 GITHUB_LATEST_RELEASE_API = (
@@ -75,6 +86,8 @@ LOBBY_CHAT_MESSAGES_PATH = '/api/chat/messages'
 LOBBY_CHAT_PRESENCE_PATH = '/api/chat/presence'
 GAME_ID_SETTINGS_KEY = 'profile/gameId'
 CHAT_SESSION_CACHE_KEY = 'chat/sessionMessages'
+CHAT_SOUND_ENABLED_KEY = 'chat/soundEnabled'
+CHAT_SOUND_VOLUME_KEY = 'chat/soundVolume'
 TASKBAR_DEFAULT_BINDINGS = {
     index: f'Alt+{digit}'
     for index, digit in enumerate('1234567890')
@@ -616,6 +629,9 @@ class PlayerLoginDialog(QDialog):
         elif self._theme == 'glass':
             dialog_bg, text, muted, card_bg = '#171b21', '#f1f2f4', '#b2b6be', '#252a32'
             accent, accent_text = '#cfd2d8', '#202124'
+        elif self._theme == 'liquid':
+            dialog_bg, text, muted, card_bg = '#102638', '#effeff', '#a4cad6', '#1a5062'
+            accent, accent_text = '#9cefff', '#082c3b'
         elif self._theme == 'blue':
             dialog_bg, text, muted, card_bg = '#082650', '#eef7ff', '#b8cce5', '#0b2e5e'
             accent, accent_text = '#a9d0fa', '#092448'
@@ -1459,6 +1475,11 @@ class ZJStartupSplash(QWidget):
             'accent': '#bfc6cf', 'edge': '#e1e5eb', 'glow': '#89939f',
             'muted': '#a4aab3',
         },
+        'liquid': {
+            'top': '#102c3e', 'bottom': '#1b1234', 'ink': '#effeff',
+            'accent': '#9cefff', 'edge': '#d6fbff', 'glow': '#8c9bff',
+            'muted': '#a4cad6',
+        },
         'dark': {
             'top': '#141d29', 'bottom': '#080e16', 'ink': '#edf4fd',
             'accent': '#8cb5df', 'edge': '#d5e8ff', 'glow': '#517da8',
@@ -1703,6 +1724,15 @@ THEME_PALETTES = {
         'glow1': (180, 205, 232, 22),
         'glow2': (108, 145, 165, 16),
     },
+    'liquid': {
+        'name': '液态玻璃',
+        'description': '流动渐变与半透明高光，呈现更有层次的玻璃材质',
+        'icon': 'waves',
+        'start': (8, 31, 48, 224),
+        'end': (24, 12, 48, 238),
+        'glow1': (103, 231, 241, 62),
+        'glow2': (154, 115, 255, 54),
+    },
     'dark': {
         'name': '暗色',
         'description': '低亮度深色界面，适合夜间使用',
@@ -1741,6 +1771,10 @@ INPUT_SURFACES = {
         # their neutral tint still matches the transparent glass surfaces.
         'fill': '#252a31', 'text': '#f6f8fb', 'border': '#8a99aa',
         'focus': '#e1edf9', 'selection': '#536f8d',
+    },
+    'liquid': {
+        'fill': '#142b3b', 'text': '#effeff', 'border': '#5bcbd9',
+        'focus': '#c5fbff', 'selection': '#356d88',
     },
     'dark': {
         'fill': '#0c1521', 'text': '#e8eef8', 'border': '#53667e',
@@ -1807,6 +1841,31 @@ QScrollBar::handle:vertical { min-height: 24px; background: rgba(194,196,200,45)
 QScrollBar::handle:vertical:hover { background: rgba(215,217,221,75); }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+""",
+    'liquid': """
+QWidget { color: #effeff; }
+QDialog { color: #effeff; background: #102638; }
+QMessageBox { color: #effeff; background: #102638; }
+QToolTip { color: #effeff; background: #18394c; border: 1px solid #63d5e0; padding: 6px; }
+QFrame#updateBanner { background: rgba(100,226,235,30); border-color: rgba(156,239,255,100); }
+QLabel#updateTitle { color: #effeff; }
+QLabel#updateHint, QLabel#muted, QLabel#pageHint, QLabel#brandHint, QLabel#metricLabel, QLabel#cardHint { color: #a4cad6; }
+QLabel#statLabel { color: #92bfcc; }
+QLineEdit { color: #effeff; background: #142b3b; border: 1px solid #5bcbd9; selection-background-color: #356d88; }
+QLineEdit:focus { color: #effeff; background: #142b3b; border: 1px solid #c5fbff; }
+QPushButton { color: #effeff; background: rgba(103,231,241,20); border-color: rgba(156,239,255,78); }
+QPushButton:hover { background: rgba(103,231,241,42); border-color: #9cefff; }
+QPushButton:pressed { background: rgba(103,231,241,62); }
+QPushButton#primary { color: #082c3b; background: #9cefff; border-color: #d6fbff; }
+QPushButton#primary:hover { background: #c5fbff; }
+QPushButton#navButton, QPushButton#settingsButton, QPushButton#settingsCategory, QPushButton#themeOption { color: #bdeaf0; }
+QPushButton#navButton:hover, QPushButton#settingsButton:hover, QPushButton#settingsCategory:hover, QPushButton#themeOption:hover { color: #effeff; background: rgba(103,231,241,34); }
+QPushButton#navButton:checked, QPushButton#settingsButton:checked, QPushButton#settingsCategory:checked, QPushButton#themeOption:checked { color: #082c3b; background: #9cefff; border-color: #d6fbff; }
+QCheckBox::indicator:unchecked { background: #142b3b; border: 1px solid #5bcbd9; border-radius: 4px; }
+QCheckBox::indicator:checked { background: #9cefff; border: 1px solid #d6fbff; border-radius: 4px; }
+QPlainTextEdit { color: #bdeaf0; }
+QProgressBar { background: rgba(103,231,241,26); }
+QProgressBar::chunk { background: #64e2eb; }
 """,
     'dark': """
 QWidget { color: #e8eef8; }
@@ -1973,6 +2032,35 @@ QPushButton#settingsCategory:checked { border: none; border-left: 3px solid #dce
 QPushButton#themeOption { border: 1px solid rgba(255,255,255,54); }
 QPushButton#themeOption:checked { border: 1px solid rgba(255,255,255,105); border-left: 3px solid #dcecff; background: rgba(255,255,255,48); color: #f7f7f8; }
 """,
+    'liquid': """
+QFrame#sidebar { background: rgba(16,48,65,184); border: 1px solid rgba(156,239,255,116); border-radius: 20px; }
+QFrame#glass { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(57,137,153,126), stop:0.48 rgba(24,74,98,132), stop:1 rgba(91,59,151,128)); border: 1px solid rgba(188,247,255,150); border-radius: 18px; }
+QFrame#matchDetailPanel { background: rgba(11,32,48,172); border: 1px solid rgba(129,226,237,110); border-radius: 18px; }
+QFrame#hero { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(74,177,188,158), stop:1 rgba(70,92,177,150)); border: 1px solid rgba(199,250,255,180); border-left: 4px solid #9cefff; border-radius: 18px; }
+QFrame#metricCard { background: rgba(29,84,105,148); border: 1px solid rgba(133,235,244,126); border-radius: 15px; }
+QFrame#featureCard { background: rgba(20,59,80,160); border: 1px solid rgba(143,235,244,118); border-radius: 18px; }
+QFrame#featureRow { background: rgba(34,95,111,148); border: 1px solid rgba(156,239,255,110); border-radius: 13px; }
+QFrame#matchRecord { background: rgba(71,164,177,74); border: 1px solid rgba(156,239,255,72); border-radius: 12px; }
+QFrame#matchRecord:hover { background: rgba(92,194,202,104); }
+QFrame#matchRecord[selected="true"] { background: rgba(123,218,224,126); border-left-color: #d6fbff; }
+QFrame#statChip { background: rgba(105,211,218,66); border-radius: 10px; }
+QFrame#matchDetailHero { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(76,181,189,156), stop:1 rgba(84,64,156,144)); border: 1px solid rgba(199,250,255,165); border-radius: 17px; }
+QFrame#placeholder { background: rgba(26,75,94,156); border: 1px solid rgba(143,235,244,118); border-radius: 18px; }
+QFrame#settingsSidebar { background: rgba(15,53,72,192); border: 1px solid rgba(156,239,255,125); border-radius: 18px; }
+QFrame#settingsCard { background: rgba(27,78,98,184); border: 1px solid rgba(174,245,251,135); border-radius: 18px; }
+QFrame#settingsOverlay { background: rgba(9,28,43,246); border: 1px solid rgba(174,245,251,155); }
+QFrame#row { background: rgba(103,217,224,18); border-bottom: 1px solid rgba(156,239,255,60); }
+QPushButton { border: 1px solid rgba(156,239,255,98); border-radius: 11px; }
+QPushButton#navButton { border: none; border-left: 4px solid transparent; border-radius: 9px; }
+QPushButton#navButton:hover { background: rgba(103,231,241,44); border-radius: 9px; color: #effeff; }
+QPushButton#navButton:checked { border: none; border-left: 4px solid #d6fbff; border-radius: 9px; background: rgba(103,231,241,76); color: #effeff; }
+QPushButton#settingsButton { border: none; border-radius: 9px; }
+QPushButton#settingsButton:hover { background: rgba(103,231,241,44); border-radius: 9px; color: #effeff; }
+QPushButton#settingsButton:checked { border: none; border-left: 4px solid #d6fbff; border-radius: 9px; background: rgba(103,231,241,76); color: #effeff; }
+QPushButton#settingsCategory:checked { border: none; border-left: 3px solid #d6fbff; background: rgba(103,231,241,64); }
+QPushButton#themeOption { border: 1px solid rgba(156,239,255,86); }
+QPushButton#themeOption:checked { border: 1px solid rgba(214,251,255,178); border-left: 3px solid #d6fbff; background: rgba(103,231,241,76); color: #effeff; }
+""",
     'dark': """
 QFrame#sidebar { background: rgba(7,13,22,248); border: 1px solid rgba(122,155,194,52); border-radius: 18px; }
 QFrame#glass { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(20,34,52,236), stop:1 rgba(11,20,32,232)); border: 1px solid rgba(137,174,218,46); border-radius: 16px; }
@@ -2079,6 +2167,17 @@ MATCH_ROW_PALETTES = {
         'recent_text': '#f0f0f2', 'positive': '#a6e6bd', 'negative': '#ffb5b5',
         'neutral': '#ececef', 'outline': 'rgba(255,255,255,108)',
     },
+    'liquid': {
+        'win_bg': 'rgba(39,153,126,116)', 'win_hover': 'rgba(54,184,151,140)', 'win_text': '#e4fff8',
+        'win_meta': '#a9e8d7', 'win_border': 'rgba(124,250,214,176)',
+        'loss_bg': 'rgba(190,78,128,108)', 'loss_hover': 'rgba(219,97,149,132)', 'loss_text': '#ffe9f5',
+        'loss_meta': '#efbad5', 'loss_border': 'rgba(255,164,207,168)',
+        'unknown_bg': 'rgba(117,209,220,54)', 'unknown_hover': 'rgba(139,229,235,78)',
+        'unknown_text': '#effeff', 'unknown_meta': '#b4e1e6',
+        'daily_bg': 'rgba(95,179,197,48)', 'recent_bg': 'rgba(98,205,213,74)', 'recent_hover': 'rgba(118,226,229,96)',
+        'recent_text': '#effeff', 'positive': '#9ff4d7', 'negative': '#ffb2d2',
+        'neutral': '#effeff', 'outline': 'rgba(188,247,255,150)',
+    },
     'dark': {
         'win_bg': '#17452f', 'win_hover': '#20583a', 'win_text': '#e0f7e8',
         'win_meta': '#add9bb', 'win_border': '#2f7049',
@@ -2124,6 +2223,12 @@ TEAM_PLAYER_PALETTES = {
         'blue': {'bg': '#293c58', 'hover': '#334d70', 'border': '#75a9ec', 'text': '#e1efff'},
         'yellow': {'bg': '#4a4029', 'hover': '#5d5030', 'border': '#e2bd58', 'text': '#ffe9ac'},
         'green': {'bg': '#294436', 'hover': '#345743', 'border': '#67c694', 'text': '#d9f7e7'},
+    },
+    'liquid': {
+        'red': {'bg': '#633044', 'hover': '#7b3b56', 'border': '#f080a6', 'text': '#ffe1ed'},
+        'blue': {'bg': '#234e70', 'hover': '#2d638a', 'border': '#76d8ff', 'text': '#ddf7ff'},
+        'yellow': {'bg': '#665327', 'hover': '#7e672f', 'border': '#f4d36e', 'text': '#fff1b7'},
+        'green': {'bg': '#215d4c', 'hover': '#2b755e', 'border': '#71e4b7', 'text': '#d7fff0'},
     },
     'dark': {
         'red': {'bg': '#3b222a', 'hover': '#4f2d38', 'border': '#d85b6b', 'text': '#ffd9df'},
@@ -2181,6 +2286,13 @@ LEADERBOARD_RANK_PALETTES = {
         '3': {'bg': '#553d2d', 'hover': '#684a35', 'border': '#d59a68', 'text': '#ffd0a4'},
         '4': {'bg': '#3e4045', 'hover': '#4a4c52', 'border': '#777a82', 'text': '#d6d8dc'},
         '5': {'bg': '#393b40', 'hover': '#45474c', 'border': '#62656c', 'text': '#bfc2c8'},
+    },
+    'liquid': {
+        '1': {'bg': '#665426', 'hover': '#806a2e', 'border': '#f5d86e', 'text': '#fff0b1'},
+        '2': {'bg': '#31566a', 'hover': '#3b6c82', 'border': '#a8e6ef', 'text': '#e4fcff'},
+        '3': {'bg': '#633d31', 'hover': '#7c4b3a', 'border': '#f2ae84', 'text': '#ffe1cb'},
+        '4': {'bg': '#23465b', 'hover': '#2c5971', 'border': '#71bfce', 'text': '#d5f4f8'},
+        '5': {'bg': '#203c50', 'hover': '#294e65', 'border': '#5ca0b0', 'text': '#bfe1e8'},
     },
     'dark': {
         '1': {'bg': '#493a17', 'hover': '#5d4a1e', 'border': '#d8b24f', 'text': '#ffe59a'},
@@ -2396,6 +2508,10 @@ def _lobby_chat_style(theme_key):
         surface, raised, text, muted = 'rgba(255,255,255,28)', 'rgba(255,255,255,48)', '#f0f0f2', '#c2c4c8'
         mine, mine_border = 'rgba(185,218,255,56)', 'rgba(185,218,255,138)'
         online = '#a6e6bd'
+    elif theme_key == 'liquid':
+        surface, raised, text, muted = 'rgba(37,110,125,118)', 'rgba(82,184,192,100)', '#effeff', '#b4e1e6'
+        mine, mine_border = 'rgba(104,220,226,128)', 'rgba(188,247,255,176)'
+        online = '#9ff4d7'
     elif theme_key == 'blue':
         surface, raised, text, muted = '#0d2e5d', '#123b73', '#e6f0ff', '#afc8e5'
         mine, mine_border = '#174476', '#78aee9'
@@ -2439,6 +2555,13 @@ def _taskbar_switcher_style(theme_key):
             'border': 'rgba(255,255,255,76)', 'accent': '#d9eaff',
             'accent_text': '#152233', 'hover': 'rgba(255,255,255,44)',
             'selected': 'rgba(185,218,255,76)', 'error': '#ffb4b1',
+        },
+        'liquid': {
+            'surface': 'rgba(16,58,76,188)', 'raised': 'rgba(34,92,108,178)',
+            'field': '#142b3b', 'text': '#effeff', 'muted': '#b4e1e6',
+            'border': 'rgba(156,239,255,128)', 'accent': '#9cefff',
+            'accent_text': '#082c3b', 'hover': 'rgba(103,231,241,60)',
+            'selected': 'rgba(103,231,241,94)', 'error': '#ffb2d2',
         },
         'dark': {
             'surface': '#16263a', 'raised': '#0d1928', 'field': '#0c1521',
@@ -2702,6 +2825,17 @@ class LargeApp(App):
         self._chat_session_id = ''
         self._chat_pending_message = ''
         self._chat_sending_message = ''
+        sound_enabled = settings.value(CHAT_SOUND_ENABLED_KEY, True)
+        if isinstance(sound_enabled, str):
+            sound_enabled = sound_enabled.strip().lower() not in {'0', 'false', 'off', 'no'}
+        self.chat_sound_enabled = bool(sound_enabled)
+        try:
+            self.chat_sound_volume = max(0, min(100, int(
+                settings.value(CHAT_SOUND_VOLUME_KEY, 65))))
+        except (TypeError, ValueError):
+            self.chat_sound_volume = 65
+        self._chat_sound_effect = None
+        self._chat_sound_path = ''
         self._chat_poll_timer = None
         # 旧版本保存过 Render HTTP 地址；聊天现在直接使用项目的 Realtime
         # WebSocket，忽略旧地址，避免把 WebSocket 协议误发到 HTTP 服务。
@@ -2733,6 +2867,7 @@ class LargeApp(App):
         self._chat_client.messageFailed.connect(self._on_supabase_message_failed)
         self._chat_client.presenceChanged.connect(self._on_supabase_presence_changed)
         self._chat_client.error.connect(self._on_supabase_chat_error)
+        self._initialize_chat_sound()
         # Restore the current session cache after the chat page has been built.
         # It is removed in closeEvent, so a normal restart starts with a clean
         # room while navigating between pages does not lose visible messages.
@@ -4750,12 +4885,16 @@ class LargeApp(App):
                 if str(player.get('player_uuid') or '').casefold() == self._match_player_uuid.casefold():
                     queried_player = player
                     break
+        # The queried player's summary follows the same fixed-field contract
+        # as the metric grid below.  An absent player field is a real zero for
+        # display purposes, rather than an em dash that makes the card look
+        # incomplete.
         query_final = self._display_stat_value(self._numeric_stat(
-            queried_player or {}, 'final_kill', 'finalKill')) if queried_player else '—'
+            queried_player or {}, 'final_kill', 'finalKill'))
         query_beds = self._display_stat_value(self._numeric_stat(
-            queried_player or {}, 'bed_destory', 'bed_destroy', 'bedDestroy')) if queried_player else '—'
+            queried_player or {}, 'bed_destory', 'bed_destroy', 'bedDestroy'))
         query_final_deaths = self._display_stat_value(self._numeric_stat(
-            queried_player or {}, 'final_death', 'finalDeath')) if queried_player else '—'
+            queried_player or {}, 'final_death', 'finalDeath'))
         ribbon = QFrame()
         ribbon.setObjectName('matchDetailRibbon')
         ribbon.setProperty('recordOutcome', outcome or 'unknown')
@@ -4940,35 +5079,48 @@ class LargeApp(App):
                     ('破坏', ('break', 'blocks_broken')),
                     ('承伤', ('interception', 'damage_taken')),
                 ]
+                # The detail view is a fixed metric grid.  The API omits
+                # counters whose value is zero, so filtering out ``None``
+                # here made each player's card change shape and hid metrics
+                # that were actually known to be zero.  Normalize every
+                # metric to a numeric value and keep all chips visible;
+                # malformed/absent counters are presented as 0 as requested.
                 available_stats = []
                 for stat_name, keys in stat_specs:
-                    value = self._player_stat_value(player, stat_name, keys)
-                    if value is not None:
-                        available_stats.append((stat_name, value, self._display_stat_value(value)))
-                if available_stats:
-                    stats_grid = QGridLayout()
-                    stats_grid.setContentsMargins(0, 0, 0, 0)
-                    stats_grid.setHorizontalSpacing(6)
-                    stats_grid.setVerticalSpacing(6)
-                    for column in range(4):
-                        stats_grid.setColumnStretch(column, 1)
-                    for index, (stat_name, raw_value, value) in enumerate(available_stats):
-                        threshold_hit = self._threshold_hit(stat_name, raw_value)
-                        chip = self._stat_chip(stat_name, value)
-                        chip.setProperty('thresholdHit', 'true' if threshold_hit else 'false')
-                        metric_tone = 'highlight' if threshold_hit else self._stat_tone(stat_name)
-                        chip.setProperty('metricTone', metric_tone)
-                        metric_icon = chip.findChild(QLabel, 'statMetricIcon')
-                        if metric_icon is not None:
-                            metric_icon.setProperty('metricTone', metric_tone)
-                        self._refresh_stat_chip_icon(chip)
-                        if threshold_hit:
-                            threshold = DETAIL_METRIC_THRESHOLDS[stat_name][0]
-                            chip.setToolTip(f'{stat_name} 超过高光阈值 {threshold}')
-                        stats_grid.addWidget(chip, index // 4, index % 4)
-                    player_layout.addLayout(stats_grid)
-                else:
-                    player_layout.addWidget(label('这位玩家暂时没有返回统计值。', 'cardHint'))
+                    raw_value = self._player_stat_value(player, stat_name, keys)
+                    if raw_value is None:
+                        raw_value = 0
+                    try:
+                        numeric_value = float(str(raw_value).replace(',', '').strip())
+                        if numeric_value != numeric_value or numeric_value < 0:
+                            numeric_value = 0.0
+                    except (TypeError, ValueError, OverflowError):
+                        numeric_value = 0.0
+                    if numeric_value.is_integer():
+                        numeric_value = int(numeric_value)
+                    available_stats.append((stat_name, numeric_value,
+                                            self._display_stat_value(numeric_value)))
+                stats_grid = QGridLayout()
+                stats_grid.setContentsMargins(0, 0, 0, 0)
+                stats_grid.setHorizontalSpacing(6)
+                stats_grid.setVerticalSpacing(6)
+                for column in range(4):
+                    stats_grid.setColumnStretch(column, 1)
+                for index, (stat_name, raw_value, value) in enumerate(available_stats):
+                    threshold_hit = self._threshold_hit(stat_name, raw_value)
+                    chip = self._stat_chip(stat_name, value)
+                    chip.setProperty('thresholdHit', 'true' if threshold_hit else 'false')
+                    metric_tone = 'highlight' if threshold_hit else self._stat_tone(stat_name)
+                    chip.setProperty('metricTone', metric_tone)
+                    metric_icon = chip.findChild(QLabel, 'statMetricIcon')
+                    if metric_icon is not None:
+                        metric_icon.setProperty('metricTone', metric_tone)
+                    self._refresh_stat_chip_icon(chip)
+                    if threshold_hit:
+                        threshold = DETAIL_METRIC_THRESHOLDS[stat_name][0]
+                        chip.setToolTip(f'{stat_name} 超过高光阈值 {threshold}')
+                    stats_grid.addWidget(chip, index // 4, index % 4)
+                player_layout.addLayout(stats_grid)
                 resources = player.get('pick_up')
                 if isinstance(resources, dict) and resources:
                     resource_text = self._format_player_stats({'pick_up': resources})
@@ -5500,6 +5652,81 @@ class LargeApp(App):
         if popup is not None:
             popup.hide()
 
+    def _initialize_chat_sound(self):
+        """Prepare a tiny Codex-style chime without adding a binary asset."""
+        try:
+            path = os.path.join(tempfile.gettempdir(), 'devking-lobby-message.wav')
+            sample_rate = 24000
+            duration = 0.22
+            frames = int(sample_rate * duration)
+            with wave.open(path, 'wb') as stream:
+                stream.setnchannels(1)
+                stream.setsampwidth(2)
+                stream.setframerate(sample_rate)
+                data = bytearray()
+                for index in range(frames):
+                    seconds = index / sample_rate
+                    frequency = 660.0 if seconds < 0.105 else 880.0
+                    local = seconds if seconds < 0.105 else seconds - 0.105
+                    envelope = min(1.0, local / 0.012, max(0.0, (0.105 - local) / 0.035))
+                    envelope *= max(0.0, min(1.0, (duration - seconds) / 0.025))
+                    value = int(0.28 * envelope * math.sin(2 * math.pi * frequency * seconds) * 32767)
+                    data.extend(struct.pack('<h', value))
+                stream.writeframes(bytes(data))
+            self._chat_sound_path = path
+            if QSoundEffect is not None:
+                effect = QSoundEffect(self)
+                effect.setLoopCount(1)
+                effect.setVolume(self.chat_sound_volume / 100.0)
+                effect.setSource(QUrl.fromLocalFile(path))
+                self._chat_sound_effect = effect
+        except Exception:
+            self._chat_sound_path = ''
+            self._chat_sound_effect = None
+
+    def _set_chat_sound_enabled(self, enabled):
+        self.chat_sound_enabled = bool(enabled)
+        self._settings.setValue(CHAT_SOUND_ENABLED_KEY, self.chat_sound_enabled)
+        self._settings.sync()
+        if hasattr(self, 'chat_sound_hint'):
+            self.chat_sound_hint.setText(
+                '已开启，新消息会播放提示音。' if self.chat_sound_enabled
+                else '已关闭，不会播放大厅消息提示音。')
+
+    def _set_chat_sound_volume(self, value):
+        try:
+            self.chat_sound_volume = max(0, min(100, int(value)))
+        except (TypeError, ValueError):
+            return
+        self._settings.setValue(CHAT_SOUND_VOLUME_KEY, self.chat_sound_volume)
+        self._settings.sync()
+        if self._chat_sound_effect is not None:
+            self._chat_sound_effect.setVolume(self.chat_sound_volume / 100.0)
+        if hasattr(self, 'chat_sound_volume_value'):
+            self.chat_sound_volume_value.setText(f'{self.chat_sound_volume}%')
+
+    def _play_chat_sound(self):
+        if self._closing or not self.chat_sound_enabled or self.chat_sound_volume <= 0:
+            return
+        effect = self._chat_sound_effect
+        if effect is not None:
+            effect.setVolume(self.chat_sound_volume / 100.0)
+            effect.stop()
+            effect.play()
+            return
+        # Fallback for a build without Qt Multimedia.  The generated WAV is
+        # still a system-local asset and PlaySound is asynchronous on Windows.
+        if self._chat_sound_path and sys.platform.startswith('win'):
+            try:
+                import winsound
+                winsound.PlaySound(
+                    self._chat_sound_path,
+                    winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+            except Exception:
+                QApplication.beep()
+        else:
+            QApplication.beep()
+
     def _chat_bound_game_id(self):
         value = str(self._settings.value(GAME_ID_SETTINGS_KEY, self._game_id) or '').strip()
         # Keep the legacy chat key in lockstep with the verified login key.
@@ -5768,6 +5995,14 @@ class LargeApp(App):
         item.setdefault('message', item.get('text', ''))
         item.setdefault('player_id', item.get('username', '未知玩家'))
         item.setdefault('created_at', datetime.now().astimezone().isoformat(timespec='seconds'))
+        sender = str(item.get('player_id') or item.get('username') or '').strip()
+        message_text = str(item.get('message') or item.get('text') or '').strip()
+        # The Realtime broadcast includes our own message before the transport
+        # emits its ACK.  Do not turn that self echo into a second notification.
+        own_echo = (
+            sender and sender == self._chat_bound_game_id() and
+            bool(self._chat_sending_message) and
+            message_text == self._chat_sending_message)
         key = self._chat_message_key(item)
         if key in self._chat_message_keys:
             return
@@ -5780,6 +6015,8 @@ class LargeApp(App):
             self._chat_message_key(message) for message in self._chat_messages}
         self._save_chat_session_cache()
         self._render_lobby_messages(self._chat_messages)
+        if not own_echo:
+            self._play_chat_sound()
         self.chat_status.setText('已同步实时消息 · 公共大厅可见')
 
     def _render_lobby_messages(self, messages):
@@ -6207,9 +6444,7 @@ class LargeApp(App):
         theme_page = self._build_theme_settings()
         self.settings_category_indices['theme'] = self.settings_stack.addWidget(theme_page)
         self.settings_category_indices['general'] = self.settings_stack.addWidget(
-            self._build_settings_placeholder(
-                '常规设置', '这里预留启动行为、通知和确认提示等常规选项。', '⚙',
-                ['启动时打开的默认分区', '通知与确认提示', '语言和辅助功能']))
+            self._build_general_settings())
         self.settings_category_indices['performance'] = self.settings_stack.addWidget(
             self._build_animation_settings())
         self.settings_category_indices['api'] = self.settings_stack.addWidget(self._build_api_settings())
@@ -6218,6 +6453,73 @@ class LargeApp(App):
         self.settings_category_indices['taskbar-hotkeys'] = self.settings_stack.addWidget(
             self._build_taskbar_hotkey_settings())
         self.switch_settings_category('theme')
+        return page
+
+    def _build_general_settings(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        card = QFrame()
+        card.setObjectName('settingsCard')
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(22, 20, 22, 18)
+        card_layout.setSpacing(11)
+        self._section_header(card_layout, '常规设置', 'settings')
+        card_layout.addWidget(label('调整消息反馈和常用行为。', 'muted'))
+
+        sound_row = QFrame()
+        sound_row.setObjectName('featureRow')
+        sound_layout = QHBoxLayout(sound_row)
+        sound_layout.setContentsMargins(14, 11, 14, 11)
+        sound_layout.setSpacing(10)
+        sound_copy = QVBoxLayout()
+        sound_copy.setSpacing(3)
+        sound_copy.addWidget(label('大厅消息提示音', 'cardTitle'))
+        self.chat_sound_hint = label('', 'cardHint')
+        sound_copy.addWidget(self.chat_sound_hint)
+        sound_layout.addLayout(sound_copy, 1)
+        from PySide6.QtWidgets import QCheckBox
+        toggle = QCheckBox('开启')
+        toggle.setObjectName('chatSoundEnabled')
+        toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        toggle.setChecked(self.chat_sound_enabled)
+        toggle.toggled.connect(self._set_chat_sound_enabled)
+        self.chat_sound_toggle = toggle
+        sound_layout.addWidget(toggle)
+        card_layout.addWidget(sound_row)
+
+        volume_row = QFrame()
+        volume_row.setObjectName('featureRow')
+        volume_layout = QHBoxLayout(volume_row)
+        volume_layout.setContentsMargins(14, 11, 14, 11)
+        volume_layout.setSpacing(10)
+        volume_copy = QVBoxLayout()
+        volume_copy.setSpacing(3)
+        volume_copy.addWidget(label('提示音音量', 'cardTitle'))
+        volume_copy.addWidget(label('使用 Codex 任务完成提示音风格的短促提示。', 'cardHint'))
+        volume_layout.addLayout(volume_copy, 1)
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setObjectName('chatSoundVolume')
+        slider.setRange(0, 100)
+        slider.setSingleStep(5)
+        slider.setPageStep(10)
+        slider.setValue(self.chat_sound_volume)
+        slider.setMinimumWidth(180)
+        slider.setCursor(Qt.CursorShape.PointingHandCursor)
+        slider.valueChanged.connect(self._set_chat_sound_volume)
+        self.chat_sound_volume_slider = slider
+        volume_layout.addWidget(slider)
+        self.chat_sound_volume_value = label(f'{self.chat_sound_volume}%', 'cardTitle')
+        self.chat_sound_volume_value.setMinimumWidth(42)
+        self.chat_sound_volume_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        volume_layout.addWidget(self.chat_sound_volume_value)
+        card_layout.addWidget(volume_row)
+        self._set_chat_sound_enabled(self.chat_sound_enabled)
+        self._set_chat_sound_volume(self.chat_sound_volume)
+        card_layout.addWidget(label('关闭提示音不会影响大厅消息接收。', 'muted'))
+        card_layout.addStretch(1)
+        layout.addWidget(card, 1)
         return page
 
     def _build_chat_account_settings(self):
@@ -6281,6 +6583,39 @@ class LargeApp(App):
         server_save.setObjectName('chatSaveServer')
         server_layout.addWidget(server_save)
         card_layout.addWidget(server_row)
+        sound_row = QFrame()
+        sound_row.setObjectName('featureRow')
+        sound_layout = QHBoxLayout(sound_row)
+        sound_layout.setContentsMargins(14, 10, 14, 10)
+        sound_layout.setSpacing(10)
+        sound_copy = QVBoxLayout()
+        sound_copy.setSpacing(3)
+        sound_copy.addWidget(label('大厅消息提示音', 'cardTitle'))
+        self.chat_sound_hint = label('', 'cardHint')
+        self.chat_sound_hint.setWordWrap(True)
+        sound_copy.addWidget(self.chat_sound_hint)
+        sound_layout.addLayout(sound_copy, 1)
+        self.chat_sound_toggle = QCheckBox('启用')
+        self.chat_sound_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.chat_sound_toggle.setChecked(self.chat_sound_enabled)
+        self.chat_sound_toggle.toggled.connect(self._set_chat_sound_enabled)
+        sound_layout.addWidget(self.chat_sound_toggle)
+        sound_layout.addWidget(label('音量', 'cardHint'))
+        self.chat_sound_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.chat_sound_volume_slider.setRange(0, 100)
+        self.chat_sound_volume_slider.setValue(self.chat_sound_volume)
+        self.chat_sound_volume_slider.setSingleStep(5)
+        self.chat_sound_volume_slider.setPageStep(10)
+        self.chat_sound_volume_slider.setFixedWidth(150)
+        self.chat_sound_volume_slider.setToolTip('调整大厅消息提示音音量')
+        self.chat_sound_volume_slider.valueChanged.connect(self._set_chat_sound_volume)
+        sound_layout.addWidget(self.chat_sound_volume_slider)
+        self.chat_sound_volume_value = label(f'{self.chat_sound_volume}%', 'cardHint')
+        self.chat_sound_volume_value.setMinimumWidth(38)
+        self.chat_sound_volume_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        sound_layout.addWidget(self.chat_sound_volume_value)
+        card_layout.addWidget(sound_row)
+        self._set_chat_sound_enabled(self.chat_sound_enabled)
         card_layout.addWidget(label('大厅消息会公开显示给所有在线玩家，请勿填写隐私信息。', 'muted'))
         card_layout.addStretch(1)
         layout.addWidget(card, 1)
@@ -6764,6 +7099,8 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
             normal, active, metric = '#536679', '#ffffff', '#3f79b4'
         elif self.current_theme == 'glass':
             normal, active, metric = '#c4c6ca', '#f7f7f8', '#d0d2d6'
+        elif self.current_theme == 'liquid':
+            normal, active, metric = '#b4e1e6', '#effeff', '#9cefff'
         else:
             normal, active, metric = '#b8c8dc', '#eff7ff', '#a9d4ff'
         for button in self.nav_buttons.values():
@@ -6776,6 +7113,7 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
         theme_active = (
             '#ffffff' if self.current_theme == 'light'
             else '#202124' if self.current_theme == 'glass'
+            else '#082c3b' if self.current_theme == 'liquid'
             else '#102640'
         )
         for key, button in getattr(self, 'theme_buttons', {}).items():
@@ -6800,6 +7138,7 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
         tile_color = (
             '#3f79b4' if self.current_theme == 'light'
             else '#c9cbd0' if self.current_theme == 'glass'
+            else '#9cefff' if self.current_theme == 'liquid'
             else '#bfe1ff'
         )
         status_color = '#287c68' if self.current_theme == 'light' else '#b9f1e4'

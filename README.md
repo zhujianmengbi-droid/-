@@ -4,7 +4,7 @@
 
 ## 下载
 
-前往 [GitHub Releases](https://github.com/zhujianmengbi-droid/-/releases) 获取 Windows EXE；当前提交也保留了 `DEV-King-Optimizer-v2026.09.30.7.exe` 和 `source/逐渐优化器-v2026.09.30.7-source.zip`。
+前往 [GitHub Releases](https://github.com/zhujianmengbi-droid/-/releases) 获取 Windows EXE；当前提交也保留了 `DEV-King-Optimizer-v2026.09.30.9.exe` 和 `source/逐渐优化器-v2026.09.30.9-source.zip`。
 
 ## 游戏 ID 登录
 
@@ -26,8 +26,11 @@
 
 ## 主题与系统
 
-支持明亮、玻璃、暗色和深海蓝主题；需要 Windows 10 或 Windows 11。
+支持明亮、玻璃、液态玻璃、暗色和深海蓝主题；需要 Windows 10 或 Windows 11。
 
 
 
 
+
+
+- v2026.09.30.9 增加液态玻璃主题、固定 0 值战局指标和大厅消息提示音（可在设置中开关并调节音量）。
