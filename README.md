@@ -4,7 +4,7 @@
 
 ## 下载
 
-前往 [GitHub Releases](https://github.com/zhujianmengbi-droid/-/releases) 获取 Windows EXE；当前提交也保留了 `DEV-King-Optimizer-v2026.09.30.2.exe` 和 `source/逐渐优化器-v2026.09.30.2-source.zip`。
+前往 [GitHub Releases](https://github.com/zhujianmengbi-droid/-/releases) 获取 Windows EXE；当前提交也保留了 `DEV-King-Optimizer-v2026.09.30.3.exe` 和 `source/逐渐优化器-v2026.09.30.3-source.zip`。
 
 ## 游戏 ID 登录
 
@@ -18,7 +18,7 @@
 - `requirements-chat.txt`：Flask + Gunicorn。
 - `render.yaml`：免费 Python Web Service，区域选择 Singapore（距离中国大陆较近的可用选项）。中国大陆网络可达性受运营商线路影响。
 
-在 Render 选择 **New → Blueprint**，连接本仓库并应用 `render.yaml`。服务名为 `dev-king-lobby`，默认地址为 `https://dev-king-lobby.onrender.com`。服务创建后，客户端大厅聊天会自动使用该地址；也可在本机 QSettings 的 `chat/serverUrl` 覆盖。
+在 Render 选择 **New → Blueprint**，连接本仓库并应用 `render.yaml`。服务名为 `dev-king-lobby`，默认地址为 `https://dev-king-lobby.onrender.com`。服务创建后，客户端大厅聊天会自动使用该地址；也可在软件“设置 → 大厅身份”中输入并保存服务器地址。
 
 ## 自动更新
 
@@ -27,3 +27,4 @@
 ## 主题与系统
 
 支持明亮、玻璃、暗色和深海蓝主题；需要 Windows 10 或 Windows 11。
+
