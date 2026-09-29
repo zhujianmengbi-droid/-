@@ -68,7 +68,7 @@ from main import App, STYLE, Backdrop, TitleBar, label, panel
 
 # The version is also used as the GitHub release tag (for example, v2026.09.29).
 # Bump it when publishing a new release so existing installations can discover it.
-APP_VERSION = '2026.09.30.15'
+APP_VERSION = '1.2'
 GITHUB_REPOSITORY = 'zhujianmengbi-droid/-'
 GITHUB_REPOSITORY_URL = f'https://github.com/{GITHUB_REPOSITORY}'
 GITHUB_LATEST_RELEASE_API = (
@@ -2768,10 +2768,6 @@ class LargeApp(App):
         self._chat_client.messageFailed.connect(self._on_supabase_message_failed)
         self._chat_client.presenceChanged.connect(self._on_supabase_presence_changed)
         self._chat_client.error.connect(self._on_supabase_chat_error)
-        # The application-level event filter lets dynamically created action
-        # buttons receive the same short, interruptible feedback without
-        # installing a new filter for every page row.
-        self._button_feedback_enabled = True
         self._initialize_chat_sound()
         # Restore the current session cache after the chat page has been built.
         # It is removed in closeEvent, so a normal restart starts with a clean
@@ -4244,20 +4240,6 @@ class LargeApp(App):
         then fade it away.  The normal scrollbar and API page loader continue
         to receive their events unchanged.
         """
-        # Feedback starts immediately, uses a short ease-out and can be
-        # interrupted when the pointer changes direction. Opacity is used
-        # instead of geometry so a button never shifts a layout.
-        if (getattr(self, '_button_feedback_enabled', False)
-                and isinstance(watched, QPushButton)
-                and watched.isEnabled()):
-            if event.type() == QEvent.Type.Enter:
-                self._animate_button(watched, 1.0)
-            elif event.type() == QEvent.Type.Leave:
-                self._animate_button(watched, 0.97)
-            elif event.type() == QEvent.Type.MouseButtonPress:
-                self._animate_button(watched, 0.90)
-            elif event.type() == QEvent.Type.MouseButtonRelease:
-                self._animate_button(watched, 1.0)
         if (hasattr(self, 'match_scroll') and watched in (
                 self.match_scroll.viewport(), self.match_scroll.verticalScrollBar())
                 and event.type() == QEvent.Type.Wheel):
@@ -7233,8 +7215,6 @@ if __name__ == '__main__':
     window = LargeApp()
     _reveal_main_window(window)
     sys.exit(app.exec())
-
-
 
 
 
