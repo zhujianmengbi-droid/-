@@ -1,10 +1,10 @@
 # 逐渐优化器 · DEV King
 
-面向起床战争的工具中心，包含电脑清理、战局数据、排行榜与常用工具。
+面向起床战争的工具中心，包含电脑清理、快捷工具、战局数据、排行榜和大厅聊天预留分区。
 
 ## 下载
 
-前往 [GitHub Releases](https://github.com/zhujianmengbi-droid/-/releases) 下载 Windows EXE。
+前往 [GitHub Releases](https://github.com/zhujianmengbi-droid/-/releases) 下载 Windows EXE 和源码包。
 
 ## 自动更新
 
@@ -12,7 +12,11 @@
 
 ## 当前版本
 
-2026.09.29
+v2026.09.29.1
+
+## 快捷工具
+
+TaskbarSwitcher 窗口切换功能已整合到“快捷工具”。默认全局快捷键为 Alt+1 至 Alt+0，可在“设置 → 快捷工具插件”中换绑。
 
 ## API 与主题
 

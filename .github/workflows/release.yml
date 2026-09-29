@@ -28,7 +28,7 @@ jobs:
 
       - name: Extract source archive
         shell: pwsh
-        run: Expand-Archive -LiteralPath "source/逐渐工具中心-源码-20260929-134533.zip" -DestinationPath "build-source" -Force
+        run: Expand-Archive -LiteralPath "source/DEV-King-Optimizer-v2026.09.29.1-source.zip" -DestinationPath "build-source" -Force
 
       - name: Build Windows executable
         working-directory: build-source/源码
@@ -37,15 +37,17 @@ jobs:
       - name: Create or update GitHub Release
         shell: pwsh
         run: |
-          $tag = "v2026.09.29"
+          $tag = "v2026.09.29.1"
           $asset = "build-source/源码/dist/逐渐优化器.exe"
-          $downloadAsset = "build-source/DEV-King-Optimizer-v2026.09.29.exe"
+          $downloadAsset = "build-source/DEV-King-Optimizer-v2026.09.29.1.exe"
+          $sourceAsset = "build-source/DEV-King-Optimizer-v2026.09.29.1-source.zip"
           if (!(Test-Path -LiteralPath $asset)) { throw "Build output not found: $asset" }
           Copy-Item -LiteralPath $asset -Destination $downloadAsset -Force
+          Copy-Item -LiteralPath "source/DEV-King-Optimizer-v2026.09.29.1-source.zip" -Destination $sourceAsset -Force
           gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $downloadAsset --clobber --repo $env:GITHUB_REPOSITORY
-            gh release edit $tag --notes-file "release-notes/2026.09.29.txt" --latest --repo $env:GITHUB_REPOSITORY
+            gh release upload $tag $downloadAsset $sourceAsset --clobber --repo $env:GITHUB_REPOSITORY
+            gh release edit $tag --notes-file "release-notes/2026.09.29.1.txt" --latest --repo $env:GITHUB_REPOSITORY
           } else {
-            gh release create $tag $downloadAsset --title "逐渐优化器 $tag" --notes-file "release-notes/2026.09.29.txt" --latest --repo $env:GITHUB_REPOSITORY
+            gh release create $tag $downloadAsset $sourceAsset --title "逐渐优化器 $tag" --notes-file "release-notes/2026.09.29.1.txt" --latest --repo $env:GITHUB_REPOSITORY
           }
