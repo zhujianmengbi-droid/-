@@ -30,6 +30,9 @@ jobs:
         shell: pwsh
         run: Expand-Archive -LiteralPath "source/逐渐优化器-v2026.09.30.2-source.zip" -DestinationPath "build-source" -Force
 
+      - name: Install application dependencies
+        run: python -m pip install --upgrade -r build-source/源码/requirements.txt
+
       - name: Build Windows executable
         working-directory: build-source/源码
         run: python build_large.py
