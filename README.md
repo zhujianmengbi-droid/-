@@ -1,10 +1,10 @@
-# 逐渐优化器 · DEV King
+# ZJ HUB · DEV King
 
 面向起床战争的 Windows 工具中心，包含电脑清理、快捷工具、战局数据、排行榜和公共大厅聊天。
 
 ## 下载
 
-前往 [GitHub Releases](https://github.com/zhujianmengbi-droid/-/releases) 获取 Windows EXE；当前提交也保留了 `DEV-King-Optimizer-v2026.09.30.9.exe` 和 `source/逐渐优化器-v2026.09.30.9-source.zip`。
+前往 [GitHub Releases](https://github.com/zhujianmengbi-droid/-/releases) 获取 Windows EXE；当前提交也保留了 `ZJ-HUB-v2026.09.30.10.exe` 和 `source/ZJ-HUB-v2026.09.30.10-source.zip`。
 
 ## 游戏 ID 登录
 
@@ -33,4 +33,5 @@
 
 
 
-- v2026.09.30.9 增加液态玻璃主题、固定 0 值战局指标和大厅消息提示音（可在设置中开关并调节音量）。
+- v2026.09.30.10 增加液态玻璃主题、固定 0 值战局指标和大厅消息提示音（可在设置中开关并调节音量）。
+

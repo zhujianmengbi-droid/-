@@ -66,7 +66,7 @@ from main import App, STYLE, Backdrop, TitleBar, label, panel
 
 # The version is also used as the GitHub release tag (for example, v2026.09.29).
 # Bump it when publishing a new release so existing installations can discover it.
-APP_VERSION = '2026.09.30.9'
+APP_VERSION = '2026.09.30.10'
 GITHUB_REPOSITORY = 'zhujianmengbi-droid/-'
 GITHUB_REPOSITORY_URL = f'https://github.com/{GITHUB_REPOSITORY}'
 GITHUB_LATEST_RELEASE_API = (
@@ -543,7 +543,7 @@ class PlayerLoginDialog(QDialog):
         self._worker = None
         self.player_name = ''
         self.setObjectName('playerLoginDialog')
-        self.setWindowTitle('逐渐工具中心 · 登录游戏 ID')
+        self.setWindowTitle('ZJ HUB · 登录游戏 ID')
         self.setModal(True)
         # The native Windows dialog frame ignores QSS corner radii and leaves
         # square white/black corners around the styled surface.  Use a
@@ -573,7 +573,7 @@ class PlayerLoginDialog(QDialog):
         title = QLabel('登录游戏 ID')
         title.setObjectName('playerLoginTitle')
         copy.addWidget(title)
-        subtitle = QLabel('验证布吉岛玩家后，再打开逐渐工具中心')
+        subtitle = QLabel('验证布吉岛玩家后，再打开 ZJ HUB')
         subtitle.setObjectName('playerLoginSubtitle')
         copy.addWidget(subtitle)
         heading.addLayout(copy, 1)
@@ -719,7 +719,7 @@ QLineEdit#themedInput:focus {{ border-color: {colors['focus']}; }}
         settings.setValue(GAME_ID_SETTINGS_KEY, self.player_name)
         settings.setValue('chat/gameId', self.player_name)
         settings.sync()
-        self.status_label.setText('创建成功，正在打开逐渐工具中心……')
+        self.status_label.setText('创建成功，正在打开 ZJ HUB……')
         self.verify_button.setEnabled(False)
         QTimer.singleShot(420, self.accept)
 
@@ -1703,7 +1703,7 @@ class ZJStartupSplash(QWidget):
             text_color.setAlpha(int(220 * alpha * text_progress))
             painter.setPen(text_color)
             painter.setFont(QFont('Microsoft YaHei UI', 13, QFont.Weight.DemiBold))
-            painter.drawText(QRectF(0, 235, width, 24), Qt.AlignmentFlag.AlignCenter, '逐渐工具中心')
+            painter.drawText(QRectF(0, 235, width, 24), Qt.AlignmentFlag.AlignCenter, 'ZJ HUB')
             muted = QColor(colors['muted'])
             muted.setAlpha(int(180 * alpha * text_progress))
             painter.setPen(muted)
@@ -2872,7 +2872,7 @@ class LargeApp(App):
         # It is removed in closeEvent, so a normal restart starts with a clean
         # room while navigating between pages does not lose visible messages.
         self._restore_chat_session_cache()
-        self.setWindowTitle('逐渐优化器 · 逐渐工具中心')
+        self.setWindowTitle('ZJ HUB')
         self.resize(1180, 800)
         # 留出标题、指标和两张功能卡的完整空间，避免缩放到窄窗口时说明文字被挤成一行。
         self.setMinimumSize(1020, 700)
@@ -3054,8 +3054,8 @@ class LargeApp(App):
         header.setContentsMargins(0, 0, 0, 0)
         title_copy = QVBoxLayout()
         title_copy.setSpacing(4)
-        title_copy.addWidget(label('逐渐优化器', 'title'))
-        title_copy.addWidget(label('逐渐工具中心', 'muted'))
+        title_copy.addWidget(label('ZJ HUB', 'title'))
+        title_copy.addWidget(label('DEV King', 'muted'))
         header.addLayout(title_copy)
         header.addStretch()
         header.addWidget(label('管理员模式' if optimizer.is_admin() else '普通模式', 'badge'))
@@ -3130,7 +3130,7 @@ class LargeApp(App):
         title = label('可更新', 'updateTitle')
         title.setObjectName('updateTitle')
         banner_layout.addWidget(title)
-        hint = label('发现新的逐渐优化器版本。', 'updateHint')
+        hint = label('发现新的 ZJ HUB 版本。', 'updateHint')
         hint.setObjectName('updateHint')
         banner_layout.addWidget(hint, 1)
         open_button = QPushButton('打开 GitHub')
@@ -3201,13 +3201,13 @@ class LargeApp(App):
         brand_row = QHBoxLayout()
         brand_row.setContentsMargins(0, 0, 0, 0)
         brand_row.setSpacing(10)
-        mark = label('DK', 'brandMark')
+        mark = label('ZJ', 'brandMark')
         mark.setFixedSize(34, 34)
         mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
         brand_row.addWidget(mark)
         brand_copy = QVBoxLayout()
         brand_copy.setSpacing(2)
-        brand_copy.addWidget(label('逐渐工具箱', 'brand'))
+        brand_copy.addWidget(label('ZJ HUB', 'brand'))
         brand_copy.addWidget(label('DEV King', 'brandHint'))
         brand_row.addLayout(brand_copy)
         layout.addLayout(brand_row)
@@ -3318,7 +3318,7 @@ class LargeApp(App):
         hero_copy.addWidget(label('READY FOR NEXT MATCH', 'eyebrow'))
         hero_copy.addWidget(label('准备开始下一局', 'heroTitle'))
         hero_copy.addWidget(label('从一个入口管理起床战争的运行环境和常用工具。', 'muted'))
-        hero_copy.addWidget(label('逐渐工具箱会持续加入战绩、快捷切换和大厅聊天功能。', 'muted'))
+        hero_copy.addWidget(label('ZJ HUB 会持续加入战绩、快捷切换和大厅聊天功能。', 'muted'))
         hero_layout.addWidget(icon_tile('shield', 'heroIconTile', '#cbe6ff', 28, 56))
         hero_layout.addLayout(hero_copy, 1)
         open_optimizer = self.button('打开电脑清理', lambda: self.switch_section('optimizer'), True)
@@ -3357,7 +3357,7 @@ class LargeApp(App):
         free_button.setIconSize(QSize(17, 17))
         actions_layout.addWidget(free_button)
         self._feature_row(actions_layout, '运行环境', '为下一局整理缓存和临时文件。', 'shield')
-        self._feature_row(actions_layout, '逐渐工具', '战绩、快捷切换和大厅聊天模块持续接入。', 'sparkles')
+        self._feature_row(actions_layout, 'ZJ HUB 工具', '战绩、快捷切换和大厅聊天模块持续接入。', 'sparkles')
         actions_layout.addStretch()
         lower.addWidget(actions, 1)
 
@@ -3367,7 +3367,7 @@ class LargeApp(App):
         status_line = QHBoxLayout()
         status_line.setSpacing(8)
         status_line.addWidget(icon_tile('check', 'statusGlyph', '#b8f2e2', 15, 24))
-        self.dashboard_state = label('就绪 · 逐渐工具中心在本机运行', 'muted')
+        self.dashboard_state = label('就绪 · ZJ HUB 在本机运行', 'muted')
         self.dashboard_state.setWordWrap(True)
         status_line.addWidget(self.dashboard_state, 1)
         status_layout.addLayout(status_line)
@@ -6395,7 +6395,7 @@ class LargeApp(App):
             heading.setSpacing(4)
             heading.addWidget(label('DEV KING / PREFERENCES', 'eyebrow'))
             heading.addWidget(label('设置', 'pageTitle'))
-            heading.addWidget(label('调整逐渐工具中心的主题和后续功能偏好。', 'pageHint'))
+            heading.addWidget(label('调整 ZJ HUB 的主题和后续功能偏好。', 'pageHint'))
             layout.addLayout(heading)
 
         body = QHBoxLayout()
@@ -6814,7 +6814,7 @@ class LargeApp(App):
         copy.setSpacing(3)
         copy.addWidget(label('DEV KING / SETTINGS', 'eyebrow'))
         copy.addWidget(label('设置', 'pageTitle'))
-        copy.addWidget(label('逐渐工具中心 · 设置覆盖在主界面之上，背景不透明', 'pageHint'))
+        copy.addWidget(label('ZJ HUB · 设置覆盖在主界面之上，背景不透明', 'pageHint'))
         header.addLayout(copy)
         header.addStretch()
         back = QPushButton('返回主界面')
@@ -7154,7 +7154,7 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
 
     def _build_footer(self, root_layout):
         footer = QHBoxLayout()
-        self.status = label('就绪 · 逐渐工具中心在本机运行', 'muted')
+        self.status = label('就绪 · ZJ HUB 在本机运行', 'muted')
         footer.addWidget(self.status)
         footer.addStretch()
         if not optimizer.is_admin():
@@ -7185,7 +7185,7 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
         if widget.text() != text:
             widget.setText(text)
 
-    def set_busy(self, busy, text='就绪 · 逐渐工具中心在本机运行'):
+    def set_busy(self, busy, text='就绪 · ZJ HUB 在本机运行'):
         super().set_busy(busy, text)
         if hasattr(self, 'dashboard_state'):
             self._set_if_changed(self.dashboard_state, text)
