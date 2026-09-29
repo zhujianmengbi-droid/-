@@ -39,11 +39,13 @@ jobs:
         run: |
           $tag = "v2026.09.29"
           $asset = "build-source/源码/dist/逐渐优化器.exe"
+          $downloadAsset = "build-source/DEV-King-Optimizer-v2026.09.29.exe"
           if (!(Test-Path -LiteralPath $asset)) { throw "Build output not found: $asset" }
+          Copy-Item -LiteralPath $asset -Destination $downloadAsset -Force
           gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $asset --clobber --repo $env:GITHUB_REPOSITORY
+            gh release upload $tag $downloadAsset --clobber --repo $env:GITHUB_REPOSITORY
             gh release edit $tag --notes-file "release-notes/2026.09.29.txt" --latest --repo $env:GITHUB_REPOSITORY
           } else {
-            gh release create $tag $asset --title "逐渐优化器 $tag" --notes-file "release-notes/2026.09.29.txt" --latest --repo $env:GITHUB_REPOSITORY
+            gh release create $tag $downloadAsset --title "逐渐优化器 $tag" --notes-file "release-notes/2026.09.29.txt" --latest --repo $env:GITHUB_REPOSITORY
           }
