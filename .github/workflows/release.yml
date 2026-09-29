@@ -1,0 +1,48 @@
+name: Publish Windows release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install build dependencies
+        run: python -m pip install --upgrade pip PySide6==6.11.1 psutil==7.2.2 PyInstaller==6.21.0
+
+      - name: Extract source archive
+        shell: pwsh
+        run: Expand-Archive -LiteralPath "source/逐渐工具中心-源码-20260929-134533.zip" -DestinationPath "build-source" -Force
+
+      - name: Build Windows executable
+        working-directory: build-source/源码
+        run: python build_large.py
+
+      - name: Create or update GitHub Release
+        shell: pwsh
+        run: |
+          $tag = "v2026.09.29"
+          $asset = "build-source/源码/dist/逐渐优化器.exe"
+          if (!(Test-Path -LiteralPath $asset)) { throw "Build output not found: $asset" }
+          gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $asset --clobber --repo $env:GITHUB_REPOSITORY
+            gh release edit $tag --notes-file "release-notes/2026.09.29.txt" --latest --repo $env:GITHUB_REPOSITORY
+          } else {
+            gh release create $tag $asset --title "逐渐优化器 $tag" --notes-file "release-notes/2026.09.29.txt" --latest --repo $env:GITHUB_REPOSITORY
+          }
