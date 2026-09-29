@@ -4,7 +4,7 @@
 
 ## 下载
 
-前往 [GitHub Releases](https://github.com/zhujianmengbi-droid/-/releases) 获取 Windows EXE；当前版本为 `ZJ-HUB-v2026.09.30.11.exe`，源码包为 `source/ZJ-HUB-v2026.09.30.11-source.zip`。
+前往 [GitHub Releases](https://github.com/zhujianmengbi-droid/-/releases) 获取 Windows EXE；当前版本为 `ZJ-HUB-v2026.09.30.12.exe`，源码包为 `source/ZJ-HUB-v2026.09.30.12-source.zip`。
 
 ## 游戏 ID 登录
 
@@ -26,12 +26,12 @@
 
 ## 主题与系统
 
-支持明亮、玻璃、液态玻璃、暗色和深海蓝主题；需要 Windows 10 或 Windows 11。液态玻璃主题参考 [liquid-glass-webgl](https://github.com/martin65536/liquid-glass-webgl) 的动态光场、折射、连续圆角与分层高光思路，在 Qt 中使用缓存底图和单背景动画实现，保证窗口交互流畅。
+支持明亮、玻璃、液态玻璃、暗色和深海蓝主题；需要 Windows 10 或 Windows 11。液态玻璃主题参考 [liquid-glass-webgl](https://github.com/martin65536/liquid-glass-webgl) 的中性灰白玻璃面、白色高光边缘、蓝色点缀和动态光场思路，在 Qt 中使用缓存底图和单背景动画实现，保证窗口交互流畅。
 
 
 
 
 
 
-- v2026.09.30.11 重置液态玻璃材质：加入动态光场、流动折射带、弧形边缘高光和五级表面层次，所有主题页面同步适配。
+- v2026.09.30.12 调整液态玻璃配色：玻璃面改为中性灰白，保留白色边缘高光和蓝色焦点，背景使用低饱和橙/粉/蓝光场，降低青紫色大面积铺色。
 

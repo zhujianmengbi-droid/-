@@ -66,7 +66,7 @@ from main import App, STYLE, Backdrop, TitleBar, label, panel
 
 # The version is also used as the GitHub release tag (for example, v2026.09.29).
 # Bump it when publishing a new release so existing installations can discover it.
-APP_VERSION = '2026.09.30.11'
+APP_VERSION = '2026.09.30.12'
 GITHUB_REPOSITORY = 'zhujianmengbi-droid/-'
 GITHUB_REPOSITORY_URL = f'https://github.com/{GITHUB_REPOSITORY}'
 GITHUB_LATEST_RELEASE_API = (
@@ -1476,9 +1476,9 @@ class ZJStartupSplash(QWidget):
             'muted': '#a4aab3',
         },
         'liquid': {
-            'top': '#102c3e', 'bottom': '#1b1234', 'ink': '#effeff',
-            'accent': '#9cefff', 'edge': '#d6fbff', 'glow': '#8c9bff',
-            'muted': '#a4cad6',
+            'top': '#303542', 'bottom': '#151923', 'ink': '#f5f7fb',
+            'accent': '#b9d6ff', 'edge': '#ffffff', 'glow': '#8b9fd0',
+            'muted': '#b6bfce',
         },
         'dark': {
             'top': '#141d29', 'bottom': '#080e16', 'ink': '#edf4fd',
@@ -1726,15 +1726,15 @@ THEME_PALETTES = {
     },
     'liquid': {
         'name': '液态玻璃',
-        'description': '动态折射光场、连续圆角和分层高光，模拟真正的液态材质',
+        'description': '中性雾化玻璃、动态折射光场与白色高光边缘',
         'icon': 'waves',
-        # The background is intentionally dark enough to give the moving
-        # refraction field room to breathe.  The alpha is kept high so the
-        # translucent top-level window never falls back to a washed-out gray.
-        'start': (7, 19, 34, 248),
-        'end': (17, 9, 37, 250),
-        'glow1': (53, 219, 235, 74),
-        'glow2': (158, 102, 255, 64),
+        # The reference keeps the panes close to neutral gray and lets the
+        # wallpaper carry the colour.  Keep the base charcoal and reserve
+        # saturation for the slow light field painted above it.
+        'start': (20, 24, 35, 250),
+        'end': (11, 15, 27, 252),
+        'glow1': (81, 133, 218, 50),
+        'glow2': (201, 87, 170, 42),
     },
     'dark': {
         'name': '暗色',
@@ -1776,8 +1776,8 @@ INPUT_SURFACES = {
         'focus': '#e1edf9', 'selection': '#536f8d',
     },
     'liquid': {
-        'fill': '#102b3d', 'text': '#f1ffff', 'border': '#54d5df',
-        'focus': '#c4fbff', 'selection': '#2b6d86',
+        'fill': '#252a36', 'text': '#f7f8fc', 'border': '#9fb6d5',
+        'focus': '#dceaff', 'selection': '#426c9e',
     },
     'dark': {
         'fill': '#0c1521', 'text': '#e8eef8', 'border': '#53667e',
@@ -1846,38 +1846,37 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
 """,
     'liquid': """
-/* Liquid Glass uses a dark optical base, a cool cyan rim, and a restrained
-   violet counter-light.  The moving light field is painted by
-   ThemeBackdrop; these surfaces deliberately leave a little alpha so that
-   the field remains visible through each layer. */
-QWidget { color: #f1ffff; }
-QDialog { color: #f1ffff; background: #0d2132; }
-QMessageBox { color: #f1ffff; background: #0d2132; }
-QToolTip { color: #f1ffff; background: #14384b; border: 1px solid #65e4ec; border-radius: 9px; padding: 6px; }
-QFrame#updateBanner { background: rgba(51,189,204,48); border-color: rgba(168,249,255,148); }
-QLabel#updateTitle { color: #f4ffff; }
-QLabel#updateHint, QLabel#muted, QLabel#pageHint, QLabel#brandHint, QLabel#metricLabel, QLabel#cardHint { color: #b4dce4; }
-QLabel#statLabel { color: #9bcbd5; }
-QLineEdit { color: #f1ffff; background: #102b3d; border: 1px solid #54d5df; selection-background-color: #2b6d86; border-radius: 11px; }
-QLineEdit:focus { color: #ffffff; background: #12334a; border: 1px solid #c4fbff; }
-QPushButton { color: #f1ffff; background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(88,210,219,54), stop:1 rgba(129,100,219,44)); border-color: rgba(177,247,255,130); }
-QPushButton:hover { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(107,234,239,86), stop:1 rgba(150,120,240,72)); border-color: #d5ffff; }
-QPushButton:pressed { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(107,234,239,112), stop:1 rgba(150,120,240,98)); }
-QPushButton#primary { color: #082b3a; background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #c6ffff, stop:0.52 #9cefff, stop:1 #c5b5ff); border-color: #ecffff; }
-QPushButton#primary:hover { background: #e4ffff; }
-QPushButton#navButton, QPushButton#settingsButton, QPushButton#settingsCategory, QPushButton#themeOption { color: #c3eaf0; }
-QPushButton#navButton:hover, QPushButton#settingsButton:hover, QPushButton#settingsCategory:hover, QPushButton#themeOption:hover { color: #ffffff; background: rgba(96,218,228,58); }
-QPushButton#navButton:checked, QPushButton#settingsButton:checked, QPushButton#settingsCategory:checked, QPushButton#themeOption:checked { color: #082b3a; background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #a8f4f6, stop:1 #b9a6f3); border-color: #ebffff; }
-QPushButton#windowControl { background: rgba(98,212,222,32); border-color: rgba(177,247,255,80); }
-QPushButton#windowControl:hover { background: rgba(177,247,255,92); }
-QCheckBox::indicator:unchecked { background: #102b3d; border: 1px solid #54d5df; border-radius: 5px; }
-QCheckBox::indicator:checked { background: #9cefff; border: 1px solid #efffff; border-radius: 5px; }
-QPlainTextEdit { color: #b9e1e7; }
-QProgressBar { background: rgba(82,211,221,38); border-radius: 4px; }
-QProgressBar::chunk { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #62e7e5, stop:1 #b39bff); border-radius: 4px; }
+/* The reference uses a neutral frosted pane and a white specular rim; the
+   wallpaper supplies the colour.  Keep text and controls on this quiet gray
+   scale, with one restrained iOS-like blue accent. */
+QWidget { color: #f4f6fb; }
+QDialog { color: #f4f6fb; background: #1a1d25; }
+QMessageBox { color: #f4f6fb; background: #1a1d25; }
+QToolTip { color: #f4f6fb; background: #2b303b; border: 1px solid #b7c8df; border-radius: 9px; padding: 6px; }
+QFrame#updateBanner { background: rgba(112,157,216,58); border-color: rgba(222,237,255,172); }
+QLabel#updateTitle { color: #ffffff; }
+QLabel#updateHint, QLabel#muted, QLabel#pageHint, QLabel#brandHint, QLabel#metricLabel, QLabel#cardHint { color: #bac4d3; }
+QLabel#statLabel { color: #a5b0c0; }
+QLineEdit { color: #f4f6fb; background: #252a35; border: 1px solid #9eafc7; selection-background-color: #426c9e; border-radius: 11px; }
+QLineEdit:focus { color: #ffffff; background: #2a303c; border: 1px solid #dceaff; }
+QPushButton { color: #f4f6fb; background: rgba(230,235,244,32); border-color: rgba(239,245,255,132); }
+QPushButton:hover { background: rgba(230,238,250,64); border-color: #ffffff; }
+QPushButton:pressed { background: rgba(202,219,242,86); }
+QPushButton#primary { color: #102039; background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #f7f9ff, stop:0.55 #d4e4fb, stop:1 #aac9f4); border-color: #ffffff; }
+QPushButton#primary:hover { background: #ffffff; }
+QPushButton#navButton, QPushButton#settingsButton, QPushButton#settingsCategory, QPushButton#themeOption { color: #cbd4e1; }
+QPushButton#navButton:hover, QPushButton#settingsButton:hover, QPushButton#settingsCategory:hover, QPushButton#themeOption:hover { color: #ffffff; background: rgba(221,232,249,58); }
+QPushButton#navButton:checked, QPushButton#settingsButton:checked, QPushButton#settingsCategory:checked, QPushButton#themeOption:checked { color: #15243a; background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #d5e8ff, stop:1 #abc8ee); border-color: #ffffff; }
+QPushButton#windowControl { background: rgba(226,235,247,38); border-color: rgba(239,245,255,90); }
+QPushButton#windowControl:hover { background: rgba(245,249,255,110); }
+QCheckBox::indicator:unchecked { background: #252a35; border: 1px solid #9eafc7; border-radius: 5px; }
+QCheckBox::indicator:checked { background: #b8d3f4; border: 1px solid #ffffff; border-radius: 5px; }
+QPlainTextEdit { color: #c2cbd8; }
+QProgressBar { background: rgba(220,230,244,40); border-radius: 4px; }
+QProgressBar::chunk { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #a8c8f0, stop:1 #e6edfa); border-radius: 4px; }
 QScrollBar:vertical { width: 9px; margin: 4px 1px 4px 1px; background: transparent; }
-QScrollBar::handle:vertical { min-height: 26px; background: rgba(151,240,245,110); border-radius: 4px; }
-QScrollBar::handle:vertical:hover { background: rgba(211,255,255,190); }
+QScrollBar::handle:vertical { min-height: 26px; background: rgba(220,232,249,110); border-radius: 4px; }
+QScrollBar::handle:vertical:hover { background: rgba(247,250,255,190); }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
 """,
@@ -2047,37 +2046,36 @@ QPushButton#themeOption { border: 1px solid rgba(255,255,255,54); }
 QPushButton#themeOption:checked { border: 1px solid rgba(255,255,255,105); border-left: 3px solid #dcecff; background: rgba(255,255,255,48); color: #f7f7f8; }
 """,
     'liquid': """
-/* Five material levels: sidebar, work surface, hero, card, and chip.  Each
-   has a different tint/alpha so moving light is visible without making text
-   translucent.  The 1px rim is paired with a faint inner top edge, which is
-   the inexpensive Qt equivalent of a bevel pass in the WebGL renderer. */
-QFrame#sidebar { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(11,43,58,226), stop:0.55 rgba(14,35,53,214), stop:1 rgba(37,22,66,220)); border: 1px solid rgba(181,248,255,166); border-radius: 20px; }
-QFrame#glass { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(42,112,126,165), stop:0.34 rgba(19,65,86,178), stop:0.72 rgba(27,45,83,182), stop:1 rgba(82,47,130,164)); border: 1px solid rgba(199,250,255,192); border-radius: 20px; }
-QFrame#matchDetailPanel { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(13,46,62,208), stop:1 rgba(37,25,70,204)); border: 1px solid rgba(145,236,244,144); border-radius: 20px; }
-QFrame#hero { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(70,185,193,205), stop:0.45 rgba(50,123,157,204), stop:1 rgba(107,74,183,194)); border: 1px solid rgba(222,255,255,230); border-left: 4px solid #b7ffff; border-radius: 20px; }
-QFrame#metricCard { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(35,106,124,188), stop:1 rgba(37,57,106,184)); border: 1px solid rgba(164,244,249,158); border-radius: 16px; }
-QFrame#featureCard { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(20,70,89,204), stop:0.6 rgba(24,50,83,206), stop:1 rgba(59,35,98,194)); border: 1px solid rgba(174,244,250,148); border-radius: 20px; }
-QFrame#featureRow { background: rgba(49,125,139,176); border: 1px solid rgba(183,247,251,138); border-radius: 14px; }
-QFrame#matchRecord { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 rgba(48,145,151,112), stop:1 rgba(84,67,146,96)); border: 1px solid rgba(176,247,250,118); border-radius: 14px; }
-QFrame#matchRecord:hover { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 rgba(74,199,198,160), stop:1 rgba(128,104,209,140)); }
-QFrame#matchRecord[selected="true"] { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 rgba(109,228,222,188), stop:1 rgba(157,128,236,170)); border-left-color: #f1ffff; }
-QFrame#statChip { background: rgba(104,215,218,92); border: 1px solid rgba(190,250,252,80); border-radius: 10px; }
-QFrame#matchDetailHero { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(75,190,195,204), stop:0.48 rgba(56,122,163,198), stop:1 rgba(116,75,188,198)); border: 1px solid rgba(221,255,255,220); border-radius: 19px; }
-QFrame#placeholder { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(25,78,96,190), stop:1 rgba(48,38,92,186)); border: 1px solid rgba(175,241,248,142); border-radius: 20px; }
-QFrame#settingsSidebar { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(15,60,77,230), stop:1 rgba(48,30,85,222)); border: 1px solid rgba(186,246,251,165); border-radius: 20px; }
-QFrame#settingsCard { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(33,93,108,220), stop:0.65 rgba(29,57,91,220), stop:1 rgba(65,41,106,210)); border: 1px solid rgba(199,250,255,176); border-radius: 20px; }
-QFrame#settingsOverlay { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(8,30,47,252), stop:0.55 rgba(13,26,47,252), stop:1 rgba(32,18,60,252)); border: 1px solid rgba(201,250,255,210); }
-QFrame#row { background: rgba(103,217,224,28); border-bottom: 1px solid rgba(170,241,247,82); }
-QPushButton { border: 1px solid rgba(180,247,252,132); border-radius: 12px; }
+/* The pane hierarchy is intentionally neutral gray/white like the reference
+   material.  Wallpaper colour remains visible behind it while the crisp rim
+   and the tiny blue accent provide depth and focus. */
+QFrame#sidebar { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(45,49,61,224), stop:0.55 rgba(30,34,45,216), stop:1 rgba(59,48,68,208)); border: 1px solid rgba(245,248,255,176); border-radius: 20px; }
+QFrame#glass { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(236,240,248,92), stop:0.38 rgba(176,188,208,70), stop:0.72 rgba(111,125,151,76), stop:1 rgba(239,226,239,72)); border: 1px solid rgba(255,255,255,198); border-radius: 20px; }
+QFrame#matchDetailPanel { background: rgba(37,42,53,164); border: 1px solid rgba(241,246,255,144); border-radius: 20px; }
+QFrame#hero { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(242,246,253,132), stop:0.48 rgba(174,193,222,108), stop:1 rgba(228,211,229,108)); border: 1px solid rgba(255,255,255,230); border-left: 4px solid #dceaff; border-radius: 20px; }
+QFrame#metricCard { background: rgba(226,232,243,82); border: 1px solid rgba(255,255,255,165); border-radius: 16px; }
+QFrame#featureCard { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(208,216,231,76), stop:0.6 rgba(135,149,174,70), stop:1 rgba(214,195,218,66)); border: 1px solid rgba(255,255,255,158); border-radius: 20px; }
+QFrame#featureRow { background: rgba(229,235,245,66); border: 1px solid rgba(255,255,255,135); border-radius: 14px; }
+QFrame#matchRecord { background: rgba(231,236,246,56); border: 1px solid rgba(255,255,255,102); border-radius: 14px; }
+QFrame#matchRecord:hover { background: rgba(245,248,255,86); }
+QFrame#matchRecord[selected="true"] { background: rgba(212,229,251,112); border-left-color: #f8fbff; }
+QFrame#statChip { background: rgba(242,246,253,70); border: 1px solid rgba(255,255,255,98); border-radius: 10px; }
+QFrame#matchDetailHero { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(241,245,253,126), stop:0.48 rgba(178,197,225,104), stop:1 rgba(226,209,229,102)); border: 1px solid rgba(255,255,255,215); border-radius: 19px; }
+QFrame#placeholder { background: rgba(209,218,233,76); border: 1px solid rgba(255,255,255,150); border-radius: 20px; }
+QFrame#settingsSidebar { background: rgba(44,49,61,230); border: 1px solid rgba(245,248,255,178); border-radius: 20px; }
+QFrame#settingsCard { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(221,228,240,92), stop:0.65 rgba(128,143,170,86), stop:1 rgba(214,193,220,78)); border: 1px solid rgba(255,255,255,180); border-radius: 20px; }
+QFrame#settingsOverlay { background: rgba(27,30,38,248); border: 1px solid rgba(255,255,255,205); }
+QFrame#row { background: rgba(235,240,248,24); border-bottom: 1px solid rgba(255,255,255,74); }
+QPushButton { border: 1px solid rgba(255,255,255,138); border-radius: 12px; }
 QPushButton#navButton { border: none; border-left: 4px solid transparent; border-radius: 9px; }
-QPushButton#navButton:hover { background: rgba(103,231,241,64); border-radius: 9px; color: #ffffff; }
-QPushButton#navButton:checked { border: none; border-left: 4px solid #ebffff; border-radius: 9px; background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 rgba(103,231,241,122), stop:1 rgba(144,112,224,100)); color: #ffffff; }
+QPushButton#navButton:hover { background: rgba(240,246,255,70); border-radius: 9px; color: #ffffff; }
+QPushButton#navButton:checked { border: none; border-left: 4px solid #ffffff; border-radius: 9px; background: rgba(208,226,250,116); color: #ffffff; }
 QPushButton#settingsButton { border: none; border-radius: 9px; }
-QPushButton#settingsButton:hover { background: rgba(103,231,241,64); border-radius: 9px; color: #ffffff; }
-QPushButton#settingsButton:checked { border: none; border-left: 4px solid #ebffff; border-radius: 9px; background: rgba(103,231,241,94); color: #ffffff; }
-QPushButton#settingsCategory:checked { border: none; border-left: 3px solid #ebffff; background: rgba(103,231,241,82); }
-QPushButton#themeOption { border: 1px solid rgba(174,244,250,120); border-radius: 13px; }
-QPushButton#themeOption:checked { border: 1px solid rgba(237,255,255,220); border-left: 3px solid #ebffff; background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 rgba(103,231,241,104), stop:1 rgba(145,111,229,96)); color: #ffffff; }
+QPushButton#settingsButton:hover { background: rgba(240,246,255,70); border-radius: 9px; color: #ffffff; }
+QPushButton#settingsButton:checked { border: none; border-left: 4px solid #ffffff; border-radius: 9px; background: rgba(208,226,250,104); color: #ffffff; }
+QPushButton#settingsCategory:checked { border: none; border-left: 3px solid #ffffff; background: rgba(208,226,250,88); }
+QPushButton#themeOption { border: 1px solid rgba(255,255,255,128); border-radius: 13px; }
+QPushButton#themeOption:checked { border: 1px solid rgba(255,255,255,225); border-left: 3px solid #ffffff; background: rgba(208,226,250,98); color: #ffffff; }
 """,
     'dark': """
 QFrame#sidebar { background: rgba(7,13,22,248); border: 1px solid rgba(122,155,194,52); border-radius: 18px; }
@@ -2186,15 +2184,15 @@ MATCH_ROW_PALETTES = {
         'neutral': '#ececef', 'outline': 'rgba(255,255,255,108)',
     },
     'liquid': {
-        'win_bg': 'rgba(39,153,126,116)', 'win_hover': 'rgba(54,184,151,140)', 'win_text': '#e4fff8',
-        'win_meta': '#a9e8d7', 'win_border': 'rgba(124,250,214,176)',
-        'loss_bg': 'rgba(190,78,128,108)', 'loss_hover': 'rgba(219,97,149,132)', 'loss_text': '#ffe9f5',
-        'loss_meta': '#efbad5', 'loss_border': 'rgba(255,164,207,168)',
-        'unknown_bg': 'rgba(117,209,220,54)', 'unknown_hover': 'rgba(139,229,235,78)',
-        'unknown_text': '#effeff', 'unknown_meta': '#b4e1e6',
-        'daily_bg': 'rgba(95,179,197,48)', 'recent_bg': 'rgba(98,205,213,74)', 'recent_hover': 'rgba(118,226,229,96)',
-        'recent_text': '#effeff', 'positive': '#9ff4d7', 'negative': '#ffb2d2',
-        'neutral': '#effeff', 'outline': 'rgba(188,247,255,150)',
+        'win_bg': 'rgba(54,156,104,108)', 'win_hover': 'rgba(68,181,121,132)', 'win_text': '#e3f8e9',
+        'win_meta': '#b5ddc0', 'win_border': 'rgba(154,233,178,170)',
+        'loss_bg': 'rgba(178,70,76,102)', 'loss_hover': 'rgba(205,88,94,126)', 'loss_text': '#ffe7e8',
+        'loss_meta': '#e6b8bc', 'loss_border': 'rgba(255,171,177,166)',
+        'unknown_bg': 'rgba(238,243,251,42)', 'unknown_hover': 'rgba(250,252,255,68)',
+        'unknown_text': '#f4f6fb', 'unknown_meta': '#c2cad7',
+        'daily_bg': 'rgba(225,232,244,40)', 'recent_bg': 'rgba(235,241,251,62)', 'recent_hover': 'rgba(248,251,255,86)',
+        'recent_text': '#f4f6fb', 'positive': '#a8e6bc', 'negative': '#ffb1b5',
+        'neutral': '#f4f6fb', 'outline': 'rgba(245,249,255,148)',
     },
     'dark': {
         'win_bg': '#17452f', 'win_hover': '#20583a', 'win_text': '#e0f7e8',
@@ -2306,11 +2304,11 @@ LEADERBOARD_RANK_PALETTES = {
         '5': {'bg': '#393b40', 'hover': '#45474c', 'border': '#62656c', 'text': '#bfc2c8'},
     },
     'liquid': {
-        '1': {'bg': '#665426', 'hover': '#806a2e', 'border': '#f5d86e', 'text': '#fff0b1'},
-        '2': {'bg': '#31566a', 'hover': '#3b6c82', 'border': '#a8e6ef', 'text': '#e4fcff'},
-        '3': {'bg': '#633d31', 'hover': '#7c4b3a', 'border': '#f2ae84', 'text': '#ffe1cb'},
-        '4': {'bg': '#23465b', 'hover': '#2c5971', 'border': '#71bfce', 'text': '#d5f4f8'},
-        '5': {'bg': '#203c50', 'hover': '#294e65', 'border': '#5ca0b0', 'text': '#bfe1e8'},
+        '1': {'bg': '#5b4a22', 'hover': '#735e2b', 'border': '#f0ca67', 'text': '#fff0ba'},
+        '2': {'bg': '#4a4e57', 'hover': '#5d626c', 'border': '#c8d0dc', 'text': '#f1f4f9'},
+        '3': {'bg': '#5a3f30', 'hover': '#704d39', 'border': '#e0a477', 'text': '#ffe2cd'},
+        '4': {'bg': '#394454', 'hover': '#4b586b', 'border': '#96a9c0', 'text': '#dce5f0'},
+        '5': {'bg': '#303a49', 'hover': '#414d5e', 'border': '#7d91a8', 'text': '#c7d2e0'},
     },
     'dark': {
         '1': {'bg': '#493a17', 'hover': '#5d4a1e', 'border': '#d8b24f', 'text': '#ffe59a'},
@@ -2527,9 +2525,9 @@ def _lobby_chat_style(theme_key):
         mine, mine_border = 'rgba(185,218,255,56)', 'rgba(185,218,255,138)'
         online = '#a6e6bd'
     elif theme_key == 'liquid':
-        surface, raised, text, muted = 'rgba(37,110,125,118)', 'rgba(82,184,192,100)', '#effeff', '#b4e1e6'
-        mine, mine_border = 'rgba(104,220,226,128)', 'rgba(188,247,255,176)'
-        online = '#9ff4d7'
+        surface, raised, text, muted = 'rgba(226,232,243,74)', 'rgba(245,248,255,86)', '#f4f6fb', '#c2cad7'
+        mine, mine_border = 'rgba(208,226,250,112)', 'rgba(245,249,255,190)'
+        online = '#b6efcf'
     elif theme_key == 'blue':
         surface, raised, text, muted = '#0d2e5d', '#123b73', '#e6f0ff', '#afc8e5'
         mine, mine_border = '#174476', '#78aee9'
@@ -2575,11 +2573,11 @@ def _taskbar_switcher_style(theme_key):
             'selected': 'rgba(185,218,255,76)', 'error': '#ffb4b1',
         },
         'liquid': {
-            'surface': 'rgba(16,58,76,188)', 'raised': 'rgba(34,92,108,178)',
-            'field': '#142b3b', 'text': '#effeff', 'muted': '#b4e1e6',
-            'border': 'rgba(156,239,255,128)', 'accent': '#9cefff',
-            'accent_text': '#082c3b', 'hover': 'rgba(103,231,241,60)',
-            'selected': 'rgba(103,231,241,94)', 'error': '#ffb2d2',
+            'surface': 'rgba(42,47,59,218)', 'raised': 'rgba(223,231,244,74)',
+            'field': '#252a36', 'text': '#f4f6fb', 'muted': '#c2cad7',
+            'border': 'rgba(245,249,255,150)', 'accent': '#d6e7ff',
+            'accent_text': '#16243a', 'hover': 'rgba(235,242,253,86)',
+            'selected': 'rgba(205,225,251,112)', 'error': '#ffb1b5',
         },
         'dark': {
             'surface': '#16263a', 'raised': '#0d1928', 'field': '#0c1521',
@@ -2836,16 +2834,16 @@ class ThemeBackdrop(Backdrop):
         blobs = [
             (0.16 + 0.08 * math.sin(phase * 0.71),
              0.20 + 0.12 * math.cos(phase * 0.53),
-             0.60, (54, 223, 235, 72)),
+             0.60, (79, 155, 235, 62)),
             (0.82 + 0.10 * math.cos(phase * 0.47),
              0.30 + 0.14 * math.sin(phase * 0.63),
-             0.53, (152, 105, 255, 66)),
+             0.53, (210, 73, 181, 48)),
             (0.58 + 0.12 * math.sin(phase * 0.38),
              0.88 + 0.08 * math.cos(phase * 0.59),
-             0.44, (64, 175, 214, 44)),
+             0.44, (235, 137, 104, 40)),
             (0.28 + 0.10 * math.cos(phase * 0.31),
              0.68 + 0.10 * math.sin(phase * 0.43),
-             0.36, (208, 118, 239, 30)),
+             0.36, (104, 204, 208, 32)),
         ]
         painter.save()
         painter.setPen(Qt.PenStyle.NoPen)
@@ -2866,11 +2864,11 @@ class ThemeBackdrop(Backdrop):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         ribbon_specs = [
             (0.16 + 0.035 * math.sin(phase * 0.45), 0.22, 0.22,
-             QColor(145, 247, 250, 22), QColor(207, 255, 255, 58)),
+             QColor(228, 237, 255, 18), QColor(246, 250, 255, 62)),
             (0.64 + 0.045 * math.cos(phase * 0.36), -0.12, 0.20,
-             QColor(189, 145, 255, 18), QColor(225, 201, 255, 50)),
+             QColor(245, 216, 255, 14), QColor(255, 241, 250, 48)),
             (0.44 + 0.04 * math.sin(phase * 0.57), 0.70, 0.16,
-             QColor(117, 231, 229, 14), QColor(197, 255, 250, 42)),
+             QColor(255, 222, 197, 12), QColor(255, 245, 225, 42)),
         ]
         for index, (anchor, slope, curve, broad, edge) in enumerate(ribbon_specs):
             path = QPainterPath()
@@ -2894,9 +2892,9 @@ class ThemeBackdrop(Backdrop):
         sheen_x = -width * 0.3 + ((phase / math.tau) % 1.0) * width * 1.6
         sheen = QLinearGradient(sheen_x - width * 0.18, 0,
                                 sheen_x + width * 0.18, 0)
-        sheen.setColorAt(0.0, QColor(216, 255, 255, 0))
-        sheen.setColorAt(0.5, QColor(231, 255, 255, 25))
-        sheen.setColorAt(1.0, QColor(206, 184, 255, 0))
+        sheen.setColorAt(0.0, QColor(240, 244, 255, 0))
+        sheen.setColorAt(0.5, QColor(255, 255, 255, 30))
+        sheen.setColorAt(1.0, QColor(221, 231, 255, 0))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(sheen)
         painter.drawRect(0, 0, width, height)
@@ -2908,7 +2906,7 @@ class ThemeBackdrop(Backdrop):
             cx = width * (0.18 + i * 0.37) + math.sin(phase * 0.4 + i) * width * 0.06
             cy = height * (0.25 + i * 0.28) + math.cos(phase * 0.32 + i) * height * 0.05
             radius = short * (0.22 + i * 0.035)
-            pen_color = QColor(199, 255, 255, 28 if i != 1 else 36)
+            pen_color = QColor(237, 244, 255, 30 if i != 1 else 40)
             painter.setPen(QPen(pen_color, max(1.0, short * 0.0018)))
             painter.drawArc(QRectF(cx - radius, cy - radius, radius * 2, radius * 2),
                             int((phase * 180 / math.pi + i * 72) * 16), 94 * 16)
@@ -7263,7 +7261,7 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
         elif self.current_theme == 'glass':
             normal, active, metric = '#c4c6ca', '#f7f7f8', '#d0d2d6'
         elif self.current_theme == 'liquid':
-            normal, active, metric = '#b4e1e6', '#effeff', '#9cefff'
+            normal, active, metric = '#c7d1df', '#ffffff', '#b7d3f5'
         else:
             normal, active, metric = '#b8c8dc', '#eff7ff', '#a9d4ff'
         for button in self.nav_buttons.values():
@@ -7276,7 +7274,7 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
         theme_active = (
             '#ffffff' if self.current_theme == 'light'
             else '#202124' if self.current_theme == 'glass'
-            else '#082c3b' if self.current_theme == 'liquid'
+            else '#18263b' if self.current_theme == 'liquid'
             else '#102640'
         )
         for key, button in getattr(self, 'theme_buttons', {}).items():
@@ -7301,7 +7299,7 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
         tile_color = (
             '#3f79b4' if self.current_theme == 'light'
             else '#c9cbd0' if self.current_theme == 'glass'
-            else '#9cefff' if self.current_theme == 'liquid'
+            else '#b7d3f5' if self.current_theme == 'liquid'
             else '#bfe1ff'
         )
         status_color = '#287c68' if self.current_theme == 'light' else '#b9f1e4'
