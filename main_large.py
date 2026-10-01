@@ -68,7 +68,7 @@ from main import App, STYLE, Backdrop, TitleBar, label, panel
 
 # The version is also used as the GitHub release tag (for example, v2026.09.29).
 # Bump it when publishing a new release so existing installations can discover it.
-APP_VERSION = '1.2'
+APP_VERSION = '1.3'
 GITHUB_REPOSITORY = 'zhujianmengbi-droid/-'
 GITHUB_REPOSITORY_URL = f'https://github.com/{GITHUB_REPOSITORY}'
 GITHUB_LATEST_RELEASE_API = (
@@ -2414,18 +2414,22 @@ def _lobby_chat_style(theme_key):
         surface, raised, text, muted = '#f4f7fa', '#eaf0f6', '#1c2c3d', '#5b6d80'
         mine, mine_border = '#dfeeff', '#8db6df'
         online = '#168052'
+        badge_outline = '#ffffff'
     elif theme_key == 'glass':
         surface, raised, text, muted = 'rgba(255,255,255,28)', 'rgba(255,255,255,48)', '#f0f0f2', '#c2c4c8'
         mine, mine_border = 'rgba(185,218,255,56)', 'rgba(185,218,255,138)'
         online = '#a6e6bd'
+        badge_outline = '#34363a'
     elif theme_key == 'blue':
         surface, raised, text, muted = '#0d2e5d', '#123b73', '#e6f0ff', '#afc8e5'
         mine, mine_border = '#174476', '#78aee9'
         online = '#a4e6bd'
+        badge_outline = '#0d2e5d'
     else:
         surface, raised, text, muted = '#12243a', '#1b304b', '#e8eef8', '#b8c7d9'
         mine, mine_border = '#1b3b60', '#6fa9ef'
         online = '#9fe0b6'
+        badge_outline = '#12243a'
     return f"""
 QFrame#chatOverviewCard, QFrame#chatCard {{ background: {surface}; border: 1px solid {colors['outline']}; border-radius: 16px; }}
 QFrame#chatOnlineCard {{ background: {raised}; border: 1px solid {colors['outline']}; border-radius: 12px; min-width: 86px; }}
@@ -2435,6 +2439,7 @@ QLabel#chatConnectionBadge {{ color: {colors['positive']}; background: {colors['
 QLabel#chatServerHint, QLabel#chatStatus, QLabel#chatEmpty {{ color: {muted}; }}
 QScrollArea#chatScroll {{ background: transparent; border: none; border-radius: 12px; }}
 QWidget#chatMessagesHost {{ background: transparent; }}
+QLabel#chatUnreadDot {{ background: #e5484d; border: 2px solid {badge_outline}; border-radius: 5px; }}
 QFrame#chatMessageBubble {{ background: {raised}; border: 1px solid {colors['outline']}; border-radius: 13px; }}
 QFrame#chatMessageBubble[mine="true"] {{ background: {mine}; border-color: {mine_border}; }}
 QLabel#chatMessageAuthor {{ color: {text}; font-size: 11px; font-weight: 700; }}
@@ -2723,6 +2728,8 @@ class LargeApp(App):
         self._chat_worker = None
         self._chat_messages = []
         self._chat_message_keys = set()
+        self._chat_unread = False
+        self._chat_unread_badges = {}
         self._chat_session_id = ''
         self._chat_pending_message = ''
         self._chat_sending_message = ''
@@ -3138,6 +3145,7 @@ class LargeApp(App):
 
     def _register_navigation(self, pages):
         self.nav_buttons = {}
+        self._chat_unread_badges = {}
         for key, icon, title, hint, _page in pages:
             icon_name = {
                 'overview': 'home',
@@ -3159,6 +3167,36 @@ class LargeApp(App):
             button.clicked.connect(lambda checked=False, section=key: self.switch_section(section))
             self.nav_layout.addWidget(button)
             self.nav_buttons[key] = button
+            if key == 'lobby-chat':
+                unread_dot = QLabel(button)
+                unread_dot.setObjectName('chatUnreadDot')
+                unread_dot.setFixedSize(10, 10)
+                unread_dot.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+                unread_dot.setVisible(self._chat_unread)
+                self._chat_unread_badges[button] = unread_dot
+                button.installEventFilter(self)
+                self._position_chat_unread_dot(button)
+
+    def _position_chat_unread_dot(self, button):
+        dot = getattr(self, '_chat_unread_badges', {}).get(button)
+        if dot is None:
+            return
+        dot.move(max(0, button.width() - dot.width() - 12), 5)
+        dot.raise_()
+
+    def _set_lobby_chat_unread(self, unread):
+        self._chat_unread = bool(unread)
+        for dot in getattr(self, '_chat_unread_badges', {}).values():
+            dot.setVisible(self._chat_unread)
+            if self._chat_unread:
+                dot.raise_()
+
+    def _lobby_chat_is_open(self):
+        overlay = getattr(self, 'settings_overlay', None)
+        return (
+            getattr(self, '_active_section', '') == 'lobby-chat' and
+            (overlay is None or not overlay.isVisible())
+        )
 
     def switch_section(self, key):
         if key == 'settings':
@@ -3171,6 +3209,8 @@ class LargeApp(App):
             self.settings_overlay.hide()
         self._active_section = key
         self.page_stack.setCurrentIndex(index)
+        if key == 'lobby-chat':
+            self._set_lobby_chat_unread(False)
         # TaskbarSwitcher 页面包含原生 QTableWidget viewport。对整页施加
         # QGraphicsOpacityEffect 时，Windows 合成器会在首帧把 viewport
         # 画成黑色镂空条；页面本身保持稳定，内部控件仍可正常交互。
@@ -4240,6 +4280,9 @@ class LargeApp(App):
         then fade it away.  The normal scrollbar and API page loader continue
         to receive their events unchanged.
         """
+        if (watched in getattr(self, '_chat_unread_badges', {}) and
+                event.type() in (QEvent.Type.Resize, QEvent.Type.Show)):
+            self._position_chat_unread_dot(watched)
         if (hasattr(self, 'match_scroll') and watched in (
                 self.match_scroll.viewport(), self.match_scroll.verticalScrollBar())
                 and event.type() == QEvent.Type.Wheel):
@@ -5445,6 +5488,15 @@ class LargeApp(App):
         self.chat_scroll.setObjectName('chatScroll')
         self.chat_scroll.setWidgetResizable(True)
         self.chat_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        chat_scrollbar = self.chat_scroll.verticalScrollBar()
+        self._chat_scroll_animation = QPropertyAnimation(chat_scrollbar, b'value', self)
+        self._chat_scroll_animation.setDuration(150)
+        self._chat_scroll_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._chat_scroll_timer = QTimer(self)
+        self._chat_scroll_timer.setSingleShot(True)
+        self._chat_scroll_timer.timeout.connect(self._scroll_lobby_chat_to_latest)
+        chat_scrollbar.rangeChanged.connect(
+            lambda _minimum, _maximum: self._schedule_chat_scroll_to_latest())
         self.chat_messages_host = QWidget()
         self.chat_messages_host.setObjectName('chatMessagesHost')
         self.chat_messages_layout = QVBoxLayout(self.chat_messages_host)
@@ -5898,10 +5950,13 @@ class LargeApp(App):
         item.setdefault('created_at', datetime.now().astimezone().isoformat(timespec='seconds'))
         sender = str(item.get('player_id') or item.get('username') or '').strip()
         message_text = str(item.get('message') or item.get('text') or '').strip()
+        current_player = self._chat_bound_game_id().casefold()
+        is_current_player_message = bool(
+            sender and current_player and sender.casefold() == current_player)
         # The Realtime broadcast includes our own message before the transport
         # emits its ACK.  Do not turn that self echo into a second notification.
         own_echo = (
-            sender and sender == self._chat_bound_game_id() and
+            is_current_player_message and
             bool(self._chat_sending_message) and
             message_text == self._chat_sending_message)
         key = self._chat_message_key(item)
@@ -5916,9 +5971,36 @@ class LargeApp(App):
             self._chat_message_key(message) for message in self._chat_messages}
         self._save_chat_session_cache()
         self._render_lobby_messages(self._chat_messages)
-        if not own_echo:
+        if not own_echo and not is_current_player_message:
             self._play_chat_sound()
+        if not is_current_player_message and not self._lobby_chat_is_open():
+            self._set_lobby_chat_unread(True)
         self.chat_status.setText('已同步实时消息 · 公共大厅可见')
+
+    def _schedule_chat_scroll_to_latest(self):
+        timer = getattr(self, '_chat_scroll_timer', None)
+        if timer is not None:
+            timer.start(0)
+
+    def _scroll_lobby_chat_to_latest(self):
+        if self._closing or not hasattr(self, 'chat_scroll'):
+            return
+        layout = getattr(self, 'chat_messages_layout', None)
+        if layout is not None:
+            layout.activate()
+        scrollbar = self.chat_scroll.verticalScrollBar()
+        target = scrollbar.maximum()
+        animation = getattr(self, '_chat_scroll_animation', None)
+        if animation is None:
+            scrollbar.setValue(target)
+            return
+        animation.stop()
+        current = scrollbar.value()
+        if current == target:
+            return
+        animation.setStartValue(current)
+        animation.setEndValue(target)
+        animation.start()
 
     def _render_lobby_messages(self, messages):
         if not hasattr(self, 'chat_messages_layout'):
@@ -5979,8 +6061,7 @@ class LargeApp(App):
             self.chat_messages_layout.addWidget(bubble)
         self.chat_messages_layout.addStretch(1)
         self.chat_messages_host.setUpdatesEnabled(True)
-        QTimer.singleShot(0, lambda: self.chat_scroll.verticalScrollBar().setValue(
-            self.chat_scroll.verticalScrollBar().maximum()))
+        self._schedule_chat_scroll_to_latest()
 
     def _build_placeholder(self, title, description, icon, bullets):
         page = QWidget()
@@ -7215,6 +7296,3 @@ if __name__ == '__main__':
     window = LargeApp()
     _reveal_main_window(window)
     sys.exit(app.exec())
-
-
-

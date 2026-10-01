@@ -4,7 +4,7 @@
 
 ## 下载
 
-前往 [GitHub Releases](https://github.com/zhujianmengbi-droid/-/releases) 获取 Windows EXE；当前版本为 `ZJ-HUB-v1.2.exe`，源码包为 `source/ZJ-HUB-v1.2-source.zip`。
+前往 [GitHub Releases](https://github.com/zhujianmengbi-droid/-/releases) 获取 Windows EXE；当前版本为 `ZJ-HUB-v1.3.exe`，源码包为 `source/ZJ-HUB-v1.3-source.zip`。
 
 ## 游戏 ID 登录
 
@@ -34,4 +34,5 @@
 
 
 - v1.2 删除液态玻璃主题及其动态背景层；保留明亮、玻璃、暗色、深海蓝四套主题，清理重复按钮事件动画和无效重绘路径，保持视觉并提升流畅度。
+- v1.3 大厅聊天新增未读红点，打开聊天页后清除；消息列表会在滚动范围更新后平滑跟随到最新消息。
 
