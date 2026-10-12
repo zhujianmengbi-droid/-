@@ -16,11 +16,13 @@ import os
 import struct
 import tempfile
 import wave
+import subprocess
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from functools import lru_cache
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 
 from PySide6.QtCore import (
     QByteArray, QEasingCurve, QPropertyAnimation, QSettings, QThread, QTimer, QSize, Qt, QRectF, QPoint, QUrl, Signal, QEvent, QObject,
@@ -69,7 +71,7 @@ from startup_motion import reveal_main_window
 
 # The version is also used as the GitHub release tag (for example, v2026.09.29).
 # Bump it when publishing a new release so existing installations can discover it.
-APP_VERSION = '1.4'
+APP_VERSION = '1.5'
 GITHUB_REPOSITORY = 'zhujianmengbi-droid/-'
 GITHUB_REPOSITORY_URL = f'https://github.com/{GITHUB_REPOSITORY}'
 GITHUB_LATEST_RELEASE_API = (
@@ -84,6 +86,8 @@ SUPABASE_REALTIME_URL = (
     f'wss://{SUPABASE_PROJECT_REF}.supabase.co/realtime/v1/websocket')
 SUPABASE_CHAT_TOPIC = 'realtime:public-lobby'
 GAME_ID_SETTINGS_KEY = 'profile/gameId'
+FLASHBACK_PLUGIN_NAME = 'FlashbackRecorder-Compat-Warning.exe'
+FLASHBACK_PACKAGE_NAME = 'FlashbackRecorder-完整交付-2026-10-13'
 CHAT_SESSION_CACHE_KEY = 'chat/sessionMessages'
 CHAT_SOUND_ENABLED_KEY = 'chat/soundEnabled'
 CHAT_SOUND_VOLUME_KEY = 'chat/soundVolume'
@@ -2405,6 +2409,7 @@ class LargeApp(App):
         self._taskbar_action_kind = ''
         self._taskbar_hotkeys_paused = False
         self._taskbar_bindings = {}
+        self._flashback_process = None
         self._chat_messages = []
         self._chat_message_keys = set()
         self._chat_unread = False
@@ -2684,6 +2689,7 @@ class LargeApp(App):
             ('leaderboard', 'chart', '排行榜', '查询各个模式的日榜、周榜、年榜和总榜', self._build_leaderboard_page()),
             ('startup', 'command', '快捷工具', '用快捷键快速切换任务栏窗口', self._build_taskbar_switcher_page()),
             ('lobby-chat', 'chat', '大厅聊天', '连接起床战争公共大厅聊天', self._build_lobby_chat_page()),
+            ('flashback', 'blocks', 'Flashback 录制', '录制 Minecraft 过程并管理回放文件', self._build_flashback_page()),
         ]
         for key, icon, title, hint, page in pages:
             self._section_page_indices[key] = self.page_stack.addWidget(page)
@@ -2823,6 +2829,7 @@ class LargeApp(App):
                 'leaderboard': 'chart',
                 'startup': 'command',
                 'lobby-chat': 'chat',
+                'flashback': 'blocks',
             }.get(key, 'command')
             button = QPushButton(title)
             button.setObjectName('navButton')
@@ -5214,6 +5221,262 @@ class LargeApp(App):
         self._refresh_chat_identity()
         self._render_lobby_messages([])
         return page
+
+    # ------------------------------------------------------------------
+    # Flashback 录制与回放
+    def _flashback_search_roots(self):
+        """Return possible companion-plugin locations without touching the UI."""
+        roots = []
+        for base in (Path(sys.executable).resolve().parent,
+                     Path(__file__).resolve().parent):
+            roots.extend((base / 'plugins' / 'FlashbackRecorder', base / 'FlashbackRecorder', base))
+        roots.append(Path.home() / 'Desktop' / FLASHBACK_PACKAGE_NAME / '软件')
+        result = []
+        seen = set()
+        for root in roots:
+            key = str(root).casefold()
+            if key not in seen:
+                seen.add(key)
+                result.append(root)
+        return result
+
+    def _find_flashback_executable(self):
+        for root in self._flashback_search_roots():
+            candidate = root / FLASHBACK_PLUGIN_NAME
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def _flashback_replay_dirs(self):
+        """Find the delivery replay folder and the recorder's default output."""
+        candidates = [Path.home() / 'Videos' / 'FlashbackRecorder']
+        for root in self._flashback_search_roots():
+            candidates.append(root.parent / '回放')
+            candidates.append(root / '回放')
+        result = []
+        seen = set()
+        for directory in candidates:
+            key = str(directory).casefold()
+            if key not in seen:
+                seen.add(key)
+                result.append(directory)
+        return result
+
+    def _flashback_replays(self):
+        files = []
+        seen = set()
+        for directory in self._flashback_replay_dirs():
+            if not directory.is_dir():
+                continue
+            try:
+                entries = directory.glob('*.flashback.zip')
+            except OSError:
+                continue
+            for path in entries:
+                key = str(path).casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    files.append((path, path.stat().st_mtime))
+                except OSError:
+                    files.append((path, 0))
+        files.sort(key=lambda item: item[1], reverse=True)
+        return [path for path, _mtime in files[:12]]
+
+    def _build_flashback_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(4, 0, 4, 0)
+        layout.setSpacing(14)
+
+        heading = QVBoxLayout()
+        heading.setSpacing(4)
+        heading.addWidget(label('REPLAY TOOLS / FLASHBACK', 'eyebrow'))
+        heading.addWidget(label('Flashback 录制', 'pageTitle'))
+        heading.addWidget(label('录制 Minecraft 1.20.1 游戏过程，并整理为可回放的 Flashback 文件。', 'pageHint'))
+        layout.addLayout(heading)
+
+        hero = GlassFrame()
+        hero.setObjectName('flashbackHero')
+        hero_layout = QVBoxLayout(hero)
+        hero_layout.setContentsMargins(18, 15, 18, 15)
+        hero_layout.setSpacing(10)
+        hero_header = QHBoxLayout()
+        hero_header.setSpacing(9)
+        hero_header.addWidget(icon_tile('blocks', 'sectionIcon', '#bfe1ff', 16, 30))
+        copy = QVBoxLayout()
+        copy.setSpacing(3)
+        copy.addWidget(label('Flashback Recorder', 'cardTitle'))
+        self.flashback_status = label('正在检查录制器…', 'cardHint')
+        self.flashback_status.setObjectName('flashbackStatus')
+        copy.addWidget(self.flashback_status)
+        hero_header.addLayout(copy, 1)
+        self.flashback_launch_button = self.button('启动录制器', self._launch_flashback_recorder, True)
+        self.flashback_launch_button.setObjectName('flashbackLaunchButton')
+        self.flashback_launch_button.setProperty('themeIconName', 'command')
+        hero_header.addWidget(self.flashback_launch_button)
+        hero_layout.addLayout(hero_header)
+        self.flashback_path_hint = label('', 'cardHint')
+        self.flashback_path_hint.setObjectName('flashbackPathHint')
+        self.flashback_path_hint.setWordWrap(True)
+        hero_layout.addWidget(self.flashback_path_hint)
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        actions.addWidget(self.button('打开回放目录', self._open_flashback_replay_folder))
+        actions.addWidget(self.button('打开交付目录', self._open_flashback_package))
+        actions.addStretch(1)
+        actions.addWidget(self.button('刷新列表', self._refresh_flashback_page))
+        hero_layout.addLayout(actions)
+        layout.addWidget(hero)
+
+        guide = GlassFrame()
+        guide.setObjectName('flashbackGuideCard')
+        guide_layout = QHBoxLayout(guide)
+        guide_layout.setContentsMargins(16, 13, 16, 13)
+        guide_layout.setSpacing(10)
+        for title, detail, icon in (
+            ('选择进程', '进入世界后手动选择网易 Minecraft 1.20.1', 'target'),
+            ('开始录制', '注入后选择 20～120 tick 读取频率', 'chart'),
+            ('生成回放', '停止录制后导出 .mc1.21.11.flashback.zip', 'layers'),
+        ):
+            item = QVBoxLayout()
+            item.setSpacing(3)
+            item.addWidget(icon_tile(icon, 'sectionIcon', '#bfe1ff', 13, 24))
+            item.addWidget(label(title, 'cardTitle'))
+            note = label(detail, 'cardHint')
+            note.setWordWrap(True)
+            item.addWidget(note)
+            guide_layout.addLayout(item, 1)
+        layout.addWidget(guide)
+
+        replay_card = GlassFrame()
+        replay_card.setObjectName('flashbackReplayCard')
+        replay_layout = QVBoxLayout(replay_card)
+        replay_layout.setContentsMargins(16, 14, 16, 14)
+        replay_layout.setSpacing(9)
+        replay_header = QHBoxLayout()
+        replay_header.addWidget(label('最近回放', 'section'))
+        replay_header.addStretch(1)
+        replay_header.addWidget(label('双击文件可直接打开', 'cardHint'))
+        replay_layout.addLayout(replay_header)
+        self.flashback_replay_scroll = QScrollArea()
+        self.flashback_replay_scroll.setObjectName('flashbackReplayScroll')
+        self.flashback_replay_scroll.setWidgetResizable(True)
+        self.flashback_replay_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.flashback_replay_host = QWidget()
+        self.flashback_replay_layout = QVBoxLayout(self.flashback_replay_host)
+        self.flashback_replay_layout.setContentsMargins(2, 2, 5, 2)
+        self.flashback_replay_layout.setSpacing(7)
+        self.flashback_replay_scroll.setWidget(self.flashback_replay_host)
+        replay_layout.addWidget(self.flashback_replay_scroll, 1)
+        layout.addWidget(replay_card, 1)
+
+        self._refresh_flashback_page()
+        return page
+
+    def _launch_flashback_recorder(self):
+        executable = self._find_flashback_executable()
+        if executable is None:
+            self.flashback_status.setText('未找到录制器，请把 FlashbackRecorder-Compat-Warning.exe 放到 ZJ HUB/plugins/FlashbackRecorder。')
+            self.flashback_path_hint.setText('也可以点击“打开交付目录”，从完整交付包中直接启动。')
+            return
+        process = self._flashback_process
+        if process is not None and process.poll() is None:
+            self.flashback_status.setText('录制器已经在运行。请在录制器中选择 Minecraft 进程。')
+            return
+        try:
+            self._flashback_process = subprocess.Popen(
+                [str(executable)], cwd=str(executable.parent),
+                creationflags=getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0))
+        except OSError as error:
+            self.flashback_status.setText(f'录制器启动失败：{error}')
+            return
+        self.flashback_status.setText('录制器已启动 · 请进入世界后手动选择进程并注入。')
+        self.flashback_path_hint.setText(str(executable))
+
+    def _open_flashback_replay_folder(self):
+        directories = self._flashback_replay_dirs()
+        target = next((path for path in directories if path.is_dir()), directories[0])
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+
+    def _open_flashback_package(self):
+        package = Path.home() / 'Desktop' / FLASHBACK_PACKAGE_NAME
+        if package.is_dir():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(package)))
+            self.flashback_status.setText('已打开 Flashback 完整交付目录。')
+        else:
+            self.flashback_status.setText('未找到桌面上的 Flashback 完整交付目录。')
+
+    def _open_flashback_replay(self, path):
+        path = Path(path)
+        if path.is_file():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _clear_layout(self, layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            child = item.layout()
+            if widget is not None:
+                widget.deleteLater()
+            elif child is not None:
+                self._clear_layout(child)
+
+    def _refresh_flashback_page(self):
+        if not hasattr(self, 'flashback_replay_layout'):
+            return
+        executable = self._find_flashback_executable()
+        if executable is None:
+            self.flashback_status.setText('未找到录制器 · 可从完整交付目录启动')
+            self.flashback_launch_button.setEnabled(False)
+            self.flashback_path_hint.setText('插件目录：ZJ HUB/plugins/FlashbackRecorder/')
+        else:
+            self.flashback_launch_button.setEnabled(True)
+            self.flashback_path_hint.setText(str(executable))
+            process = self._flashback_process
+            if process is None or process.poll() is not None:
+                self.flashback_status.setText('录制器已就绪 · 需要 Java 17/21 和 Minecraft 1.20.1')
+            else:
+                self.flashback_status.setText('录制器正在运行 · 请在录制器中选择进程')
+
+        self._clear_layout(self.flashback_replay_layout)
+        replays = self._flashback_replays()
+        if not replays:
+            empty = label('还没有找到回放文件。停止录制后，文件会出现在 Videos/FlashbackRecorder。', 'cardHint')
+            empty.setWordWrap(True)
+            self.flashback_replay_layout.addWidget(empty)
+        else:
+            for path in replays:
+                row = GlassFrame()
+                row.setObjectName('flashbackReplayRow')
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(11, 8, 10, 8)
+                row_layout.setSpacing(8)
+                row_layout.addWidget(icon_tile('layers', 'sectionIcon', '#bfe1ff', 13, 25))
+                copy = QVBoxLayout()
+                copy.setSpacing(2)
+                title = label(path.stem, 'cardTitle')
+                title.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                copy.addWidget(title)
+                try:
+                    size_mb = path.stat().st_size / (1024 * 1024)
+                    detail = f'{size_mb:.1f} MB · {path.parent}'
+                except OSError:
+                    detail = str(path.parent)
+                hint = label(detail, 'cardHint')
+                hint.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                copy.addWidget(hint)
+                row_layout.addLayout(copy, 1)
+                open_button = self.button('打开', lambda checked=False, p=path: self._open_flashback_replay(p))
+                row_layout.addWidget(open_button)
+                row.mouseDoubleClickEvent = lambda event, p=path: self._open_flashback_replay(p)
+                self.flashback_replay_layout.addWidget(row)
+        self.flashback_replay_layout.addStretch(1)
 
     def _ensure_chat_emoji_panel(self):
         """Create the small built-in emoji picker once, without dependencies."""
