@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>ZJHUB.Recorder.Engine</AssemblyName>
+    <RootNamespace>FlashbackRecorder</RootNamespace>
+    <PlatformTarget>x64</PlatformTarget>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="runtime\runtime-recorder-cli.jar" LogicalName="RuntimeAssets/runtime-recorder-cli.jar" />
+    <EmbeddedResource Include="runtime\runtime-recorder-agent-v12.jar" LogicalName="RuntimeAssets/runtime-recorder-agent-v12.jar" />
+    <EmbeddedResource Include="runtime\flashback-protocol-adapter-v5.jar" LogicalName="RuntimeAssets/flashback-protocol-adapter-v5.jar" />
+  </ItemGroup>
+</Project>
