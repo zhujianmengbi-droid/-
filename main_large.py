@@ -75,7 +75,7 @@ from startup_motion import reveal_main_window
 
 # The version is also used as the GitHub release tag (for example, v2026.09.29).
 # Bump it when publishing a new release so existing installations can discover it.
-APP_VERSION = '1.6.1'
+APP_VERSION = '1.6.2'
 GITHUB_REPOSITORY = 'zhujianmengbi-droid/-'
 GITHUB_REPOSITORY_URL = f'https://github.com/{GITHUB_REPOSITORY}'
 GITHUB_LATEST_RELEASE_API = (
@@ -1841,6 +1841,9 @@ QCheckBox#flashbackAutoZip::indicator:checked {{ background: {colors['check']}; 
 QScrollArea#flashbackReplayScroll {{ background: transparent; border: none; }}
 QScrollArea#flashbackReplayScroll QWidget#qt_scrollarea_viewport,
 QScrollArea#flashbackReplayScroll QWidget#flashbackReplayHost {{ background: transparent; }}
+QScrollArea#flashbackPageScroll {{ background: transparent; border: none; }}
+QScrollArea#flashbackPageScroll QWidget#qt_scrollarea_viewport,
+QScrollArea#flashbackPageScroll QWidget#flashbackPageContent {{ background: transparent; }}
 QPlainTextEdit#flashbackLog, QPlainTextEdit#flashbackInfo {{ color: {colors['text']}; background: {colors['input']}; border: 1px solid {colors['border']}; border-radius: 10px; padding: 7px; }}
 """
 
@@ -5723,9 +5726,38 @@ class LargeApp(App):
 
     def _build_flashback_native_page(self):
         page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(4, 0, 4, 0)
+        # The native Flashback page contains a real recorder configuration
+        # form, two preview panes and a log surface.  Its natural height is
+        # larger than the compact app viewport (especially at 100% DPI), so
+        # putting the raw layout directly on ``page`` lets Qt squeeze rows
+        # down to zero pixels.  That was the source of clipped Chinese text,
+        # collapsed checkboxes and cards that appeared to overlap.  Keep the
+        # same visual shell, but give the page a single themed vertical
+        # scroller so every child can keep its sizeHint and typography.
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        page_scroll = QScrollArea(page)
+        page_scroll.setObjectName('flashbackPageScroll')
+        page_scroll.setWidgetResizable(True)
+        page_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        page_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        page_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        page_viewport = page_scroll.viewport()
+        page_viewport.setAutoFillBackground(False)
+        page_viewport.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        page_palette = page_viewport.palette()
+        page_palette.setColor(QPalette.ColorRole.Base, Qt.GlobalColor.transparent)
+        page_palette.setColor(QPalette.ColorRole.Window, Qt.GlobalColor.transparent)
+        page_viewport.setPalette(page_palette)
+        content = QWidget()
+        content.setObjectName('flashbackPageContent')
+        content.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(4, 0, 4, 14)
         layout.setSpacing(12)
+        page_scroll.setWidget(content)
+        outer.addWidget(page_scroll, 1)
         heading = QVBoxLayout()
         heading.setSpacing(4)
         heading.addWidget(label('REPLAY TOOLS / BUILT IN', 'eyebrow'))
@@ -5804,6 +5836,12 @@ class LargeApp(App):
 
         self._flashback_replay_layout = self.flashback_replay_layout
         self._flashback_status_timer = QTimer(self); self._flashback_status_timer.setInterval(800); self._flashback_status_timer.timeout.connect(self._flashback_status_tick)
+        # Preserve the form's natural height inside the outer scroll area.
+        # Without an explicit minimum, ``widgetResizable`` allows the content
+        # widget to shrink back to the viewport and the lower cards squeeze
+        # their text editors down to a few dozen pixels.
+        content.adjustSize()
+        content.setMinimumHeight(content.sizeHint().height())
         return page
 
     def _section_header_layout(self, title, icon_name='command'):
