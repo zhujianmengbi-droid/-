@@ -64,11 +64,12 @@ import match_data
 import optimizer
 import taskbar_switcher_core
 from main import App, STYLE, Backdrop, TitleBar, label, panel
+from startup_motion import reveal_main_window
 
 
 # The version is also used as the GitHub release tag (for example, v2026.09.29).
 # Bump it when publishing a new release so existing installations can discover it.
-APP_VERSION = '1.3'
+APP_VERSION = '1.4'
 GITHUB_REPOSITORY = 'zhujianmengbi-droid/-'
 GITHUB_REPOSITORY_URL = f'https://github.com/{GITHUB_REPOSITORY}'
 GITHUB_LATEST_RELEASE_API = (
@@ -1465,254 +1466,6 @@ class MatchHistoryScrollArea(QScrollArea):
         super().wheelEvent(event)
 
 
-class ZJStartupSplash(QWidget):
-    """A compact, theme-aware ZJ mark with a clean 60 fps reveal."""
-
-    finished = Signal()
-
-    _THEMES = {
-        'light': {
-            'top': '#f8fafc', 'bottom': '#e6ebf1', 'ink': '#1d2c3e',
-            'accent': '#3f79b4', 'edge': '#8eafd0', 'glow': '#9bbddd',
-            'muted': '#71849a',
-        },
-        'glass': {
-            'top': '#303236', 'bottom': '#1d1f22', 'ink': '#f1f3f6',
-            'accent': '#bfc6cf', 'edge': '#e1e5eb', 'glow': '#89939f',
-            'muted': '#a4aab3',
-        },
-        'dark': {
-            'top': '#141d29', 'bottom': '#080e16', 'ink': '#edf4fd',
-            'accent': '#8cb5df', 'edge': '#d5e8ff', 'glow': '#517da8',
-            'muted': '#91a7bd',
-        },
-        'blue': {
-            'top': '#113768', 'bottom': '#071b3b', 'ink': '#f0f7ff',
-            'accent': '#8ec8ff', 'edge': '#d9efff', 'glow': '#3f91d7',
-            'muted': '#9dc0e2',
-        },
-    }
-
-    def __init__(self, theme='light'):
-        super().__init__(None, Qt.WindowType.SplashScreen | Qt.WindowType.FramelessWindowHint)
-        # The surface is deliberately opaque. It avoids the expensive translucent
-        # DWM composition that made the old particle animation stutter.
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
-        self.setFixedSize(520, 300)
-        self._timer = QTimer(self)
-        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._timer.setInterval(16)
-        self._timer.timeout.connect(self._tick)
-        self._started_at = 0.0
-        self._phase = 0.0
-        self._opacity = 0.0
-        self._finishing = False
-        self._duration_ms = 1160
-        self._fade_ms = 220
-        self._theme_key = theme if theme in self._THEMES else 'light'
-        self._build_logo()
-
-    def set_theme(self, theme):
-        if theme in self._THEMES and theme != self._theme_key:
-            self._theme_key = theme
-            self.update()
-
-    def _build_logo(self):
-        # Filled geometric bars keep the mark typographic and crisp at any DPI.
-        path = QPainterPath()
-        path.moveTo(132, 82)
-        path.lineTo(260, 82)
-        path.lineTo(260, 100)
-        path.lineTo(160, 190)
-        path.lineTo(260, 190)
-        path.lineTo(260, 210)
-        path.lineTo(132, 210)
-        path.lineTo(132, 192)
-        path.lineTo(232, 102)
-        path.lineTo(132, 102)
-        path.closeSubpath()
-        path.moveTo(310, 82)
-        path.lineTo(424, 82)
-        path.lineTo(424, 102)
-        path.lineTo(399, 102)
-        path.lineTo(399, 169)
-        path.cubicTo(399, 197, 383, 211, 355, 211)
-        path.cubicTo(328, 211, 307, 198, 300, 176)
-        path.lineTo(322, 176)
-        path.cubicTo(328, 187, 339, 192, 352, 192)
-        path.cubicTo(368, 192, 377, 184, 377, 168)
-        path.lineTo(377, 102)
-        path.lineTo(310, 102)
-        path.closeSubpath()
-        self._logo_path = path
-        self._logo_bounds = path.boundingRect()
-        # Each line is an intentional construction stroke, not a cloud of dots.
-        # It travels in from one direction and settles on the final geometry.
-        self._segments = []
-        final = [
-            ((132, 92), (260, 92), (-92, -35), (42, -35), 0.00),
-            ((260, 92), (146, 197), (66, -40), (66, 40), 0.10),
-            ((146, 200), (260, 200), (-78, 38), (56, 38), 0.16),
-            ((310, 92), (424, 92), (60, -32), (170, -32), 0.06),
-            ((388, 92), (388, 171), (458, -46), (458, 120), 0.14),
-            ((388, 171), (352, 201), (456, 152), (442, 250), 0.22),
-            ((352, 201), (310, 180), (430, 250), (292, 240), 0.27),
-        ]
-        for start, end, from_a, from_b, delay in final:
-            self._segments.append({
-                'a': QPointF(*start), 'b': QPointF(*end),
-                'sa': QPointF(start[0] + from_a[0], start[1] + from_a[1]),
-                'sb': QPointF(end[0] + from_b[0], end[1] + from_b[1]),
-                'delay': delay,
-            })
-
-    @staticmethod
-    def _ease(value):
-        value = max(0.0, min(1.0, value))
-        return value * value * (3.0 - 2.0 * value)
-
-    @staticmethod
-    def _mix(first, second, amount):
-        return QPointF(
-            first.x() + (second.x() - first.x()) * amount,
-            first.y() + (second.y() - first.y()) * amount,
-        )
-
-    def start(self):
-        screen = QApplication.primaryScreen()
-        if screen is not None:
-            self.move(screen.availableGeometry().center() - self.rect().center())
-        self._started_at = time.monotonic()
-        self._phase = 0.0
-        self._opacity = 0.0
-        self._finishing = False
-        self.show()
-        self.raise_()
-        self._timer.start()
-        self.update()
-
-    def finish(self):
-        """Request an early finish while preserving the fade-out and signal."""
-        if not self.isVisible() or self._finishing:
-            return
-        self._started_at = time.monotonic() - self._duration_ms / 1000.0
-        self._finishing = True
-
-    def _tick(self):
-        if not self.isVisible():
-            self._timer.stop()
-            return
-        elapsed_ms = (time.monotonic() - self._started_at) * 1000.0
-        if elapsed_ms <= self._duration_ms:
-            self._phase = elapsed_ms / self._duration_ms
-            self._opacity = min(1.0, elapsed_ms / 150.0)
-        else:
-            self._phase = 1.0
-            self._opacity = max(0.0, 1.0 - (elapsed_ms - self._duration_ms) / self._fade_ms)
-            self._finishing = True
-        if elapsed_ms >= self._duration_ms + self._fade_ms:
-            self._timer.stop()
-            self.close()
-            self.finished.emit()
-            return
-        self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        width, height = self.width(), self.height()
-        progress = max(0.0, min(1.0, self._phase))
-        alpha = max(0.0, min(1.0, self._opacity))
-        colors = self._THEMES[self._theme_key]
-
-        background = QLinearGradient(0, 0, width, height)
-        background.setColorAt(0.0, QColor(colors['top']))
-        background.setColorAt(1.0, QColor(colors['bottom']))
-        painter.fillRect(self.rect(), background)
-        # A single soft focal light establishes depth without the old perspective grid.
-        glow = QRadialGradient(width * 0.52, height * 0.43, width * 0.48)
-        glow_color = QColor(colors['glow'])
-        glow_color.setAlpha(int(42 * alpha))
-        glow.setColorAt(0.0, glow_color)
-        glow.setColorAt(1.0, QColor(0, 0, 0, 0))
-        painter.fillRect(self.rect(), glow)
-
-        # Construction strokes settle first. All geometry is fixed, so repainting is
-        # bounded to a handful of lines and stays smooth on slower integrated GPUs.
-        stroke_progress = self._ease(progress / 0.72)
-        accent = QColor(colors['accent'])
-        edge = QColor(colors['edge'])
-        for segment in self._segments:
-            local = (stroke_progress - segment['delay']) / max(0.001, 1.0 - segment['delay'])
-            amount = self._ease(local)
-            if amount <= 0.0:
-                continue
-            first = self._mix(segment['sa'], segment['a'], amount)
-            second = self._mix(segment['sb'], segment['b'], amount)
-            shadow = QColor(colors['ink'])
-            shadow.setAlpha(int(95 * alpha * amount))
-            painter.setPen(QPen(shadow, 8.0, Qt.PenStyle.SolidLine,
-                                Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-            painter.drawLine(first + QPointF(2.0, 3.0), second + QPointF(2.0, 3.0))
-            line_color = QColor(accent)
-            line_color.setAlpha(int(205 * alpha * amount))
-            painter.setPen(QPen(line_color, 3.0, Qt.PenStyle.SolidLine,
-                                Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-            painter.drawLine(first, second)
-
-        body_progress = self._ease((progress - 0.36) / 0.42)
-        if body_progress > 0.0:
-            body_alpha = int(255 * alpha * body_progress)
-            # Five restrained extrusion layers communicate depth without looking like
-            # a bevel stack or a hand-drawn logo.
-            for depth in range(4, 0, -1):
-                depth_color = QColor(colors['ink'])
-                depth_color.setAlpha(int(body_alpha * (0.16 + depth * 0.04)))
-                painter.save()
-                painter.translate(depth * 1.15, depth * 1.35)
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(depth_color)
-                painter.drawPath(self._logo_path)
-                painter.restore()
-            top = QColor(colors['edge'])
-            bottom = QColor(accent)
-            top.setAlpha(body_alpha)
-            bottom.setAlpha(body_alpha)
-            gradient = QLinearGradient(0, self._logo_bounds.top(), 0, self._logo_bounds.bottom())
-            gradient.setColorAt(0.0, top)
-            gradient.setColorAt(1.0, bottom)
-            outline = QColor(colors['edge'])
-            outline.setAlpha(int(body_alpha * 0.9))
-            painter.setPen(QPen(outline, 1.2))
-            painter.setBrush(gradient)
-            painter.drawPath(self._logo_path)
-
-            # One narrow sheen passes over the mark once, then disappears.
-            sweep = self._logo_bounds.left() - 115 + body_progress * (self._logo_bounds.width() + 230)
-            sheen = QLinearGradient(sweep - 34, 0, sweep + 34, 0)
-            sheen.setColorAt(0.0, QColor(255, 255, 255, 0))
-            sheen.setColorAt(0.5, QColor(255, 255, 255, int(body_alpha * 0.36)))
-            sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
-            painter.save()
-            painter.setClipPath(self._logo_path)
-            painter.fillRect(self._logo_bounds, sheen)
-            painter.restore()
-
-        text_progress = self._ease((progress - 0.63) / 0.27)
-        if text_progress > 0.0:
-            text_color = QColor(colors['ink'])
-            text_color.setAlpha(int(220 * alpha * text_progress))
-            painter.setPen(text_color)
-            painter.setFont(QFont('Microsoft YaHei UI', 13, QFont.Weight.DemiBold))
-            painter.drawText(QRectF(0, 235, width, 24), Qt.AlignmentFlag.AlignCenter, 'ZJ HUB')
-            muted = QColor(colors['muted'])
-            muted.setAlpha(int(180 * alpha * text_progress))
-            painter.setPen(muted)
-            painter.setFont(QFont('Segoe UI', 8, QFont.Weight.Medium))
-            painter.drawText(QRectF(0, 261, width, 18), Qt.AlignmentFlag.AlignCenter, 'DEV KING  /  MATCH INTELLIGENCE')
-        painter.end()
-
-
 THEME_PALETTES = {
     # 玻璃主题只保留轻微的中性遮罩，让桌面色彩能够透过来；卡片本身
     # 负责建立层级，避免整块灰底把玻璃材质压成一张灰色背景。
@@ -2953,8 +2706,10 @@ class LargeApp(App):
         self.backdrop = root
         self.setCentralWidget(root)
         root_layout = QVBoxLayout(root)
-        root_layout.setContentsMargins(28, 24, 28, 22)
-        root_layout.setSpacing(18)
+        # Keep one shared outer rhythm for the app shell and the settings
+        # overlay while giving page content a little more usable space.
+        root_layout.setContentsMargins(22, 18, 22, 16)
+        root_layout.setSpacing(14)
 
         # 无边框窗口的自绘标题栏，沿用原助手的拖动和玻璃效果。
         title_bar = TitleBar()
@@ -2995,7 +2750,7 @@ class LargeApp(App):
         root_layout.addWidget(self.update_banner)
 
         workspace = QHBoxLayout()
-        workspace.setSpacing(16)
+        workspace.setSpacing(14)
         root_layout.addLayout(workspace, 1)
 
         sidebar = self._build_sidebar()
@@ -3100,11 +2855,11 @@ class LargeApp(App):
     def _build_sidebar(self):
         sidebar = GlassFrame()
         sidebar.setObjectName('sidebar')
-        sidebar.setMinimumWidth(218)
-        sidebar.setMaximumWidth(244)
+        sidebar.setMinimumWidth(208)
+        sidebar.setMaximumWidth(236)
         layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(14, 16, 14, 14)
-        layout.setSpacing(10)
+        layout.setContentsMargins(12, 14, 12, 12)
+        layout.setSpacing(9)
 
         brand_row = QHBoxLayout()
         brand_row.setContentsMargins(0, 0, 0, 0)
@@ -3127,7 +2882,7 @@ class LargeApp(App):
 
         self.nav_layout = QVBoxLayout()
         self.nav_layout.setContentsMargins(0, 0, 0, 0)
-        self.nav_layout.setSpacing(6)
+        self.nav_layout.setSpacing(5)
         layout.addLayout(self.nav_layout)
         layout.addStretch(1)
 
@@ -3246,29 +3001,28 @@ class LargeApp(App):
         heading.setSpacing(4)
         heading.addWidget(label('BEDWARS TOOL CENTER', 'eyebrow'))
         heading.addWidget(label('总览', 'pageTitle'))
-        heading.addWidget(label('查看起床战争工具状态，选择对应功能开始使用。', 'pageHint'))
+        heading.addWidget(label('战绩、榜单与大厅工具，一处进入。', 'pageHint'))
         layout.addLayout(heading)
 
         hero = GlassFrame()
         hero.setObjectName('hero')
         hero_layout = QHBoxLayout(hero)
-        hero_layout.setContentsMargins(22, 20, 22, 20)
-        hero_layout.setSpacing(18)
+        hero_layout.setContentsMargins(18, 16, 18, 16)
+        hero_layout.setSpacing(14)
         hero_copy = QVBoxLayout()
-        hero_copy.setSpacing(7)
+        hero_copy.setSpacing(6)
         hero_copy.addWidget(label('READY FOR NEXT MATCH', 'eyebrow'))
         hero_copy.addWidget(label('准备开始下一局', 'heroTitle'))
-        hero_copy.addWidget(label('从一个入口管理起床战争的运行环境和常用工具。', 'muted'))
-        hero_copy.addWidget(label('ZJ HUB 会持续加入战绩、快捷切换和大厅聊天功能。', 'muted'))
+        hero_copy.addWidget(label('查询战绩、浏览排行榜，或进入大厅与队友交流。', 'muted'))
         hero_layout.addWidget(icon_tile('shield', 'heroIconTile', '#cbe6ff', 28, 56))
         hero_layout.addLayout(hero_copy, 1)
-        open_optimizer = self.button('打开电脑清理', lambda: self.switch_section('optimizer'), True)
-        open_optimizer.setProperty('themeIconName', 'sparkles')
-        open_optimizer.setIcon(line_icon(
-            'sparkles', normal=primary_icon_color(self.current_theme),
+        open_matches = self.button('查询战局数据', lambda: self.switch_section('memory'), True)
+        open_matches.setProperty('themeIconName', 'chart')
+        open_matches.setIcon(line_icon(
+            'chart', normal=primary_icon_color(self.current_theme),
             active=primary_icon_color(self.current_theme), size=18))
-        open_optimizer.setIconSize(QSize(18, 18))
-        hero_layout.addWidget(open_optimizer)
+        open_matches.setIconSize(QSize(18, 18))
+        hero_layout.addWidget(open_matches)
         layout.addWidget(hero)
 
         metrics = QHBoxLayout()
@@ -3280,46 +3034,58 @@ class LargeApp(App):
         layout.addLayout(metrics)
 
         lower = QHBoxLayout()
-        lower.setSpacing(14)
+        lower.setSpacing(12)
         actions, actions_layout = panel()
         actions.setObjectName('featureCard')
-        self._section_header(actions_layout, '快捷操作', 'command')
-        actions_layout.addWidget(label('常用起床战争工具会随着功能分区逐步加入。', 'muted'))
-        actions_layout.addSpacing(4)
+        self._section_header(actions_layout, '电脑清理', 'sparkles')
+        actions_layout.addWidget(label('整理临时文件，或释放当前占用的运行内存。', 'muted'))
+        actions_row = QHBoxLayout()
+        actions_row.setSpacing(8)
         scan_button = self.button('扫描可释放空间', self._dashboard_scan, True)
         scan_button.setProperty('themeIconName', 'chart')
         scan_button.setIcon(line_icon(
             'chart', normal=primary_icon_color(self.current_theme),
             active=primary_icon_color(self.current_theme), size=17))
         scan_button.setIconSize(QSize(17, 17))
-        actions_layout.addWidget(scan_button)
+        actions_row.addWidget(scan_button, 1)
         free_button = self.button('释放运行内存', self.free_memory)
+        free_button.setProperty('themeIconName', 'sparkles')
         free_button.setIcon(line_icon('sparkles', size=17))
         free_button.setIconSize(QSize(17, 17))
-        actions_layout.addWidget(free_button)
-        self._feature_row(actions_layout, '运行环境', '为下一局整理缓存和临时文件。', 'shield')
-        self._feature_row(actions_layout, 'ZJ HUB 工具', '战绩、快捷切换和大厅聊天模块持续接入。', 'sparkles')
-        actions_layout.addStretch()
+        actions_row.addWidget(free_button, 1)
+        actions_layout.addLayout(actions_row)
         lower.addWidget(actions, 1)
 
-        status, status_layout = panel()
-        status.setObjectName('featureCard')
-        self._section_header(status_layout, '当前状态', 'check')
-        status_line = QHBoxLayout()
-        status_line.setSpacing(8)
-        status_line.addWidget(icon_tile('check', 'statusGlyph', '#b8f2e2', 15, 24))
-        self.dashboard_state = label('就绪 · ZJ HUB 在本机运行', 'muted')
-        self.dashboard_state.setWordWrap(True)
-        status_line.addWidget(self.dashboard_state, 1)
-        status_layout.addLayout(status_line)
-        status_layout.addSpacing(5)
-        status_layout.addWidget(label('后续可以继续接入战绩、快捷切换、大厅聊天和地图等工具。', 'muted'))
-        self._feature_row(status_layout, '玻璃界面', '主题和布局可以在设置中调整。', 'sparkles')
-        self._feature_row(status_layout, '本地运行', '工具操作不依赖云端，启动更轻。', 'network')
-        status_layout.addStretch()
-        lower.addWidget(status, 1)
+        shortcuts, shortcuts_layout = panel()
+        shortcuts.setObjectName('featureCard')
+        self._section_header(shortcuts_layout, '起床战争工具', 'layers')
+        self.dashboard_state = label('就绪 · ZJ HUB 在本机运行', 'cardHint')
+        shortcuts_layout.addWidget(self.dashboard_state)
+        shortcut_grid = QGridLayout()
+        shortcut_grid.setContentsMargins(0, 0, 0, 0)
+        shortcut_grid.setHorizontalSpacing(8)
+        shortcut_grid.setVerticalSpacing(8)
+        for row, items in enumerate((
+            (('战局数据', 'chart', 'memory'), ('排行榜', 'layers', 'leaderboard')),
+            (('快捷工具', 'command', 'startup'), ('大厅聊天', 'chat', 'lobby-chat')),
+        )):
+            for column, (title, icon_name, section) in enumerate(items):
+                self._dashboard_shortcut(shortcut_grid, row, column, title, icon_name, section)
+        shortcuts_layout.addLayout(shortcut_grid, 1)
+        lower.addWidget(shortcuts, 1)
         layout.addLayout(lower, 1)
         return page
+
+    def _dashboard_shortcut(self, grid, row, column, title, icon_name, section):
+        """Create a theme-aware direct entry for one existing product section."""
+        button = self.button(title, lambda checked=False, key=section: self.switch_section(key))
+        button.setMinimumHeight(40)
+        button.setProperty('themeIconName', icon_name)
+        button.setIcon(line_icon(
+            icon_name, normal=primary_icon_color(self.current_theme),
+            active=primary_icon_color(self.current_theme), size=17))
+        button.setIconSize(QSize(17, 17))
+        grid.addWidget(button, row, column)
 
     def _feature_row(self, parent_layout, title, description, mark='●'):
         row = GlassFrame()
@@ -3539,7 +3305,7 @@ class LargeApp(App):
         self.leaderboard_mode_combo.setObjectName('leaderboardFilter')
         self.leaderboard_mode_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToContents)
-        self.leaderboard_mode_combo.setMinimumWidth(190)
+        self.leaderboard_mode_combo.setMinimumWidth(142)
         for title, prefix in [
             ('全部模式', 'bw'),
             ('经验 4 队 8 人', 'bwxp32'),
@@ -3555,7 +3321,7 @@ class LargeApp(App):
         self.leaderboard_metric_combo.setObjectName('leaderboardFilter')
         self.leaderboard_metric_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToContents)
-        self.leaderboard_metric_combo.setMinimumWidth(160)
+        self.leaderboard_metric_combo.setMinimumWidth(112)
         for title, suffix in [('最终击杀', 'final_kills'), ('胜利', 'win'), ('拆床', 'destory_bed')]:
             self.leaderboard_metric_combo.addItem(title, suffix)
         filters.addWidget(self.leaderboard_metric_combo, 1)
@@ -3563,7 +3329,7 @@ class LargeApp(App):
         self.leaderboard_period_combo.setObjectName('leaderboardFilter')
         self.leaderboard_period_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToContents)
-        self.leaderboard_period_combo.setMinimumWidth(126)
+        self.leaderboard_period_combo.setMinimumWidth(82)
         for title, suffix in [('日榜', 'daily'), ('周榜', 'weekly'), ('年榜', 'yearly'), ('总榜', 'all')]:
             self.leaderboard_period_combo.addItem(title, suffix)
         filters.addWidget(self.leaderboard_period_combo, 1)
@@ -3571,12 +3337,12 @@ class LargeApp(App):
         self.leaderboard_platform_combo.setObjectName('leaderboardFilter')
         self.leaderboard_platform_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToContents)
-        self.leaderboard_platform_combo.setMinimumWidth(104)
+        self.leaderboard_platform_combo.setMinimumWidth(76)
         self.leaderboard_platform_combo.addItem('端游', 'java')
         self.leaderboard_platform_combo.addItem('手游', 'bedrock')
         filters.addWidget(self.leaderboard_platform_combo, 1)
         self.leaderboard_query_button = self.button('查询排行榜', self.query_leaderboard, True)
-        self.leaderboard_query_button.setMinimumWidth(120)
+        self.leaderboard_query_button.setMinimumWidth(104)
         self.leaderboard_query_button.setProperty('themeIconName', 'chart')
         self.leaderboard_query_button.setIcon(line_icon(
             'chart', normal=primary_icon_color(self.current_theme),
@@ -6787,8 +6553,8 @@ class LargeApp(App):
         overlay.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
         overlay.setGeometry(root.rect())
         layout = QVBoxLayout(overlay)
-        layout.setContentsMargins(28, 24, 28, 22)
-        layout.setSpacing(18)
+        layout.setContentsMargins(22, 18, 22, 16)
+        layout.setSpacing(14)
 
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
@@ -7222,62 +6988,6 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
         super().closeEvent(event)
 
 
-def _reveal_main_window(window):
-    """Show the main window with a short, quiet expand/fade reveal.
-
-    The old standalone ZJ splash made startup feel like a separate loading
-    screen and also delayed the first usable frame.  The application now opens
-    directly and animates its own surface for roughly half a second.  Keeping
-    the two animations on the native window also avoids a transient black
-    overlay on Windows' frameless translucent window.
-    """
-    final_geometry = window.geometry()
-    screen = QApplication.primaryScreen()
-    if screen is not None:
-        available = screen.availableGeometry()
-        if not available.contains(final_geometry.center()):
-            final_geometry.moveCenter(available.center())
-    window.setGeometry(final_geometry)
-
-    # A small 6% scale gives the expand motion without making the first frame
-    # look like a dialog popping in.  Respect the window's minimum dimensions.
-    start_width = max(window.minimumWidth(), int(final_geometry.width() * 0.94))
-    start_height = max(window.minimumHeight(), int(final_geometry.height() * 0.94))
-    start_geometry = QRect(0, 0, start_width, start_height)
-    start_geometry.moveCenter(final_geometry.center())
-
-    window.setWindowOpacity(0.0)
-    window.setGeometry(start_geometry)
-    window.show()
-    window.raise_()
-    window.activateWindow()
-
-    geometry_animation = QPropertyAnimation(window, b'geometry', window)
-    geometry_animation.setDuration(500)
-    geometry_animation.setStartValue(start_geometry)
-    geometry_animation.setEndValue(final_geometry)
-    geometry_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-
-    opacity_animation = QPropertyAnimation(window, b'windowOpacity', window)
-    opacity_animation.setDuration(460)
-    opacity_animation.setStartValue(0.0)
-    opacity_animation.setEndValue(1.0)
-    opacity_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-
-    # Store the animations on the window so they remain alive for the full
-    # transition even when this helper returns.
-    window._startup_reveal_animations = [geometry_animation, opacity_animation]
-
-    def finish_reveal():
-        window.setWindowOpacity(1.0)
-        window.setGeometry(final_geometry)
-        window._startup_reveal_animations = []
-
-    geometry_animation.finished.connect(finish_reveal)
-    geometry_animation.start()
-    opacity_animation.start()
-
-
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
@@ -7294,5 +7004,5 @@ if __name__ == '__main__':
         if login_dialog.exec() != QDialog.DialogCode.Accepted:
             sys.exit(0)
     window = LargeApp()
-    _reveal_main_window(window)
+    reveal_main_window(window)
     sys.exit(app.exec())
