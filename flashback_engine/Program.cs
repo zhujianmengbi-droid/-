@@ -189,36 +189,56 @@ internal sealed class RecorderForm : Form
 
     async Task BridgeStdioLoopAsync()
     {
+        async Task ProcessBridgeLineAsync(string line)
+        {
+            if (string.IsNullOrWhiteSpace(line)) return;
+            object response;
+            try
+            {
+                using var document = JsonDocument.Parse(line);
+                response = await InvokeOnUiAsync(async () =>
+                {
+                    var command = "";
+                    try
+                    {
+                        command = BridgeCommand(document.RootElement);
+                        if (document.RootElement.TryGetProperty("afterLog", out var afterLog) && afterLog.TryGetInt64(out var cursor))
+                            bridgeLastLogSent = Math.Max(0, Math.Min(cursor, bridgeLogSequence));
+                        return await HandleBridgeCommandAsync(document.RootElement);
+                    }
+                    catch (Exception error)
+                    {
+                        Log("ZJ HUB 请求失败：" + error.Message);
+                        return BridgeSnapshot(command, error: error.Message);
+                    }
+                });
+            }
+            catch (JsonException error) { response = BridgeError("请求不是有效 JSON：" + error.Message); }
+            catch (Exception error) { response = BridgeError(error.Message); }
+            WriteBridgeResponse(response);
+        }
+
         try
         {
-            string? line;
-            while (!bridgeExitRequested && (line = await Console.In.ReadLineAsync()) is not null)
+            // Console.ReadLineAsync is unreliable with Windows anonymous
+            // pipes created by QProcess. Read the inherited byte handle
+            // directly, then split complete UTF-8 JSON lines ourselves.
+            using var input = Console.OpenStandardInput();
+            var buffer = new byte[4096];
+            var pending = new StringBuilder();
+            while (!bridgeExitRequested)
             {
-                if (string.IsNullOrWhiteSpace(line)) continue;
-                object response;
-                try
+                var count = await input.ReadAsync(buffer, 0, buffer.Length, lifetime.Token);
+                if (count <= 0) break;
+                pending.Append(Encoding.UTF8.GetString(buffer, 0, count));
+                while (true)
                 {
-                    using var document = JsonDocument.Parse(line);
-                    response = await InvokeOnUiAsync(async () =>
-                    {
-                        var command = "";
-                        try
-                        {
-                            command = BridgeCommand(document.RootElement);
-                            if (document.RootElement.TryGetProperty("afterLog", out var afterLog) && afterLog.TryGetInt64(out var cursor))
-                                bridgeLastLogSent = Math.Max(0, Math.Min(cursor, bridgeLogSequence));
-                            return await HandleBridgeCommandAsync(document.RootElement);
-                        }
-                        catch (Exception error)
-                        {
-                            Log("ZJ HUB 请求失败：" + error.Message);
-                            return BridgeSnapshot(command, error: error.Message);
-                        }
-                    });
+                    var text = pending.ToString();
+                    var newline = text.IndexOf('\n');
+                    if (newline < 0) break;
+                    pending.Remove(0, newline + 1);
+                    await ProcessBridgeLineAsync(text[..newline].TrimEnd('\r'));
                 }
-                catch (JsonException error) { response = BridgeError("请求不是有效 JSON：" + error.Message); }
-                catch (Exception error) { response = BridgeError(error.Message); }
-                WriteBridgeResponse(response);
             }
         }
         catch (Exception error) { WriteBridgeResponse(BridgeError("标准输入桥接失败：" + error.Message)); }

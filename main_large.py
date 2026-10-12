@@ -75,7 +75,7 @@ from startup_motion import reveal_main_window
 
 # The version is also used as the GitHub release tag (for example, v2026.09.29).
 # Bump it when publishing a new release so existing installations can discover it.
-APP_VERSION = '1.6'
+APP_VERSION = '1.6.1'
 GITHUB_REPOSITORY = 'zhujianmengbi-droid/-'
 GITHUB_REPOSITORY_URL = f'https://github.com/{GITHUB_REPOSITORY}'
 GITHUB_LATEST_RELEASE_API = (
@@ -1778,6 +1778,73 @@ QPushButton#themeOption:checked { border: none; border-left: 3px solid #d4eaff; 
 }
 
 
+# Flashback is rendered by the same PySide6 shell as every other ZJ HUB
+# section.  These controls have explicit surfaces because Qt's native Fusion
+# defaults are black on Windows when a QComboBox/QSpinBox is created without
+# a theme-specific background.
+FLASHBACK_SURFACES = {
+    'glass': {
+        'card': 'rgba(255,255,255,30)', 'raised': 'rgba(255,255,255,42)',
+        'border': 'rgba(255,255,255,88)', 'input': 'rgba(255,255,255,50)',
+        'text': '#f2f4f7', 'muted': '#c2c5ca', 'accent': '#dcecff',
+        'error': '#ffb4b1',
+        'check': '#c4c6ca', 'check_border': '#e1e4e8',
+    },
+    'dark': {
+        'card': '#16263a', 'raised': '#1d3048', 'border': '#536f91',
+        'input': '#0f1c2c', 'text': '#e8eef8', 'muted': '#a8b9cc',
+        'accent': '#a9cef7', 'error': '#ffaaa6', 'check': '#a9cef7', 'check_border': '#c9e0ff',
+    },
+    'light': {
+        'card': '#f8fafc', 'raised': '#eef3f8', 'border': '#9eb2c6',
+        'input': '#ffffff', 'text': '#1c2c3d', 'muted': '#5b6d80',
+        'accent': '#3f79b4', 'error': '#a8323c', 'check': '#3f79b4', 'check_border': '#6b9bc9',
+    },
+    'blue': {
+        'card': '#0c2b55', 'raised': '#123b73', 'border': '#577da8',
+        'input': '#082248', 'text': '#e6f0ff', 'muted': '#a9c1de',
+        'accent': '#a9d0fa', 'error': '#ffb0ad', 'check': '#a9d0fa', 'check_border': '#d0e6ff',
+    },
+}
+
+
+def _flashback_style(theme_key):
+    colors = FLASHBACK_SURFACES.get(theme_key, FLASHBACK_SURFACES['light'])
+    return f"""
+QFrame#flashbackHero, QFrame#flashbackSessionCard,
+QFrame#flashbackReplayCard, QFrame#flashbackInfoCard,
+QFrame#flashbackLogCard, QFrame#flashbackConfigCard {{
+    background: {colors['card']}; border: 1px solid {colors['border']}; border-radius: 16px;
+}}
+QFrame#flashbackHero {{ background: {colors['raised']}; border-left: 3px solid {colors['accent']}; }}
+QFrame#flashbackReplayRow {{ background: {colors['raised']}; border: 1px solid {colors['border']}; border-radius: 11px; }}
+QFrame#flashbackReplayRow:hover {{ background: {colors['card']}; border-color: {colors['accent']}; }}
+QLabel#flashbackStatus {{ color: {colors['muted']}; }}
+QLabel#flashbackStatus[statusTone="error"] {{ color: {colors['error']}; font-weight: 700; }}
+QComboBox#flashbackProcessCombo, QAbstractSpinBox#flashbackRate {{
+    color: {colors['text']}; background: {colors['input']}; border: 1px solid {colors['border']};
+    border-radius: 9px; padding: 6px 10px; min-height: 26px;
+}}
+QComboBox#flashbackProcessCombo:hover, QAbstractSpinBox#flashbackRate:hover,
+QComboBox#flashbackProcessCombo:focus, QAbstractSpinBox#flashbackRate:focus {{ border-color: {colors['accent']}; }}
+QComboBox#flashbackProcessCombo::drop-down {{ width: 26px; border: none; border-left: 1px solid {colors['border']}; }}
+QComboBox#flashbackProcessCombo QAbstractItemView {{ color: {colors['text']}; background: {colors['input']}; border: 1px solid {colors['border']}; border-radius: 9px; padding: 4px; outline: none; }}
+QComboBox#flashbackProcessCombo QAbstractItemView::item {{ color: {colors['text']}; background: transparent; padding: 7px 10px; border-radius: 6px; }}
+QComboBox#flashbackProcessCombo QAbstractItemView::item:hover,
+QComboBox#flashbackProcessCombo QAbstractItemView::item:selected {{ background: {colors['raised']}; color: {colors['text']}; }}
+QAbstractSpinBox#flashbackRate::up-button, QAbstractSpinBox#flashbackRate::down-button {{ width: 18px; background: transparent; border: none; }}
+QAbstractSpinBox#flashbackRate::up-button:hover, QAbstractSpinBox#flashbackRate::down-button:hover {{ background: {colors['raised']}; }}
+QAbstractSpinBox#flashbackRate::up-arrow, QAbstractSpinBox#flashbackRate::down-arrow {{ width: 8px; height: 8px; }}
+QCheckBox#flashbackAutoZip {{ color: {colors['text']}; background: transparent; spacing: 8px; }}
+QCheckBox#flashbackAutoZip::indicator {{ width: 17px; height: 17px; border-radius: 5px; background: {colors['input']}; border: 1px solid {colors['border']}; }}
+QCheckBox#flashbackAutoZip::indicator:checked {{ background: {colors['check']}; border-color: {colors['check_border']}; }}
+QScrollArea#flashbackReplayScroll {{ background: transparent; border: none; }}
+QScrollArea#flashbackReplayScroll QWidget#qt_scrollarea_viewport,
+QScrollArea#flashbackReplayScroll QWidget#flashbackReplayHost {{ background: transparent; }}
+QPlainTextEdit#flashbackLog, QPlainTextEdit#flashbackInfo {{ color: {colors['text']}; background: {colors['input']}; border: 1px solid {colors['border']}; border-radius: 10px; padding: 7px; }}
+"""
+
+
 MATCH_ROW_PALETTES = {
     'glass': {
         'win_bg': 'rgba(62,160,107,92)', 'win_hover': 'rgba(74,184,123,112)', 'win_text': '#e4f7e9',
@@ -2092,6 +2159,7 @@ def build_style(theme_key):
         theme_key = 'light'
     return (LARGE_STYLE + THEME_OVERRIDES[theme_key]
             + REFINED_SURFACES[theme_key] + _match_state_style(theme_key)
+            + _flashback_style(theme_key)
             + _taskbar_switcher_style(theme_key)
             + _lobby_chat_style(theme_key))
 
@@ -5697,7 +5765,7 @@ class LargeApp(App):
         mark_row = QHBoxLayout(); mark_row.setSpacing(8)
         self.flashback_marker = QLineEdit(); self.flashback_marker.setObjectName('themedInput'); self.flashback_marker.setPlaceholderText('时间线标记，例如：进入矿洞 / 发生团战'); mark_row.addWidget(self.flashback_marker, 1)
         mark_row.addWidget(self.button('添加标记', self._flashback_mark))
-        self.flashback_rate = QSpinBox(); self.flashback_rate.setRange(20, 120); self.flashback_rate.setSingleStep(10); self.flashback_rate.setValue(20); self.flashback_rate.setSuffix(' tick/s'); self.flashback_rate.setToolTip('录制采样频率，不会改变游戏速度。'); mark_row.addWidget(self.flashback_rate)
+        self.flashback_rate = QSpinBox(); self.flashback_rate.setObjectName('flashbackRate'); self.flashback_rate.setRange(20, 120); self.flashback_rate.setSingleStep(10); self.flashback_rate.setValue(20); self.flashback_rate.setSuffix(' tick/s'); self.flashback_rate.setToolTip('录制采样频率，不会改变游戏速度。'); mark_row.addWidget(self.flashback_rate)
         session_layout.addLayout(mark_row)
         config = GlassFrame(); config.setObjectName('flashbackConfigCard')
         config_layout = QGridLayout(config); config_layout.setContentsMargins(10, 9, 10, 9); config_layout.setHorizontalSpacing(8); config_layout.setVerticalSpacing(7)
@@ -5707,7 +5775,7 @@ class LargeApp(App):
         output_button = self.button('选择', self._flashback_choose_output); target_button = self.button('选择', self._flashback_choose_target)
         config_layout.addWidget(label('保存目录', 'cardHint'), 1, 0); config_layout.addWidget(self.flashback_output, 1, 1); config_layout.addWidget(output_button, 1, 2)
         config_layout.addWidget(label('回放目录', 'cardHint'), 2, 0); config_layout.addWidget(self.flashback_target, 2, 1); config_layout.addWidget(target_button, 2, 2)
-        self.flashback_auto_zip = QCheckBox('停止后自动生成回放 ZIP'); self.flashback_auto_zip.setChecked(True); config_layout.addWidget(self.flashback_auto_zip, 3, 0, 1, 2)
+        self.flashback_auto_zip = QCheckBox('停止后自动生成回放 ZIP'); self.flashback_auto_zip.setObjectName('flashbackAutoZip'); self.flashback_auto_zip.setChecked(True); config_layout.addWidget(self.flashback_auto_zip, 3, 0, 1, 2)
         save_config = self.button('保存设置', self._flashback_save_config, True); config_layout.addWidget(save_config, 3, 2)
         export_button = self.button('导出最近录制', self._flashback_export); import_button = self.button('安装已有回放', self._flashback_import)
         config_layout.addWidget(export_button, 4, 1); config_layout.addWidget(import_button, 4, 2)
@@ -5717,13 +5785,21 @@ class LargeApp(App):
         lower = QHBoxLayout(); lower.setSpacing(12)
         replay_card = GlassFrame(); replay_card.setObjectName('flashbackReplayCard'); replay_layout = QVBoxLayout(replay_card); replay_layout.setContentsMargins(14, 12, 14, 12); replay_layout.setSpacing(8)
         self._section_header(replay_layout, '最近回放', 'layers')
-        self.flashback_replay_scroll = QScrollArea(); self.flashback_replay_scroll.setWidgetResizable(True); self.flashback_replay_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.flashback_replay_host = QWidget(); self.flashback_replay_layout = QVBoxLayout(self.flashback_replay_host); self.flashback_replay_layout.setContentsMargins(1, 1, 3, 1); self.flashback_replay_layout.setSpacing(7); self.flashback_replay_scroll.setWidget(self.flashback_replay_host); replay_layout.addWidget(self.flashback_replay_scroll, 1); lower.addWidget(replay_card, 1)
-        info_card = GlassFrame(); info_layout = QVBoxLayout(info_card); info_layout.setContentsMargins(14, 12, 14, 12); info_layout.addLayout(self._section_header_layout('回放信息', 'chart'))
+        self.flashback_replay_scroll = QScrollArea(); self.flashback_replay_scroll.setObjectName('flashbackReplayScroll'); self.flashback_replay_scroll.setWidgetResizable(True); self.flashback_replay_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.flashback_replay_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        replay_viewport = self.flashback_replay_scroll.viewport()
+        replay_viewport.setAutoFillBackground(False)
+        replay_viewport.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        replay_palette = replay_viewport.palette()
+        replay_palette.setColor(QPalette.ColorRole.Base, Qt.GlobalColor.transparent)
+        replay_palette.setColor(QPalette.ColorRole.Window, Qt.GlobalColor.transparent)
+        replay_viewport.setPalette(replay_palette)
+        self.flashback_replay_host = QWidget(); self.flashback_replay_host.setObjectName('flashbackReplayHost'); self.flashback_replay_host.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True); self.flashback_replay_layout = QVBoxLayout(self.flashback_replay_host); self.flashback_replay_layout.setContentsMargins(1, 1, 3, 1); self.flashback_replay_layout.setSpacing(7); self.flashback_replay_scroll.setWidget(self.flashback_replay_host); replay_layout.addWidget(self.flashback_replay_scroll, 1); lower.addWidget(replay_card, 1)
+        info_card = GlassFrame(); info_card.setObjectName('flashbackInfoCard'); info_layout = QVBoxLayout(info_card); info_layout.setContentsMargins(14, 12, 14, 12); info_layout.addLayout(self._section_header_layout('回放信息', 'chart'))
         self.flashback_replay_info = QPlainTextEdit(); self.flashback_replay_info.setObjectName('flashbackInfo'); self.flashback_replay_info.setReadOnly(True); self.flashback_replay_info.setPlaceholderText('选择一条回放查看 metadata、文件数量和录制摘要。'); info_layout.addWidget(self.flashback_replay_info, 1); lower.addWidget(info_card, 1)
         layout.addLayout(lower, 1)
 
-        log_card = GlassFrame(); log_layout = QVBoxLayout(log_card); log_layout.setContentsMargins(14, 10, 14, 10); log_layout.addLayout(self._section_header_layout('内置引擎日志', 'command'))
+        log_card = GlassFrame(); log_card.setObjectName('flashbackLogCard'); log_layout = QVBoxLayout(log_card); log_layout.setContentsMargins(14, 10, 14, 10); log_layout.addLayout(self._section_header_layout('内置引擎日志', 'command'))
         self.flashback_log = QPlainTextEdit(); self.flashback_log.setObjectName('flashbackLog'); self.flashback_log.setReadOnly(True); self.flashback_log.setMaximumBlockCount(120); self.flashback_log.setMinimumHeight(70); log_layout.addWidget(self.flashback_log); layout.addWidget(log_card)
 
         self._flashback_replay_layout = self.flashback_replay_layout
@@ -7472,7 +7548,7 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
             # Keep this surface light and readable. The page backdrop still
             # supplies the glass material; an opaque log surface prevents
             # Windows styles from falling back to a black viewport.
-            'glass': ('#eef2f5', QColor('#eef2f5'), '#586777', '#d3dae0'),
+            'glass': ('#252a31', QColor('#252a31'), '#f2f4f7', '#8a99aa'),
             'dark': ('#0d1928', QColor('#0d1928'), '#aabbd0', '#53667e'),
             'blue': ('#082248', QColor('#082248'), '#adc5e0', '#577da8'),
         }
