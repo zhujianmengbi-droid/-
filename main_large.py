@@ -3112,8 +3112,12 @@ class LargeApp(App):
         self._section_header(activity_layout, '操作记录', 'command')
         from PySide6.QtWidgets import QPlainTextEdit
         self.log_text = QPlainTextEdit()
+        self.log_text.setObjectName('activityLog')
         self.log_text.setReadOnly(True)
         self.log_text.setUndoRedoEnabled(False)
+        self.log_text.setFrameShape(QFrame.Shape.NoFrame)
+        self.log_text.setAutoFillBackground(False)
+        self.log_text.viewport().setAutoFillBackground(False)
         self.log_text.document().setMaximumBlockCount(150)
         self.log_text.setMinimumHeight(65)
         activity_layout.addWidget(self.log_text, 1)
@@ -5387,7 +5391,8 @@ class LargeApp(App):
             return
         try:
             self._flashback_process = subprocess.Popen(
-                [str(executable)], cwd=str(executable.parent),
+                [str(executable), '--theme', str(getattr(self, 'current_theme', 'light'))],
+                cwd=str(executable.parent),
                 creationflags=getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0))
         except OSError as error:
             self.flashback_status.setText(f'录制器启动失败：{error}')
@@ -6955,6 +6960,7 @@ class LargeApp(App):
             app.setProperty('_themeKey', key)
             app.setStyleSheet(build_style(key))
         self._apply_opaque_input_surfaces()
+        self._apply_log_surface()
         self._refresh_theme_icons()
         if hasattr(self, 'theme_buttons'):
             for name, button in self.theme_buttons.items():
@@ -7008,6 +7014,43 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
                 palette.setColor(group, QPalette.ColorRole.HighlightedText, QColor(text))
             field.setPalette(palette)
             field.setStyleSheet(field_style)
+
+    def _apply_log_surface(self):
+        """Keep the activity log on a readable themed surface on Windows."""
+        log = getattr(self, 'log_text', None)
+        if log is None:
+            return
+        surfaces = {
+            'light': ('#ffffff', QColor('#ffffff'), '#536679', '#c4ced8'),
+            # Keep the glass alpha in the style sheet, while using a real
+            # QColor instance for the native viewport palette on Windows.
+            # Keep this surface light and readable. The page backdrop still
+            # supplies the glass material; an opaque log surface prevents
+            # Windows styles from falling back to a black viewport.
+            'glass': ('#eef2f5', QColor('#eef2f5'), '#586777', '#d3dae0'),
+            'dark': ('#0d1928', QColor('#0d1928'), '#aabbd0', '#53667e'),
+            'blue': ('#082248', QColor('#082248'), '#adc5e0', '#577da8'),
+        }
+        fill_css, fill_color, text, border = surfaces.get(self.current_theme, surfaces['light'])
+        log.setAutoFillBackground(False)
+        log.viewport().setAutoFillBackground(False)
+        palette = log.palette()
+        for group in (
+            QPalette.ColorGroup.Active,
+            QPalette.ColorGroup.Inactive,
+            QPalette.ColorGroup.Disabled,
+        ):
+            palette.setColor(group, QPalette.ColorRole.Base, fill_color)
+            palette.setColor(group, QPalette.ColorRole.Window, fill_color)
+            palette.setColor(group, QPalette.ColorRole.Text, QColor(text))
+            palette.setColor(group, QPalette.ColorRole.PlaceholderText, QColor(text))
+        log.setPalette(palette)
+        log.setStyleSheet(
+            'QPlainTextEdit#activityLog {'
+            f'background-color: {fill_css}; color: {text}; '
+            f'border: 1px solid {border}; border-radius: 10px; padding: 7px;'
+            '}'
+        )
 
     def _refresh_theme_icons(self):
         """让各主题共用同一套图标几何，只切换对比度色，避免视觉漂移。"""
