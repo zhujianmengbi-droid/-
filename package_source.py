@@ -8,7 +8,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parent
 SOURCE_FILES = (
-    'main_large.py', 'flashback_page.py', 'main.py', 'bugland_api.py',
+    'main_large.py', 'main.py', 'bugland_api.py',
     'match_data.py', 'optimizer.py', 'startup_motion.py',
     'taskbar_switcher_core.py', 'lobby_server.py',
     'build_large.py', 'package_source.py', '电脑优化中心.spec',

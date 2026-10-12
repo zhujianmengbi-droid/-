@@ -1,6 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>WinExe</OutputType>
+    <!-- The ZJ HUB bridge speaks JSON over inherited stdio.  A GUI
+         subsystem drops those handles on Windows; the bridge hides its
+         console at startup, while the normal recorder remains a WinForms
+         application when launched directly. -->
+    <OutputType>Exe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
     <EnableWindowsTargeting>true</EnableWindowsTargeting>

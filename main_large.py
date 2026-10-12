@@ -17,6 +17,7 @@ import struct
 import tempfile
 import wave
 import subprocess
+import shutil
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from functools import lru_cache
@@ -25,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QByteArray, QEasingCurve, QPropertyAnimation, QSettings, QThread, QTimer, QSize, Qt, QRectF, QPoint, QUrl, Signal, QEvent, QObject,
+    QByteArray, QEasingCurve, QPropertyAnimation, QSettings, QThread, QTimer, QSize, Qt, QRectF, QPoint, QUrl, Signal, QEvent, QObject, QProcess,
 )
 from PySide6.QtGui import (QColor, QDesktopServices, QIcon, QKeySequence,
                            QLinearGradient, QPainter, QPalette,
@@ -40,6 +41,7 @@ except Exception:  # pragma: no cover - portable builds may omit Multimedia
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
+    QFileDialog,
     QFrame,
     QGraphicsOpacityEffect,
     QHBoxLayout,
@@ -53,6 +55,8 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSlider,
+    QSpinBox,
+    QPlainTextEdit,
     QScrollArea,
     QStackedWidget,
     QTableWidget,
@@ -71,7 +75,7 @@ from startup_motion import reveal_main_window
 
 # The version is also used as the GitHub release tag (for example, v2026.09.29).
 # Bump it when publishing a new release so existing installations can discover it.
-APP_VERSION = '1.5'
+APP_VERSION = '1.6'
 GITHUB_REPOSITORY = 'zhujianmengbi-droid/-'
 GITHUB_REPOSITORY_URL = f'https://github.com/{GITHUB_REPOSITORY}'
 GITHUB_LATEST_RELEASE_API = (
@@ -2410,6 +2414,23 @@ class LargeApp(App):
         self._taskbar_hotkeys_paused = False
         self._taskbar_bindings = {}
         self._flashback_process = None
+        # Flashback is controlled directly by this window.  The Java Attach
+        # runtime remains a local helper, while no recorder window is shown.
+        self._flashback_bridge = None
+        self._flashback_bridge_buffer = ''
+        self._flashback_bridge_queue = deque()
+        self._flashback_bridge_inflight = None
+        self._flashback_bridge_executable = None
+        self._flashback_bridge_error = ''
+        self._flashback_status_timer = None
+        self._flashback_processes = []
+        self._flashback_selected_pid = None
+        self._flashback_selected_identity = ''
+        self._flashback_state_dir = None
+        self._flashback_status = {}
+        self._flashback_output_dir = Path.home() / 'Videos' / 'FlashbackRecorder'
+        self._flashback_busy = False
+        self._flashback_replay_path = ''
         self._chat_messages = []
         self._chat_message_keys = set()
         self._chat_unread = False
@@ -2689,7 +2710,7 @@ class LargeApp(App):
             ('leaderboard', 'chart', '排行榜', '查询各个模式的日榜、周榜、年榜和总榜', self._build_leaderboard_page()),
             ('startup', 'command', '快捷工具', '用快捷键快速切换任务栏窗口', self._build_taskbar_switcher_page()),
             ('lobby-chat', 'chat', '大厅聊天', '连接起床战争公共大厅聊天', self._build_lobby_chat_page()),
-            ('flashback', 'blocks', 'Flashback 录制', '录制 Minecraft 过程并管理回放文件', self._build_flashback_page()),
+            ('flashback', 'blocks', 'Flashback 录制', '在 ZJ HUB 内录制、标记并管理 Minecraft 回放', self._build_flashback_native_page()),
         ]
         for key, icon, title, hint, page in pages:
             self._section_page_indices[key] = self.page_stack.addWidget(page)
@@ -2912,6 +2933,12 @@ class LargeApp(App):
                 self._poll_lobby_chat()
             else:
                 self._chat_poll_timer.stop()
+        if hasattr(self, '_flashback_status_timer') and self._flashback_status_timer is not None:
+            if key == 'flashback':
+                self._flashback_status_timer.start()
+                self._flashback_refresh()
+            else:
+                self._flashback_status_timer.stop()
 
     def _build_dashboard(self):
         page = QWidget()
@@ -5253,7 +5280,7 @@ class LargeApp(App):
 
     def _flashback_replay_dirs(self):
         """Find the delivery replay folder and the recorder's default output."""
-        candidates = [Path.home() / 'Videos' / 'FlashbackRecorder']
+        candidates = [self._flashback_output_dir, Path.home() / 'Videos' / 'FlashbackRecorder']
         for root in self._flashback_search_roots():
             candidates.append(root.parent / '回放')
             candidates.append(root / '回放')
@@ -5287,6 +5314,424 @@ class LargeApp(App):
                     files.append((path, 0))
         files.sort(key=lambda item: item[1], reverse=True)
         return [path for path, _mtime in files[:12]]
+
+    # ------------------------------------------------------------------
+    # Native Flashback bridge.  The recorder engine is kept headless and
+    # controlled through stdin/stdout; every visible action remains inside
+    # this ZJ HUB page.
+    def _find_flashback_bridge(self):
+        embedded = Path(getattr(sys, '_MEIPASS', '')) / 'flashback_engine' / 'ZJHUB.Recorder.Engine.exe'
+        if embedded.is_file():
+            return embedded
+        # Development fallback is deliberately limited to the headless
+        # bridge publish folder and this checkout's embedded-engine output.
+        # Never fall back to the old visible FlashbackRecorder window.
+        roots = [
+            Path.home() / 'Desktop' / FLASHBACK_PACKAGE_NAME / '源码' / 'CSharpRecorder' / 'bin' / 'publish-bridge',
+            Path(__file__).resolve().parent / 'flashback_engine' / 'bin',
+        ]
+        seen = set()
+        for root in roots:
+            root = Path(root)
+            key = str(root).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            for name in ('FlashbackRecorder.exe', 'ZJHUB.Recorder.Engine.exe'):
+                candidate = root / name
+                if candidate.is_file():
+                    return candidate
+        return None
+
+    def _flashback_start_bridge(self):
+        process = self._flashback_bridge
+        if process is not None and process.state() != QProcess.ProcessState.NotRunning:
+            return True
+        executable = self._find_flashback_bridge()
+        self._flashback_bridge_executable = executable
+        if executable is None:
+            self._flashback_bridge_error = '未找到内置 Flashback 引擎。'
+            return False
+        process = QProcess(self)
+        process.setProgram(str(executable))
+        process.setArguments([
+            '--bridge-stdio', '--theme', str(getattr(self, 'current_theme', 'light')),
+        ])
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+        process.readyReadStandardOutput.connect(self._flashback_bridge_read)
+        process.stateChanged.connect(self._flashback_bridge_state_changed)
+        process.errorOccurred.connect(self._flashback_bridge_error_signal)
+        process.finished.connect(self._flashback_bridge_finished)
+        self._flashback_bridge = process
+        self._flashback_bridge_buffer = ''
+        process.start()
+        return True
+
+    def _flashback_bridge_state_changed(self, state):
+        """Flush the first queued command after QProcess leaves Starting."""
+        if state == QProcess.ProcessState.Running:
+            self._flashback_flush_request_queue()
+
+    def _flashback_bridge_error_signal(self, error):
+        process = self._flashback_bridge
+        detail = process.errorString() if process is not None else str(error)
+        self._flashback_bridge_error = detail or '内置 Flashback 引擎连接失败。'
+        self._flashback_set_status(self._flashback_bridge_error, error=True)
+
+    def _flashback_bridge_finished(self, _code, _status):
+        if self._flashback_bridge_inflight is not None:
+            self._flashback_bridge_inflight = None
+        self._flashback_busy = False
+        if not self._closing and hasattr(self, 'flashback_status'):
+            self._flashback_set_status('录制引擎已退出，请点击刷新重新连接。', error=True)
+
+    def _flashback_bridge_read(self):
+        process = self._flashback_bridge
+        if process is None:
+            return
+        data = bytes(process.readAllStandardOutput()).decode('utf-8', errors='replace')
+        self._flashback_bridge_buffer += data
+        while '\n' in self._flashback_bridge_buffer:
+            line, self._flashback_bridge_buffer = self._flashback_bridge_buffer.split('\n', 1)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                response = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            self._flashback_handle_response(response)
+
+    def _flashback_request(self, command, **payload):
+        if command in {'status', 'refresh'}:
+            # One status request is enough while the bridge is initializing;
+            # do not let the 800 ms timer build a long queue behind Attach.
+            if (self._flashback_bridge_inflight or
+                    any(item.get('command') in {'status', 'refresh'}
+                        for item in self._flashback_bridge_queue)):
+                return
+        request = {'command': command}
+        request.update(payload)
+        self._flashback_bridge_queue.append(request)
+        if self._flashback_start_bridge():
+            self._flashback_flush_request_queue()
+        else:
+            self._flashback_bridge_queue.clear()
+            self._flashback_set_status(self._flashback_bridge_error or '内置引擎不可用。', error=True)
+
+    def _flashback_flush_request_queue(self):
+        process = self._flashback_bridge
+        if process is None or process.state() != QProcess.ProcessState.Running:
+            return
+        if self._flashback_bridge_inflight is not None or not self._flashback_bridge_queue:
+            return
+        request = self._flashback_bridge_queue.popleft()
+        self._flashback_bridge_inflight = request
+        process.write((json.dumps(request, ensure_ascii=False) + '\n').encode('utf-8'))
+
+    def _flashback_handle_response(self, response):
+        self._flashback_bridge_inflight = None
+        self._flashback_busy = False
+        if not isinstance(response, dict):
+            self._flashback_set_status('录制引擎返回了无效状态。', error=True)
+        elif not response.get('ok', False):
+            self._flashback_set_status(str(response.get('error') or '录制引擎操作失败。'), error=True)
+            self._flashback_append_log(str(response.get('error') or '录制引擎操作失败。'))
+        else:
+            self._flashback_apply_snapshot(response)
+            message = response.get('message') or response.get('stateText')
+            if message:
+                self._flashback_append_log(str(message))
+        self._flashback_flush_request_queue()
+
+    def _flashback_append_log(self, text):
+        widget = getattr(self, 'flashback_log', None)
+        if widget is None or not text:
+            return
+        stamp = datetime.now().strftime('%H:%M:%S')
+        widget.appendPlainText(f'[{stamp}] {text}')
+        widget.ensureCursorVisible()
+
+    def _flashback_set_status(self, text, error=False):
+        if hasattr(self, 'flashback_status'):
+            self.flashback_status.setText(str(text))
+            self.flashback_status.setProperty('statusTone', 'error' if error else 'normal')
+            self.flashback_status.style().unpolish(self.flashback_status)
+            self.flashback_status.style().polish(self.flashback_status)
+
+    def _flashback_apply_snapshot(self, snapshot):
+        if not isinstance(snapshot, dict):
+            return
+        self._flashback_processes = snapshot.get('processes') or self._flashback_processes
+        selected = snapshot.get('selected') or {}
+        self._flashback_selected_pid = selected.get('pid')
+        self._flashback_selected_identity = str(selected.get('identity') or '')
+        self._flashback_state_dir = snapshot.get('sessionDir')
+        self._flashback_status = snapshot.get('status') or {}
+        self._flashback_replay_path = str(snapshot.get('replay') or '')
+        settings = snapshot.get('settings') or {}
+        if hasattr(self, 'flashback_output') and settings.get('output'):
+            self.flashback_output.setText(str(settings['output']))
+        if settings.get('output'):
+            self._flashback_output_dir = Path(str(settings['output']))
+        if hasattr(self, 'flashback_target'):
+            self.flashback_target.setText(str(settings.get('flashbackDirectory') or ''))
+        if hasattr(self, 'flashback_auto_zip') and 'autoZip' in settings:
+            self.flashback_auto_zip.setChecked(bool(settings.get('autoZip')))
+        if hasattr(self, 'flashback_rate') and settings.get('readRate'):
+            self.flashback_rate.setValue(int(settings['readRate']))
+        for item in snapshot.get('logs') or []:
+            text = str(item.get('text') or '') if isinstance(item, dict) else ''
+            if text:
+                self._flashback_append_log(text)
+        if hasattr(self, 'flashback_process_combo'):
+            current = self.flashback_process_combo.currentData()
+            self.flashback_process_combo.blockSignals(True)
+            self.flashback_process_combo.clear()
+            for item in self._flashback_processes:
+                label_text = item.get('commandLine') or item.get('name') or 'Minecraft'
+                if item.get('netease'):
+                    label_text = '网易 · ' + label_text
+                if item.get('supported'):
+                    label_text = '✓ ' + label_text
+                self.flashback_process_combo.addItem(
+                    f'{label_text} · PID {item.get("pid", "-")}', item)
+            wanted = self._flashback_selected_identity or current
+            index = next((i for i in range(self.flashback_process_combo.count())
+                          if str(self.flashback_process_combo.itemData(i).get('identity')) == str(wanted)), -1)
+            if index >= 0:
+                self.flashback_process_combo.setCurrentIndex(index)
+            self.flashback_process_combo.blockSignals(False)
+        recording = bool(snapshot.get('recording'))
+        state = self._flashback_status
+        state_text = str(snapshot.get('stateText') or '内置引擎已连接')
+        if recording:
+            state_text = '● 录制中 · ' + state.get('samplingRate', '20') + ' tick / 秒'
+        self._flashback_set_status(state_text, error=state.get('state') in {'error', 'record-error', 'native-finish-error'})
+        if hasattr(self, 'flashback_pid_value'):
+            self.flashback_pid_value.setText(str(state.get('pid') or self._flashback_selected_pid or '-'))
+            self.flashback_samples_value.setText(str(state.get('samples', '0')))
+            self.flashback_packets_value.setText(str(state.get('packets', '0')))
+            self.flashback_recording_value.setText('录制中' if recording else '未录制')
+        if hasattr(self, 'flashback_start_button'):
+            self.flashback_start_button.setEnabled(not recording and bool(self._flashback_state_dir) and not snapshot.get('busy'))
+            self.flashback_stop_button.setEnabled(recording and not snapshot.get('busy'))
+            self.flashback_inject_button.setEnabled(bool(selected.get('supported')) and not self._flashback_state_dir and not snapshot.get('busy'))
+        if self._flashback_replay_path:
+            self._flashback_refresh_replay_list()
+
+    def _flashback_process_changed(self, index):
+        if index < 0:
+            return
+        item = self.flashback_process_combo.itemData(index)
+        if not isinstance(item, dict):
+            return
+        self._flashback_request('select', identity=item.get('identity'))
+
+    def _flashback_refresh(self):
+        self._flashback_request('refresh')
+        self._flashback_refresh_replay_list()
+
+    def _flashback_inject(self):
+        item = self.flashback_process_combo.currentData()
+        if not isinstance(item, dict):
+            self._flashback_set_status('请先选择 Minecraft 1.20.1 进程。', error=True)
+            return
+        self._flashback_busy = True
+        self._flashback_set_status('正在把录制组件注入选中的 Minecraft…')
+        self._flashback_request('inject', identity=item.get('identity'), pid=item.get('pid'))
+
+    def _flashback_start_recording(self):
+        rate = int(self.flashback_rate.value()) if hasattr(self, 'flashback_rate') else 20
+        self._flashback_busy = True
+        self._flashback_set_status(f'正在开始录制 · {rate} tick / 秒…')
+        self._flashback_request('start', rate=rate)
+
+    def _flashback_stop_recording(self):
+        self._flashback_busy = True
+        self._flashback_set_status('正在停止并保存当前录制…')
+        self._flashback_request('stop')
+
+    def _flashback_choose_output(self):
+        current = self.flashback_output.text().strip() if hasattr(self, 'flashback_output') else ''
+        directory = QFileDialog.getExistingDirectory(self, '选择录制保存目录', current or str(self._flashback_output_dir))
+        if directory:
+            self.flashback_output.setText(directory)
+
+    def _flashback_choose_target(self):
+        current = self.flashback_target.text().strip() if hasattr(self, 'flashback_target') else ''
+        directory = QFileDialog.getExistingDirectory(self, '选择 Flashback 游戏目录', current or str(Path.home()))
+        if directory:
+            self.flashback_target.setText(directory)
+
+    def _flashback_save_config(self):
+        payload = {
+            'output': self.flashback_output.text().strip(),
+            'target': self.flashback_target.text().strip(),
+            'rate': int(self.flashback_rate.value()),
+            'autoZip': bool(self.flashback_auto_zip.isChecked()),
+        }
+        self._flashback_busy = True
+        self._flashback_set_status('正在保存录制设置…')
+        self._flashback_request('config', **payload)
+
+    def _flashback_export(self):
+        self._flashback_busy = True
+        self._flashback_set_status('正在导出最近一次录制…')
+        self._flashback_request('export')
+
+    def _flashback_import(self):
+        path, _ = QFileDialog.getOpenFileName(self, '选择 Flashback 回放', str(self._flashback_output_dir), 'Flashback 回放 (*.flashback.zip *.zip)')
+        if not path:
+            return
+        target = self.flashback_target.text().strip()
+        if not target:
+            self._flashback_set_status('请先在录制配置中填写 Flashback 游戏目录。', error=True)
+            return
+        self._flashback_busy = True
+        self._flashback_set_status('正在安装回放与录制皮肤…')
+        self._flashback_request('import', path=path, target=target)
+
+    def _flashback_mark(self):
+        text = self.flashback_marker.text().strip() if hasattr(self, 'flashback_marker') else ''
+        if not text:
+            self._flashback_set_status('先填写时间线标记。', error=True)
+            return
+        self._flashback_busy = True
+        self._flashback_request('mark', text=text)
+        self.flashback_marker.clear()
+
+    def _flashback_status_tick(self):
+        if getattr(self, '_active_section', '') != 'flashback':
+            return
+        if self._flashback_bridge and self._flashback_bridge.state() == QProcess.ProcessState.Running:
+            self._flashback_request('status')
+        self._flashback_refresh_replay_list()
+
+    def _flashback_refresh_replay_list(self):
+        layout = getattr(self, 'flashback_replay_layout', None)
+        if layout is None:
+            return
+        self._clear_layout(layout)
+        replays = self._flashback_replays()
+        if not replays:
+            layout.addWidget(label('还没有回放文件。停止录制后，完整回放会出现在 Videos/FlashbackRecorder。', 'cardHint'))
+        else:
+            for path in replays:
+                row = GlassFrame()
+                row.setObjectName('flashbackReplayRow')
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(10, 7, 10, 7)
+                row_layout.addWidget(icon_tile('layers', 'sectionIcon', '#bfe1ff', 13, 25))
+                copy = QVBoxLayout()
+                copy.addWidget(label(path.stem, 'cardTitle'))
+                try:
+                    detail = f'{path.stat().st_size / (1024 * 1024):.1f} MB · {path.parent}'
+                except OSError:
+                    detail = str(path.parent)
+                hint = label(detail, 'cardHint')
+                hint.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                copy.addWidget(hint)
+                row_layout.addLayout(copy, 1)
+                inspect = self.button('查看信息', lambda checked=False, p=path: self._flashback_show_replay_info(p))
+                row_layout.addWidget(inspect)
+                layout.addWidget(row)
+        layout.addStretch(1)
+
+    def _flashback_show_replay_info(self, path):
+        path = Path(path)
+        try:
+            import zipfile
+            with zipfile.ZipFile(path) as archive:
+                names = archive.namelist()
+                metadata = {}
+                if 'metadata.json' in names:
+                    metadata = json.loads(archive.read('metadata.json').decode('utf-8', errors='replace'))
+            summary = f'{path.name}\n大小：{path.stat().st_size / (1024 * 1024):.1f} MB\n'
+            summary += f'文件：{len(names)} 项\n' + '\n'.join(f'{key}: {value}' for key, value in metadata.items())
+            self.flashback_replay_info.setPlainText(summary)
+        except Exception as error:
+            self.flashback_replay_info.setPlainText(f'无法读取回放信息：{error}')
+
+    def _build_flashback_native_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(4, 0, 4, 0)
+        layout.setSpacing(12)
+        heading = QVBoxLayout()
+        heading.setSpacing(4)
+        heading.addWidget(label('REPLAY TOOLS / BUILT IN', 'eyebrow'))
+        heading.addWidget(label('Flashback 录制', 'pageTitle'))
+        heading.addWidget(label('录制、标记、查看回放状态都在 ZJ HUB 内完成。不会再弹出第二个录制器窗口。', 'pageHint'))
+        layout.addLayout(heading)
+
+        hero = GlassFrame(); hero.setObjectName('flashbackHero')
+        hero_layout = QVBoxLayout(hero); hero_layout.setContentsMargins(16, 13, 16, 13); hero_layout.setSpacing(9)
+        top = QHBoxLayout(); top.setSpacing(9)
+        top.addWidget(icon_tile('blocks', 'sectionIcon', '#bfe1ff', 16, 30))
+        copy = QVBoxLayout(); copy.setSpacing(2)
+        copy.addWidget(label('ZJ HUB 内置录制引擎', 'cardTitle'))
+        self.flashback_status = label('正在连接内置引擎…', 'cardHint'); self.flashback_status.setObjectName('flashbackStatus')
+        copy.addWidget(self.flashback_status); top.addLayout(copy, 1)
+        refresh = self.button('刷新进程', self._flashback_refresh, True); refresh.setProperty('themeIconName', 'refresh'); top.addWidget(refresh)
+        hero_layout.addLayout(top)
+        self.flashback_process_combo = ThemedComboBox(); self.flashback_process_combo.setObjectName('flashbackProcessCombo'); self.flashback_process_combo.currentIndexChanged.connect(self._flashback_process_changed)
+        self.flashback_process_combo.setMinimumHeight(38); hero_layout.addWidget(self.flashback_process_combo)
+        self.flashback_process_hint = label('只注入 Minecraft 1.20.1；网易客户端需要允许 Java Attach。', 'cardHint'); hero_layout.addWidget(self.flashback_process_hint)
+        layout.addWidget(hero)
+
+        session = GlassFrame(); session.setObjectName('flashbackSessionCard')
+        session_layout = QVBoxLayout(session); session_layout.setContentsMargins(16, 13, 16, 13); session_layout.setSpacing(9)
+        self._section_header(session_layout, '录制控制', 'command')
+        metrics = QGridLayout(); metrics.setHorizontalSpacing(8); metrics.setVerticalSpacing(8)
+        self.flashback_pid_value = label('-', 'metricSmallCompact'); self.flashback_samples_value = label('0', 'metricSmallCompact'); self.flashback_packets_value = label('0', 'metricSmallCompact'); self.flashback_recording_value = label('未录制', 'metricSmallCompact')
+        for col, title, widget in ((0, 'PID', self.flashback_pid_value), (1, '样本', self.flashback_samples_value), (2, '数据包', self.flashback_packets_value), (3, '状态', self.flashback_recording_value)):
+            card = GlassFrame(); card.setObjectName('metricCard'); cl = QVBoxLayout(card); cl.setContentsMargins(10, 8, 10, 8); cl.addWidget(label(title, 'cardHint')); cl.addWidget(widget); metrics.addWidget(card, 0, col)
+        session_layout.addLayout(metrics)
+        action_row = QHBoxLayout(); action_row.setSpacing(8)
+        self.flashback_inject_button = self.button('注入录制组件', self._flashback_inject, True); self.flashback_inject_button.setProperty('themeIconName', 'target')
+        self.flashback_start_button = self.button('开始录制', self._flashback_start_recording, True); self.flashback_start_button.setProperty('themeIconName', 'play')
+        self.flashback_stop_button = self.button('停止录制', self._flashback_stop_recording); self.flashback_stop_button.setProperty('themeIconName', 'stop')
+        for button in (self.flashback_inject_button, self.flashback_start_button, self.flashback_stop_button): action_row.addWidget(button)
+        session_layout.addLayout(action_row)
+        mark_row = QHBoxLayout(); mark_row.setSpacing(8)
+        self.flashback_marker = QLineEdit(); self.flashback_marker.setObjectName('themedInput'); self.flashback_marker.setPlaceholderText('时间线标记，例如：进入矿洞 / 发生团战'); mark_row.addWidget(self.flashback_marker, 1)
+        mark_row.addWidget(self.button('添加标记', self._flashback_mark))
+        self.flashback_rate = QSpinBox(); self.flashback_rate.setRange(20, 120); self.flashback_rate.setSingleStep(10); self.flashback_rate.setValue(20); self.flashback_rate.setSuffix(' tick/s'); self.flashback_rate.setToolTip('录制采样频率，不会改变游戏速度。'); mark_row.addWidget(self.flashback_rate)
+        session_layout.addLayout(mark_row)
+        config = GlassFrame(); config.setObjectName('flashbackConfigCard')
+        config_layout = QGridLayout(config); config_layout.setContentsMargins(10, 9, 10, 9); config_layout.setHorizontalSpacing(8); config_layout.setVerticalSpacing(7)
+        config_layout.addWidget(label('录制配置', 'section'), 0, 0, 1, 4)
+        self.flashback_output = QLineEdit(); self.flashback_output.setObjectName('themedInput'); self.flashback_output.setPlaceholderText('录制保存目录')
+        self.flashback_target = QLineEdit(); self.flashback_target.setObjectName('themedInput'); self.flashback_target.setPlaceholderText('可选：完整版 Flashback 游戏目录')
+        output_button = self.button('选择', self._flashback_choose_output); target_button = self.button('选择', self._flashback_choose_target)
+        config_layout.addWidget(label('保存目录', 'cardHint'), 1, 0); config_layout.addWidget(self.flashback_output, 1, 1); config_layout.addWidget(output_button, 1, 2)
+        config_layout.addWidget(label('回放目录', 'cardHint'), 2, 0); config_layout.addWidget(self.flashback_target, 2, 1); config_layout.addWidget(target_button, 2, 2)
+        self.flashback_auto_zip = QCheckBox('停止后自动生成回放 ZIP'); self.flashback_auto_zip.setChecked(True); config_layout.addWidget(self.flashback_auto_zip, 3, 0, 1, 2)
+        save_config = self.button('保存设置', self._flashback_save_config, True); config_layout.addWidget(save_config, 3, 2)
+        export_button = self.button('导出最近录制', self._flashback_export); import_button = self.button('安装已有回放', self._flashback_import)
+        config_layout.addWidget(export_button, 4, 1); config_layout.addWidget(import_button, 4, 2)
+        session_layout.addWidget(config)
+        layout.addWidget(session)
+
+        lower = QHBoxLayout(); lower.setSpacing(12)
+        replay_card = GlassFrame(); replay_card.setObjectName('flashbackReplayCard'); replay_layout = QVBoxLayout(replay_card); replay_layout.setContentsMargins(14, 12, 14, 12); replay_layout.setSpacing(8)
+        self._section_header(replay_layout, '最近回放', 'layers')
+        self.flashback_replay_scroll = QScrollArea(); self.flashback_replay_scroll.setWidgetResizable(True); self.flashback_replay_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.flashback_replay_host = QWidget(); self.flashback_replay_layout = QVBoxLayout(self.flashback_replay_host); self.flashback_replay_layout.setContentsMargins(1, 1, 3, 1); self.flashback_replay_layout.setSpacing(7); self.flashback_replay_scroll.setWidget(self.flashback_replay_host); replay_layout.addWidget(self.flashback_replay_scroll, 1); lower.addWidget(replay_card, 1)
+        info_card = GlassFrame(); info_layout = QVBoxLayout(info_card); info_layout.setContentsMargins(14, 12, 14, 12); info_layout.addLayout(self._section_header_layout('回放信息', 'chart'))
+        self.flashback_replay_info = QPlainTextEdit(); self.flashback_replay_info.setObjectName('flashbackInfo'); self.flashback_replay_info.setReadOnly(True); self.flashback_replay_info.setPlaceholderText('选择一条回放查看 metadata、文件数量和录制摘要。'); info_layout.addWidget(self.flashback_replay_info, 1); lower.addWidget(info_card, 1)
+        layout.addLayout(lower, 1)
+
+        log_card = GlassFrame(); log_layout = QVBoxLayout(log_card); log_layout.setContentsMargins(14, 10, 14, 10); log_layout.addLayout(self._section_header_layout('内置引擎日志', 'command'))
+        self.flashback_log = QPlainTextEdit(); self.flashback_log.setObjectName('flashbackLog'); self.flashback_log.setReadOnly(True); self.flashback_log.setMaximumBlockCount(120); self.flashback_log.setMinimumHeight(70); log_layout.addWidget(self.flashback_log); layout.addWidget(log_card)
+
+        self._flashback_replay_layout = self.flashback_replay_layout
+        self._flashback_status_timer = QTimer(self); self._flashback_status_timer.setInterval(800); self._flashback_status_timer.timeout.connect(self._flashback_status_tick)
+        return page
+
+    def _section_header_layout(self, title, icon_name='command'):
+        holder = QHBoxLayout(); holder.setSpacing(8); holder.addWidget(icon_tile(icon_name, 'sectionIcon', '#bfe1ff', 15, 28)); holder.addWidget(label(title, 'section')); holder.addStretch(1); return holder
 
     def _build_flashback_page(self):
         page = QWidget()
@@ -7051,6 +7496,22 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
             f'border: 1px solid {border}; border-radius: 10px; padding: 7px;'
             '}'
         )
+        # The recorder page has its own read-only viewports.  Give them the
+        # same explicit surface as the main activity log so a native Windows
+        # style cannot paint either one with Fusion's black default.
+        for name in ('flashback_log', 'flashback_replay_info'):
+            editor = getattr(self, name, None)
+            if editor is None:
+                continue
+            editor.setAutoFillBackground(False)
+            editor.viewport().setAutoFillBackground(False)
+            editor.setPalette(palette)
+            editor.viewport().setPalette(palette)
+            editor.setStyleSheet(
+                f'QPlainTextEdit#{"flashbackLog" if name == "flashback_log" else "flashbackInfo"} '
+                f'{{ background-color: {fill_css}; color: {text}; '
+                f'border: 1px solid {border}; border-radius: 10px; padding: 7px; }}'
+            )
 
     def _refresh_theme_icons(self):
         """让各主题共用同一套图标几何，只切换对比度色，避免视觉漂移。"""
@@ -7157,6 +7618,15 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
         # either the idle or busy shutdown path so a close request can never
         # resurrect the previous room on the next launch.
         self._closing = True
+        bridge = getattr(self, '_flashback_bridge', None)
+        if bridge is not None and bridge.state() != QProcess.ProcessState.NotRunning:
+            # EOF asks the headless engine to run its normal shutdown/export
+            # path before the short fallback timeout below.
+            bridge.closeWriteChannel()
+            if not bridge.waitForFinished(1200):
+                bridge.terminate()
+            if bridge.state() != QProcess.ProcessState.NotRunning and not bridge.waitForFinished(800):
+                bridge.kill()
         self._clear_chat_session_cache()
         if self.busy:
             super().closeEvent(event)

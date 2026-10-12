@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO.Compression;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -1256,11 +1257,24 @@ internal sealed class RecorderForm : Form
 
 internal static class Program
 {
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetConsoleWindow();
+
+    [DllImport("user32.dll")]
+    static extern bool ShowWindow(IntPtr handle, int command);
+
     [STAThread]
     static void Main(string[] args)
     {
         var diagnosticsOnly = args.Contains("--diagnostics-only", StringComparer.OrdinalIgnoreCase);
         var bridgeStdio = args.Contains("--bridge-stdio", StringComparer.OrdinalIgnoreCase);
+        if (bridgeStdio)
+        {
+            // OutputType=Exe preserves inherited stdin/stdout for QProcess;
+            // hide only the child console used by the headless bridge.
+            var console = GetConsoleWindow();
+            if (console != IntPtr.Zero) ShowWindow(console, 0);
+        }
         var theme = "dark";
         for (var index = 0; index < args.Length; index++)
         {
