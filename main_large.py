@@ -23,9 +23,9 @@ from collections import deque
 from datetime import datetime
 
 from PySide6.QtCore import (
-    QByteArray, QEasingCurve, QPropertyAnimation, QSettings, QThread, QTimer, QSize, Qt, QRect, QRectF, QPoint, QPointF, QUrl, Signal, QEvent, QObject,
+    QByteArray, QEasingCurve, QPropertyAnimation, QSettings, QThread, QTimer, QSize, Qt, QRectF, QPoint, QUrl, Signal, QEvent, QObject,
 )
-from PySide6.QtGui import (QColor, QDesktopServices, QFont, QIcon, QKeySequence,
+from PySide6.QtGui import (QColor, QDesktopServices, QIcon, QKeySequence,
                            QLinearGradient, QPainter, QPalette,
                            QPainterPath, QPen, QPixmap, QRadialGradient)
 from PySide6.QtSvg import QSvgRenderer
@@ -83,10 +83,6 @@ SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_uhS8jC6RrSmUSEblKfeyYw_cZdhk7RH'
 SUPABASE_REALTIME_URL = (
     f'wss://{SUPABASE_PROJECT_REF}.supabase.co/realtime/v1/websocket')
 SUPABASE_CHAT_TOPIC = 'realtime:public-lobby'
-LOBBY_CHAT_SERVER_URL = SUPABASE_REALTIME_URL
-LOBBY_CHAT_JOIN_PATH = '/api/join'
-LOBBY_CHAT_MESSAGES_PATH = '/api/chat/messages'
-LOBBY_CHAT_PRESENCE_PATH = '/api/chat/presence'
 GAME_ID_SETTINGS_KEY = 'profile/gameId'
 CHAT_SESSION_CACHE_KEY = 'chat/sessionMessages'
 CHAT_SOUND_ENABLED_KEY = 'chat/soundEnabled'
@@ -1153,74 +1149,6 @@ class SupabaseRealtimeChatClient(QObject):
         self.error.emit(detail)
         self._fail_pending('连接发生错误，消息未确认。')
         self._close_socket()
-
-
-class LobbyChatWorker(QThread):
-    """在后台读取大厅消息，避免轮询或发送卡住主窗口。"""
-
-    completed = Signal(str, object, str)
-
-    def __init__(self, action, server_url, player_id='', message='', session_id='', parent=None):
-        super().__init__(parent)
-        self.action = str(action)
-        self.server_url = str(server_url or '').strip().rstrip('/')
-        self.player_id = str(player_id or '').strip()
-        self.message = str(message or '')
-        self.session_id = str(session_id or '').strip()
-
-    def _request(self, method, path, payload=None):
-        if not self.server_url or 'YOUR-RENDER-CHAT-SERVICE' in self.server_url:
-            raise RuntimeError('大厅聊天服务器尚未配置。')
-        url = self.server_url + str(path)
-        data = None
-        headers = {
-            'Accept': 'application/json',
-            'User-Agent': 'DEVKing-Toolbox-LobbyChat/1.0',
-        }
-        if payload is not None:
-            data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
-            headers['Content-Type'] = 'application/json'
-        request = Request(url, data=data, headers=headers, method=method)
-        # Render free instances may need a few seconds to wake from sleep.
-        with urlopen(request, timeout=18) as response:
-            raw = response.read(1024 * 1024 + 1)
-        if len(raw) > 1024 * 1024:
-            raise RuntimeError('大厅消息响应过大。')
-        if not raw:
-            return {}
-        try:
-            return json.loads(raw.decode('utf-8-sig'))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            raise RuntimeError('大厅服务器返回了无法识别的数据。') from None
-
-    def run(self):
-        try:
-            if self.action == 'join':
-                result = self._request('POST', LOBBY_CHAT_JOIN_PATH,
-                                       {'player_id': self.player_id})
-            elif self.action == 'send':
-                result = self._request(
-                    'POST', LOBBY_CHAT_MESSAGES_PATH,
-                    {'player_id': self.player_id, 'message': self.message,
-                     'session_id': self.session_id})
-            elif self.action == 'presence':
-                result = self._request('GET', LOBBY_CHAT_PRESENCE_PATH)
-            else:
-                # limit 参数是后端约定的软限制，兼容不支持 query 参数的服务。
-                query = '?limit=60'
-                if self.session_id:
-                    query += '&session_id=' + self.session_id
-                result = self._request('GET', LOBBY_CHAT_MESSAGES_PATH + query)
-            self.completed.emit(self.action, result, '')
-        except HTTPError as error:
-            try:
-                detail = error.read(4096).decode('utf-8-sig', errors='ignore')
-            except OSError:
-                detail = ''
-            self.completed.emit(self.action, None,
-                                f'大厅服务器 HTTP {error.code}' + (f'：{detail[:120]}' if detail else ''))
-        except (URLError, TimeoutError, OSError, RuntimeError) as error:
-            self.completed.emit(self.action, None, str(error) or '暂时无法连接大厅服务器。')
 
 
 class TaskbarActionWorker(QThread):
@@ -2470,7 +2398,6 @@ class LargeApp(App):
         self._leaderboard_last_key = ''
         self._update_worker = None
         self._update_release_url = GITHUB_REPOSITORY_URL
-        self._update_release_tag = ''
         self._taskbar_items = []
         self._taskbar_hotkeys = {}
         self._taskbar_action_worker = None
@@ -2478,12 +2405,10 @@ class LargeApp(App):
         self._taskbar_action_kind = ''
         self._taskbar_hotkeys_paused = False
         self._taskbar_bindings = {}
-        self._chat_worker = None
         self._chat_messages = []
         self._chat_message_keys = set()
         self._chat_unread = False
         self._chat_unread_badges = {}
-        self._chat_session_id = ''
         self._chat_pending_message = ''
         self._chat_sending_message = ''
         sound_enabled = settings.value(CHAT_SOUND_ENABLED_KEY, True)
@@ -2498,9 +2423,6 @@ class LargeApp(App):
         self._chat_sound_effect = None
         self._chat_sound_path = ''
         self._chat_poll_timer = None
-        # 旧版本保存过 Render HTTP 地址；聊天现在直接使用项目的 Realtime
-        # WebSocket，忽略旧地址，避免把 WebSocket 协议误发到 HTTP 服务。
-        self._chat_server_url = LOBBY_CHAT_SERVER_URL
         self._game_id = str(settings.value(GAME_ID_SETTINGS_KEY, '') or '').strip()
         # ``chat/gameId`` was used by an earlier preview build.  Migrate it
         # once so an existing login is not lost when the shared profile key is
@@ -2513,13 +2435,6 @@ class LargeApp(App):
             key = f'plugins/taskbar_switcher/hotkeys/{index}'
             stored = settings.value(key, default)
             self._taskbar_bindings[index] = str(default if stored is None else stored)
-        # Avoid repeatedly re-polishing the four daily summary labels when a
-        # burst of detail requests completes without changing their visible
-        # values.  The cache is purely a paint/update optimisation.
-        self._daily_summary_visual = None
-        self._match_overscroll_animations = []
-        self._match_overscroll_hint_animation = None
-
         super().__init__()
         self._chat_client = SupabaseRealtimeChatClient(self)
         self._chat_client.statusChanged.connect(self._on_supabase_chat_status)
@@ -2837,7 +2752,6 @@ class LargeApp(App):
         release_url = str(release.get('html_url') or GITHUB_REPOSITORY_URL).strip()
         if not tag_name or not release_url or not _is_newer_release(tag_name):
             return
-        self._update_release_tag = tag_name
         self._update_release_url = release_url
         if not hasattr(self, 'update_banner'):
             return
@@ -2962,6 +2876,7 @@ class LargeApp(App):
             return
         if hasattr(self, 'settings_overlay') and self.settings_overlay.isVisible():
             self.settings_overlay.hide()
+        same_section = getattr(self, '_active_section', None) == key
         self._active_section = key
         self.page_stack.setCurrentIndex(index)
         if key == 'lobby-chat':
@@ -2969,13 +2884,13 @@ class LargeApp(App):
         # TaskbarSwitcher 页面包含原生 QTableWidget viewport。对整页施加
         # QGraphicsOpacityEffect 时，Windows 合成器会在首帧把 viewport
         # 画成黑色镂空条；页面本身保持稳定，内部控件仍可正常交互。
-        if key != 'startup':
+        if key != 'startup' and not same_section:
             self._animate_widget(self.page_stack.currentWidget(), 210)
         for name, button in self.nav_buttons.items():
             button.setChecked(name == key)
         if hasattr(self, 'settings_button'):
             self.settings_button.setChecked(False)
-        if key == 'optimizer':
+        if key in {'overview', 'optimizer'}:
             self.refresh()
         if hasattr(self, '_taskbar_auto_refresh_timer'):
             if key == 'startup':
@@ -3218,7 +3133,6 @@ class LargeApp(App):
 
         from PySide6.QtWidgets import QCheckBox, QScrollArea
         scroll = QScrollArea()
-        self.scroll_area = scroll
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         rows = QWidget()
@@ -3574,7 +3488,6 @@ class LargeApp(App):
         recent_grid.setContentsMargins(0, 0, 0, 0)
         recent_grid.setHorizontalSpacing(6)
         recent_grid.setVerticalSpacing(5)
-        self.recent_queries_grid = recent_grid
         self.recent_query_buttons = []
         for index in range(5):
             recent_button = QPushButton()
@@ -3707,7 +3620,6 @@ class LargeApp(App):
 
         layout.addWidget(result_panel, 1)
         self.match_result_panel = result_panel
-        self.match_daily_summary = daily_summary
 
         # Details stay inside the selected page so the main GUI does not
         # spawn a separate window.  The panel is populated lazily on demand.
@@ -4482,7 +4394,6 @@ class LargeApp(App):
             self.match_status.setText('此条记录缺少单局详情所需的对局 ID 或时间。')
             self._set_match_detail_placeholder('详情暂不可用', '这条记录没有返回详情接口需要的对局 ID 或时间。')
             return
-        self._pending_match_record = record
         self.match_detail_title.setText('正在加载详情')
         self.match_status.setText('正在加载这场对局……')
         self._set_match_detail_placeholder('正在加载', '正在整理地图、队伍和玩家数据。')
@@ -5503,7 +5414,6 @@ class LargeApp(App):
         self._game_id = game_id
         if hasattr(self, '_player_id'):
             self._player_id = game_id
-        self._chat_session_id = ''
         self._settings.setValue(GAME_ID_SETTINGS_KEY, game_id)
         self._settings.setValue('chat/gameId', game_id)
         self._settings.sync()
@@ -5530,7 +5440,6 @@ class LargeApp(App):
         player_id = self._chat_bound_game_id()
         if player_id != self._game_id:
             self._game_id = player_id
-            self._chat_session_id = ''
             self._chat_client.stop()
             # A message typed under the previous identity must never be sent
             # after a rebind.  The transport stop above may synchronously
@@ -6378,7 +6287,6 @@ class LargeApp(App):
         self._open_player_login_dialog(value)
 
     def _save_chat_server_url(self):
-        self._chat_server_url = SUPABASE_REALTIME_URL
         self.chat_server_url_input.setText(SUPABASE_REALTIME_URL)
         self._chat_client.stop()
         self.chat_connection_badge.setText('准备连接')
@@ -6536,7 +6444,6 @@ class LargeApp(App):
         speed.setMinimumWidth(128)
         speed.setCursor(Qt.CursorShape.PointingHandCursor)
         speed.currentIndexChanged.connect(lambda _index: self._set_animation_speed(speed.currentData()))
-        self.animation_speed_combo = speed
         speed.setCurrentIndex(max(0, speed.findData(self.animation_speed)))
         row_layout.addWidget(speed)
         card_layout.addWidget(row)
@@ -6908,9 +6815,14 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
         root_layout.addLayout(footer)
 
     def refresh(self):
-        super().refresh()
         if self.isMinimized() or self._dragging:
             return
+        # The dashboard metrics are hidden on the data, tools and chat pages.
+        # Avoid sampling CPU and rebuilding their labels every timer tick; a
+        # refresh is triggered when the dashboard becomes active again.
+        if getattr(self, '_active_section', 'overview') not in {'overview', 'optimizer'}:
+            return
+        super().refresh()
         self._set_if_changed(self.dashboard_memory, self.memory.text())
         self._set_if_changed(self.dashboard_uptime, self.uptime.text())
         cpu_text = f'{optimizer.get_cpu_percent():.0f}%'
@@ -6967,13 +6879,6 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
             self.hide()
             event.ignore()
             self._api_worker.finished.connect(self.close)
-            return
-        if self._chat_worker is not None and self._chat_worker.isRunning():
-            # Lobby polling is also a bounded network request; wait for its
-            # worker before Qt tears down the parent window.
-            self.hide()
-            event.ignore()
-            self._chat_worker.finished.connect(self.close)
             return
         if self._update_worker is not None and self._update_worker.isRunning():
             self.hide()
