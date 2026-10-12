@@ -29,10 +29,16 @@ def app_version():
     """Read the release version without importing Qt or application settings."""
     tree = ast.parse((ROOT / 'main_large.py').read_text(encoding='utf-8-sig'))
     for node in tree.body:
-        if isinstance(node, ast.Assign) and any(
+        is_version = isinstance(node, ast.Assign) and any(
             isinstance(target, ast.Name) and target.id == 'APP_VERSION'
             for target in node.targets
-        ):
+        )
+        is_version = is_version or (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == 'APP_VERSION'
+        )
+        if is_version:
             version = ast.literal_eval(node.value)
             if isinstance(version, str) and version and all(
                 character.isascii() and (character.isalnum() or character in '.-_')
