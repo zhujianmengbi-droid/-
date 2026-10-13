@@ -69,13 +69,14 @@ import bugland_api
 import match_data
 import optimizer
 import taskbar_switcher_core
+from companion_pack import save_companion_pack
 from main import App, STYLE, Backdrop, TitleBar, label, panel
 from startup_motion import reveal_main_window
 
 
 # The version is also used as the GitHub release tag (for example, v2026.09.29).
 # Bump it when publishing a new release so existing installations can discover it.
-APP_VERSION = '1.6.2'
+APP_VERSION = '1.6.3'
 GITHUB_REPOSITORY = 'zhujianmengbi-droid/-'
 GITHUB_REPOSITORY_URL = f'https://github.com/{GITHUB_REPOSITORY}'
 GITHUB_LATEST_RELEASE_API = (
@@ -471,6 +472,22 @@ class GitHubUpdateWorker(QThread):
         except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
             result = None
         self.checked.emit(result)
+
+
+class CompanionPackWorker(QThread):
+    """Copy the embedded archive on a worker, including slow/removable drives."""
+
+    def __init__(self, destination, parent=None):
+        super().__init__(parent)
+        self.destination = destination
+        self.saved_path = ''
+        self.error = ''
+
+    def run(self):
+        try:
+            self.saved_path = save_companion_pack(self.destination)
+        except Exception as error:
+            self.error = str(error)
 
 
 class BuglandRequestWorker(QThread):
@@ -2493,6 +2510,8 @@ class LargeApp(App):
         self._flashback_bridge_inflight = None
         self._flashback_bridge_executable = None
         self._flashback_bridge_error = ''
+        self._close_waiting_for_bridge = False
+        self._close_bridge_timer = None
         self._flashback_status_timer = None
         self._flashback_processes = []
         self._flashback_selected_pid = None
@@ -2502,6 +2521,16 @@ class LargeApp(App):
         self._flashback_output_dir = Path.home() / 'Videos' / 'FlashbackRecorder'
         self._flashback_busy = False
         self._flashback_replay_path = ''
+        self._flashback_exported_replay_path = ''
+        self._flashback_replay_signature = None
+        self._flashback_replay_cache = []
+        self._flashback_replay_cache_at = 0.0
+        self._flashback_replay_cache_dirs = ()
+        self._companion_pack_worker = None
+        self._flashback_process_signature = None
+        self._flashback_pending_start_rate = None
+        self._flashback_log_keys = set()
+        self._flashback_log_order = deque()
         self._chat_messages = []
         self._chat_message_keys = set()
         self._chat_unread = False
@@ -4229,9 +4258,17 @@ class LargeApp(App):
                 self._history_loading_pages.discard(int(job.get('payload', {}).get('page', 0)))
             except (TypeError, ValueError):
                 pass
+        # Hydration is keyed by the match identity rather than by the worker.
+        # Release that guard before any early return so a failed, stale, or
+        # shutdown-time request can be retried on the next render.
+        record = job.get('record') if job is not None else None
+        if action in ('detail', 'hydrate') and record is not None:
+            try:
+                self._hydrating_keys.discard(self._match_detail_key(record))
+            except (AttributeError, TypeError, ValueError):
+                pass
         if self._closing or job is None or job['generation'] != self._api_generation:
             return
-        record = job.get('record')
         if error:
             if any(word in error for word in ('Token', '连接', '超时', '频率')):
                 self._api_queue.clear()
@@ -5326,6 +5363,42 @@ class LargeApp(App):
 
     # ------------------------------------------------------------------
     # Flashback 录制与回放
+    def _save_flashback_companion_pack(self):
+        if self._companion_pack_worker is not None:
+            return
+        settings = QSettings('DEV King', '逐渐工具箱')
+        directory = str(settings.value('flashback/packSaveDirectory', str(Path.home() / 'Downloads')))
+        destination, _ = QFileDialog.getSaveFileName(
+            self, '保存配套整合包', str(Path(directory) / 'ZJ HUB.zip'),
+            '整合包 ZIP (*.zip)')
+        if not destination:
+            return
+        # getSaveFileName supplies the .zip suffix and confirms replacement.
+        worker = CompanionPackWorker(destination, self)
+        self._companion_pack_worker = worker
+        self.flashback_pack_button.setEnabled(False)
+        self.flashback_pack_button.setText('正在保存…')
+        self.flashback_pack_hint.setText('正在保存配套整合包…')
+        self.flashback_pack_hint.show()
+        worker.finished.connect(self._flashback_companion_pack_finished)
+        worker.start()
+
+    def _flashback_companion_pack_finished(self):
+        worker = self._companion_pack_worker
+        if worker is None:
+            return
+        self.flashback_pack_button.setEnabled(True)
+        self.flashback_pack_button.setText('点我下载配套整合包')
+        if worker.error:
+            self.flashback_pack_hint.setText(f'保存失败：{worker.error}；请重新选择保存位置。')
+        else:
+            self.flashback_pack_hint.setText(f'已保存：{worker.saved_path}')
+            self.flashback_pack_hint.setToolTip(worker.saved_path)
+            QSettings('DEV King', '逐渐工具箱').setValue(
+                'flashback/packSaveDirectory', str(Path(worker.saved_path).parent))
+        self._companion_pack_worker = None
+        worker.deleteLater()
+
     def _flashback_search_roots(self):
         """Return possible companion-plugin locations without touching the UI."""
         roots = []
@@ -5351,7 +5424,14 @@ class LargeApp(App):
 
     def _flashback_replay_dirs(self):
         """Find the delivery replay folder and the recorder's default output."""
-        candidates = [self._flashback_output_dir, Path.home() / 'Videos' / 'FlashbackRecorder']
+        configured = ''
+        output_widget = getattr(self, 'flashback_output', None)
+        if output_widget is not None:
+            configured = output_widget.text().strip()
+        candidates = []
+        if configured:
+            candidates.append(Path(configured).expanduser())
+        candidates.extend([self._flashback_output_dir, Path.home() / 'Videos' / 'FlashbackRecorder'])
         for root in self._flashback_search_roots():
             candidates.append(root.parent / '回放')
             candidates.append(root / '回放')
@@ -5364,27 +5444,52 @@ class LargeApp(App):
                 result.append(directory)
         return result
 
-    def _flashback_replays(self):
+    def _flashback_replays(self, force=False):
+        """Return recent exports from both the normal and session folders.
+
+        The embedded recorder writes into ``.flashback-runtime/session-*``;
+        scanning only the output root made a completed recording appear to be
+        missing until it was manually copied elsewhere.
+        """
+        now = time.monotonic()
+        directories = tuple(self._flashback_replay_dirs())
+        if (not force and directories == self._flashback_replay_cache_dirs and
+                now - self._flashback_replay_cache_at < 1.0):
+            return list(self._flashback_replay_cache)
         files = []
         seen = set()
-        for directory in self._flashback_replay_dirs():
+        for directory in directories:
             if not directory.is_dir():
                 continue
-            try:
-                entries = directory.glob('*.flashback.zip')
-            except OSError:
-                continue
-            for path in entries:
-                key = str(path).casefold()
-                if key in seen:
-                    continue
-                seen.add(key)
+            patterns = [directory.glob('*.flashback.zip')]
+            runtime = directory / '.flashback-runtime'
+            if runtime.is_dir():
+                # Keep traversal bounded to the recorder's own layout and do
+                # not follow arbitrary links from a user-selected directory.
+                patterns.append(runtime.glob('session-*/*.flashback.zip'))
+                patterns.append(runtime.glob('session-*/*/*.flashback.zip'))
+            for entries in patterns:
                 try:
-                    files.append((path, path.stat().st_mtime))
+                    paths = entries
+                    for path in paths:
+                        try:
+                            if path.is_symlink() or not path.is_file():
+                                continue
+                            key = str(path.resolve()).casefold()
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            stat_result = path.stat()
+                            files.append((path, stat_result.st_mtime_ns, stat_result.st_size))
+                        except OSError:
+                            continue
                 except OSError:
-                    files.append((path, 0))
+                    continue
         files.sort(key=lambda item: item[1], reverse=True)
-        return [path for path, _mtime in files[:12]]
+        self._flashback_replay_cache = [path for path, _mtime, _size in files[:24]]
+        self._flashback_replay_cache_at = now
+        self._flashback_replay_cache_dirs = directories
+        return list(self._flashback_replay_cache)
 
     # ------------------------------------------------------------------
     # Native Flashback bridge.  The recorder engine is kept headless and
@@ -5430,6 +5535,10 @@ class LargeApp(App):
         ])
         process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
         process.readyReadStandardOutput.connect(self._flashback_bridge_read)
+        # Always drain stderr as well.  A noisy recorder diagnostic stream can
+        # otherwise fill QProcess' pipe and block the engine while stdout is
+        # waiting for the next JSON response.
+        process.readyReadStandardError.connect(self._flashback_bridge_read_stderr)
         process.stateChanged.connect(self._flashback_bridge_state_changed)
         process.errorOccurred.connect(self._flashback_bridge_error_signal)
         process.finished.connect(self._flashback_bridge_finished)
@@ -5453,8 +5562,54 @@ class LargeApp(App):
         if self._flashback_bridge_inflight is not None:
             self._flashback_bridge_inflight = None
         self._flashback_busy = False
+        if self._close_waiting_for_bridge:
+            self._close_waiting_for_bridge = False
+            if self._close_bridge_timer is not None:
+                self._close_bridge_timer.stop()
+            # Let QProcess finish delivering its final signals before asking
+            # Qt to close the window.  This keeps the close path asynchronous.
+            QTimer.singleShot(0, self.close)
+            return
         if not self._closing and hasattr(self, 'flashback_status'):
             self._flashback_set_status('录制引擎已退出，请点击刷新重新连接。', error=True)
+
+    def _force_close_flashback_bridge(self):
+        """Last-resort bridge shutdown after a long graceful-close window."""
+        if not self._close_waiting_for_bridge:
+            return
+        self._close_waiting_for_bridge = False
+        bridge = getattr(self, '_flashback_bridge', None)
+        if bridge is not None and bridge.state() != QProcess.ProcessState.NotRunning:
+            bridge.terminate()
+            if not bridge.waitForFinished(1000):
+                bridge.kill()
+                bridge.waitForFinished(1000)
+        self.close()
+
+    def _request_flashback_shutdown_for_close(self):
+        bridge = getattr(self, '_flashback_bridge', None)
+        if bridge is None or bridge.state() == QProcess.ProcessState.NotRunning:
+            return False
+        if self._close_waiting_for_bridge:
+            return True
+        self._close_waiting_for_bridge = True
+        if self._close_bridge_timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._force_close_flashback_bridge)
+            self._close_bridge_timer = timer
+        # The recorder can legitimately spend time flushing a snapshot or
+        # exporting a replay.  Keep the GUI event loop alive while the child
+        # performs its explicit shutdown protocol; only force-stop after the
+        # bounded fallback below.
+        self._close_bridge_timer.start(90_000)
+        self._flashback_set_status('正在安全收尾录制，请稍候…')
+        self._flashback_request('shutdown')
+        if bridge.state() == QProcess.ProcessState.NotRunning:
+            self._close_waiting_for_bridge = False
+            self._close_bridge_timer.stop()
+            return False
+        return True
 
     def _flashback_bridge_read(self):
         process = self._flashback_bridge
@@ -5472,6 +5627,19 @@ class LargeApp(App):
             except (ValueError, TypeError):
                 continue
             self._flashback_handle_response(response)
+
+    def _flashback_bridge_read_stderr(self):
+        """Drain bridge diagnostics so the child process cannot block on stderr."""
+        process = self._flashback_bridge
+        if process is None:
+            return
+        data = bytes(process.readAllStandardError()).decode('utf-8', errors='replace')
+        for line in data.splitlines():
+            line = line.strip()
+            if line:
+                # Keep diagnostics bounded; the engine owns the full log and
+                # the UI only needs a concise hint when troubleshooting.
+                self._flashback_append_log(f'引擎：{line[:500]}')
 
     def _flashback_request(self, command, **payload):
         if command in {'status', 'refresh'}:
@@ -5498,7 +5666,30 @@ class LargeApp(App):
             return
         request = self._flashback_bridge_queue.popleft()
         self._flashback_bridge_inflight = request
-        process.write((json.dumps(request, ensure_ascii=False) + '\n').encode('utf-8'))
+        payload = (json.dumps(request, ensure_ascii=False) + '\n').encode('utf-8')
+        try:
+            written = int(process.write(payload))
+        except (RuntimeError, TypeError, ValueError):
+            written = -1
+        if written < 0:
+            self._flashback_bridge_inflight = None
+            self._flashback_bridge_error = '无法向内置 Flashback 引擎发送命令。'
+            self._flashback_set_status(self._flashback_bridge_error, error=True)
+            return
+        if written < len(payload):
+            # QProcess normally accepts the complete small command into its
+            # internal buffer, but handle a partial write explicitly so the
+            # request cannot remain permanently in-flight.
+            remaining = payload[written:]
+            try:
+                remainder_written = int(process.write(remaining))
+            except (RuntimeError, TypeError, ValueError):
+                remainder_written = -1
+            if remainder_written != len(remaining):
+                self._flashback_bridge_inflight = None
+                self._flashback_bridge_error = '内置 Flashback 引擎写入不完整。'
+                self._flashback_set_status(self._flashback_bridge_error, error=True)
+                self._flashback_flush_request_queue()
 
     def _flashback_handle_response(self, response):
         self._flashback_bridge_inflight = None
@@ -5506,6 +5697,7 @@ class LargeApp(App):
         if not isinstance(response, dict):
             self._flashback_set_status('录制引擎返回了无效状态。', error=True)
         elif not response.get('ok', False):
+            self._flashback_pending_start_rate = None
             self._flashback_set_status(str(response.get('error') or '录制引擎操作失败。'), error=True)
             self._flashback_append_log(str(response.get('error') or '录制引擎操作失败。'))
         else:
@@ -5519,16 +5711,31 @@ class LargeApp(App):
         widget = getattr(self, 'flashback_log', None)
         if widget is None or not text:
             return
+        text = str(text).strip()
+        if not text:
+            return
+        # A bridge response carries both ``message`` and the incremental log
+        # row that produced it.  Keep one readable entry per message in the
+        # current window and bound the deduplication set.
+        key = text.casefold()
+        if key in self._flashback_log_keys:
+            return
+        self._flashback_log_keys.add(key)
+        self._flashback_log_order.append(key)
+        while len(self._flashback_log_order) > 256:
+            self._flashback_log_keys.discard(self._flashback_log_order.popleft())
         stamp = datetime.now().strftime('%H:%M:%S')
-        widget.appendPlainText(f'[{stamp}] {text}')
+        widget.appendPlainText(f'[{stamp}] {text[:800]}')
         widget.ensureCursorVisible()
 
     def _flashback_set_status(self, text, error=False):
         if hasattr(self, 'flashback_status'):
-            self.flashback_status.setText(str(text))
-            self.flashback_status.setProperty('statusTone', 'error' if error else 'normal')
-            self.flashback_status.style().unpolish(self.flashback_status)
-            self.flashback_status.style().polish(self.flashback_status)
+            self._set_if_changed(self.flashback_status, str(text))
+            tone = 'error' if error else 'normal'
+            if self.flashback_status.property('statusTone') != tone:
+                self.flashback_status.setProperty('statusTone', tone)
+                self.flashback_status.style().unpolish(self.flashback_status)
+                self.flashback_status.style().polish(self.flashback_status)
 
     def _flashback_apply_snapshot(self, snapshot):
         if not isinstance(snapshot, dict):
@@ -5540,9 +5747,17 @@ class LargeApp(App):
         self._flashback_state_dir = snapshot.get('sessionDir')
         self._flashback_status = snapshot.get('status') or {}
         self._flashback_replay_path = str(snapshot.get('replay') or '')
+        exported_replay = str(snapshot.get('exportedReplay') or '')
+        if exported_replay:
+            self._flashback_exported_replay_path = exported_replay
+            self._flashback_replay_path = exported_replay
         settings = snapshot.get('settings') or {}
         if hasattr(self, 'flashback_output') and settings.get('output'):
-            self.flashback_output.setText(str(settings['output']))
+            output_value = str(settings['output'])
+            if output_value.casefold() != str(self._flashback_output_dir).casefold():
+                self._flashback_replay_cache = []
+                self._flashback_replay_cache_at = 0.0
+            self.flashback_output.setText(output_value)
         if settings.get('output'):
             self._flashback_output_dir = Path(str(settings['output']))
         if hasattr(self, 'flashback_target'):
@@ -5556,23 +5771,32 @@ class LargeApp(App):
             if text:
                 self._flashback_append_log(text)
         if hasattr(self, 'flashback_process_combo'):
-            current = self.flashback_process_combo.currentData()
-            self.flashback_process_combo.blockSignals(True)
-            self.flashback_process_combo.clear()
-            for item in self._flashback_processes:
-                label_text = item.get('commandLine') or item.get('name') or 'Minecraft'
-                if item.get('netease'):
-                    label_text = '网易 · ' + label_text
-                if item.get('supported'):
-                    label_text = '✓ ' + label_text
-                self.flashback_process_combo.addItem(
-                    f'{label_text} · PID {item.get("pid", "-")}', item)
-            wanted = self._flashback_selected_identity or current
-            index = next((i for i in range(self.flashback_process_combo.count())
-                          if str(self.flashback_process_combo.itemData(i).get('identity')) == str(wanted)), -1)
-            if index >= 0:
-                self.flashback_process_combo.setCurrentIndex(index)
-            self.flashback_process_combo.blockSignals(False)
+            process_signature = tuple(
+                (str(item.get('identity') or ''), str(item.get('commandLine') or ''),
+                 bool(item.get('supported')), bool(item.get('netease')))
+                for item in self._flashback_processes if isinstance(item, dict))
+            if process_signature != self._flashback_process_signature:
+                current = self.flashback_process_combo.currentData()
+                current_identity = current.get('identity') if isinstance(current, dict) else ''
+                self.flashback_process_combo.blockSignals(True)
+                self.flashback_process_combo.clear()
+                for item in self._flashback_processes:
+                    if not isinstance(item, dict):
+                        continue
+                    label_text = item.get('commandLine') or item.get('name') or 'Minecraft'
+                    if item.get('netease'):
+                        label_text = '网易 · ' + label_text
+                    if item.get('supported'):
+                        label_text = '✓ ' + label_text
+                    self.flashback_process_combo.addItem(
+                        f'{label_text} · PID {item.get("pid", "-")}', item)
+                wanted = self._flashback_selected_identity or current_identity
+                index = next((i for i in range(self.flashback_process_combo.count())
+                              if str(self.flashback_process_combo.itemData(i).get('identity')) == str(wanted)), -1)
+                if index >= 0:
+                    self.flashback_process_combo.setCurrentIndex(index)
+                self.flashback_process_combo.blockSignals(False)
+                self._flashback_process_signature = process_signature
         recording = bool(snapshot.get('recording'))
         state = self._flashback_status
         state_text = str(snapshot.get('stateText') or '内置引擎已连接')
@@ -5585,9 +5809,24 @@ class LargeApp(App):
             self.flashback_packets_value.setText(str(state.get('packets', '0')))
             self.flashback_recording_value.setText('录制中' if recording else '未录制')
         if hasattr(self, 'flashback_start_button'):
-            self.flashback_start_button.setEnabled(not recording and bool(self._flashback_state_dir) and not snapshot.get('busy'))
-            self.flashback_stop_button.setEnabled(recording and not snapshot.get('busy'))
-            self.flashback_inject_button.setEnabled(bool(selected.get('supported')) and not self._flashback_state_dir and not snapshot.get('busy'))
+            # ``busy`` also includes the engine's 600 ms status poll.  Using
+            # it here made the visible button blink disabled after injection.
+            # The local command guard is stable; a start pressed during the
+            # initial snapshot is queued below and sent once the state is ready.
+            self.flashback_start_button.setEnabled(
+                not recording and bool(self._flashback_state_dir) and not self._flashback_busy)
+            self.flashback_stop_button.setEnabled(recording and not self._flashback_busy)
+            self.flashback_inject_button.setEnabled(
+                bool(selected.get('supported')) and not self._flashback_state_dir and not self._flashback_busy)
+        controls = snapshot.get('controls') if isinstance(snapshot.get('controls'), dict) else {}
+        self._flashback_last_controls = controls
+        if (self._flashback_pending_start_rate is not None and
+                controls.get('start') and not recording and not self._flashback_busy):
+            pending_rate = self._flashback_pending_start_rate
+            self._flashback_pending_start_rate = None
+            self._flashback_busy = True
+            self._flashback_set_status(f'正在开始录制 · {pending_rate} tick / 秒…')
+            QTimer.singleShot(0, lambda rate=pending_rate: self._flashback_request('start', rate=rate))
         if self._flashback_replay_path:
             self._flashback_refresh_replay_list()
 
@@ -5601,6 +5840,7 @@ class LargeApp(App):
 
     def _flashback_refresh(self):
         self._flashback_request('refresh')
+        self._flashback_replay_cache_at = 0.0
         self._flashback_refresh_replay_list()
 
     def _flashback_inject(self):
@@ -5614,6 +5854,17 @@ class LargeApp(App):
 
     def _flashback_start_recording(self):
         rate = int(self.flashback_rate.value()) if hasattr(self, 'flashback_rate') else 20
+        if not self._flashback_state_dir:
+            self._flashback_set_status('请先注入录制组件。', error=True)
+            return
+        controls = getattr(self, '_flashback_last_controls', {})
+        if not controls.get('start', True):
+            # The first world snapshot normally takes a short time.  Keep the
+            # action clickable and start automatically at the first ready poll
+            # instead of dropping the user's click on the floor.
+            self._flashback_pending_start_rate = rate
+            self._flashback_set_status('已记录开始操作，录制组件就绪后会自动开始。')
+            return
         self._flashback_busy = True
         self._flashback_set_status(f'正在开始录制 · {rate} tick / 秒…')
         self._flashback_request('start', rate=rate)
@@ -5683,10 +5934,22 @@ class LargeApp(App):
         layout = getattr(self, 'flashback_replay_layout', None)
         if layout is None:
             return
-        self._clear_layout(layout)
         replays = self._flashback_replays()
+        signature_items = []
+        for path in replays:
+            try:
+                stat_result = path.stat()
+                signature_items.append((str(path.resolve()), stat_result.st_mtime_ns, stat_result.st_size))
+            except OSError:
+                continue
+        signature = tuple(signature_items)
+        if signature == self._flashback_replay_signature:
+            return
+        self._flashback_replay_signature = signature
+        self._clear_layout(layout)
         if not replays:
-            layout.addWidget(label('还没有回放文件。停止录制后，完整回放会出现在 Videos/FlashbackRecorder。', 'cardHint'))
+            output_hint = str(getattr(self, '_flashback_output_dir', Path.home() / 'Videos')).strip()
+            layout.addWidget(label(f'还没有回放文件。停止录制后会从“{output_hint}”读取。', 'cardHint'))
         else:
             for path in replays:
                 row = GlassFrame()
@@ -5695,17 +5958,30 @@ class LargeApp(App):
                 row_layout.setContentsMargins(10, 7, 10, 7)
                 row_layout.addWidget(icon_tile('layers', 'sectionIcon', '#bfe1ff', 13, 25))
                 copy = QVBoxLayout()
-                copy.addWidget(label(path.stem, 'cardTitle'))
+                title = path.name.removesuffix('.flashback.zip')
+                copy.addWidget(label(title, 'cardTitle'))
                 try:
-                    detail = f'{path.stat().st_size / (1024 * 1024):.1f} MB · {path.parent}'
+                    stat_result = path.stat()
+                    modified = datetime.fromtimestamp(stat_result.st_mtime).strftime('%Y-%m-%d %H:%M')
+                    detail = f'{stat_result.st_size / (1024 * 1024):.1f} MB · {modified}'
                 except OSError:
-                    detail = str(path.parent)
+                    detail = '文件信息暂不可用'
                 hint = label(detail, 'cardHint')
                 hint.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
                 copy.addWidget(hint)
+                location = label(str(path.parent), 'cardHint')
+                location.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                location.setToolTip(str(path))
+                copy.addWidget(location)
                 row_layout.addLayout(copy, 1)
                 inspect = self.button('查看信息', lambda checked=False, p=path: self._flashback_show_replay_info(p))
                 row_layout.addWidget(inspect)
+                open_file = self.button(
+                    '打开文件',
+                    lambda checked=False, p=path: QDesktopServices.openUrl(
+                        QUrl.fromLocalFile(str(p))))
+                row_layout.addWidget(open_file)
+                row.mouseDoubleClickEvent = lambda event, p=path: self._flashback_show_replay_info(p)
                 layout.addWidget(row)
         layout.addStretch(1)
 
@@ -5718,9 +5994,34 @@ class LargeApp(App):
                 metadata = {}
                 if 'metadata.json' in names:
                     metadata = json.loads(archive.read('metadata.json').decode('utf-8', errors='replace'))
-            summary = f'{path.name}\n大小：{path.stat().st_size / (1024 * 1024):.1f} MB\n'
-            summary += f'文件：{len(names)} 项\n' + '\n'.join(f'{key}: {value}' for key, value in metadata.items())
+            stat_result = path.stat()
+            summary_lines = [
+                f'回放：{path.name}',
+                f'位置：{path.parent}',
+                f'大小：{stat_result.st_size / (1024 * 1024):.1f} MB',
+                f'文件：{len(names)} 项',
+            ]
+            labels = {
+                'name': '名称', 'version_string': '版本', 'total_ticks': '总 tick',
+                'data_version': '数据版本', 'protocol_version': '协议版本',
+                'world_name': '世界',
+            }
+            for key, title in labels.items():
+                if key in metadata:
+                    summary_lines.append(f'{title}：{metadata[key]}')
+            recorder = metadata.get('flashback_recorder')
+            if isinstance(recorder, dict):
+                source = recorder.get('source_file')
+                if source:
+                    summary_lines.append(f'录制源：{source}')
+            summary_lines.append('')
+            summary_lines.append('压缩包内容：')
+            summary_lines.extend(f'· {name}' for name in names[:40])
+            if len(names) > 40:
+                summary_lines.append(f'· …还有 {len(names) - 40} 项')
+            summary = '\n'.join(summary_lines)
             self.flashback_replay_info.setPlainText(summary)
+            self.flashback_replay_info.verticalScrollBar().setValue(0)
         except Exception as error:
             self.flashback_replay_info.setPlainText(f'无法读取回放信息：{error}')
 
@@ -5780,9 +6081,31 @@ class LargeApp(App):
         self.flashback_process_hint = label('只注入 Minecraft 1.20.1；网易客户端需要允许 Java Attach。', 'cardHint'); hero_layout.addWidget(self.flashback_process_hint)
         layout.addWidget(hero)
 
+        tutorial = GlassFrame(); tutorial.setObjectName('flashbackTutorial')
+        tutorial_layout = QVBoxLayout(tutorial); tutorial_layout.setContentsMargins(14, 10, 14, 10); tutorial_layout.setSpacing(4)
+        tutorial_layout.addWidget(label('快速开始', 'section'))
+        tutorial_layout.addWidget(label(
+            '① 进入 1.20.1 世界并选择进程　② 点击注入录制组件　③ 组件就绪后点击开始录制　④ 停止后等待回放自动生成',
+            'cardHint'))
+        tutorial_layout.addWidget(label(
+            '注入后的初始世界快照可能需要几秒；提前点击开始会自动排队，不会丢失操作。',
+            'cardHint'))
+        layout.addWidget(tutorial)
+
         session = GlassFrame(); session.setObjectName('flashbackSessionCard')
         session_layout = QVBoxLayout(session); session_layout.setContentsMargins(16, 13, 16, 13); session_layout.setSpacing(9)
-        self._section_header(session_layout, '录制控制', 'command')
+        session_header = self._section_header_layout('录制控制', 'command')
+        self.flashback_pack_button = self.button(
+            '点我下载配套整合包', self._save_flashback_companion_pack)
+        self.flashback_pack_button.setMinimumHeight(32)
+        self.flashback_pack_button.setToolTip('选择保存位置，将内置整合包复制到本机；离线也可使用。')
+        session_header.addWidget(self.flashback_pack_button)
+        session_layout.addLayout(session_header)
+        self.flashback_pack_hint = label('', 'cardHint')
+        self.flashback_pack_hint.setWordWrap(True)
+        self.flashback_pack_hint.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.flashback_pack_hint.hide()
+        session_layout.addWidget(self.flashback_pack_hint)
         metrics = QGridLayout(); metrics.setHorizontalSpacing(8); metrics.setVerticalSpacing(8)
         self.flashback_pid_value = label('-', 'metricSmallCompact'); self.flashback_samples_value = label('0', 'metricSmallCompact'); self.flashback_packets_value = label('0', 'metricSmallCompact'); self.flashback_recording_value = label('未录制', 'metricSmallCompact')
         for col, title, widget in ((0, 'PID', self.flashback_pid_value), (1, '样本', self.flashback_samples_value), (2, '数据包', self.flashback_packets_value), (3, '状态', self.flashback_recording_value)):
@@ -5817,7 +6140,7 @@ class LargeApp(App):
         lower = QHBoxLayout(); lower.setSpacing(12)
         replay_card = GlassFrame(); replay_card.setObjectName('flashbackReplayCard'); replay_layout = QVBoxLayout(replay_card); replay_layout.setContentsMargins(14, 12, 14, 12); replay_layout.setSpacing(8)
         self._section_header(replay_layout, '最近回放', 'layers')
-        self.flashback_replay_scroll = QScrollArea(); self.flashback_replay_scroll.setObjectName('flashbackReplayScroll'); self.flashback_replay_scroll.setWidgetResizable(True); self.flashback_replay_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.flashback_replay_scroll = QScrollArea(); self.flashback_replay_scroll.setObjectName('flashbackReplayScroll'); self.flashback_replay_scroll.setWidgetResizable(True); self.flashback_replay_scroll.setMinimumHeight(190); self.flashback_replay_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.flashback_replay_scroll.setFrameShape(QFrame.Shape.NoFrame)
         replay_viewport = self.flashback_replay_scroll.viewport()
         replay_viewport.setAutoFillBackground(False)
@@ -5828,14 +6151,14 @@ class LargeApp(App):
         replay_viewport.setPalette(replay_palette)
         self.flashback_replay_host = QWidget(); self.flashback_replay_host.setObjectName('flashbackReplayHost'); self.flashback_replay_host.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True); self.flashback_replay_layout = QVBoxLayout(self.flashback_replay_host); self.flashback_replay_layout.setContentsMargins(1, 1, 3, 1); self.flashback_replay_layout.setSpacing(7); self.flashback_replay_scroll.setWidget(self.flashback_replay_host); replay_layout.addWidget(self.flashback_replay_scroll, 1); lower.addWidget(replay_card, 1)
         info_card = GlassFrame(); info_card.setObjectName('flashbackInfoCard'); info_layout = QVBoxLayout(info_card); info_layout.setContentsMargins(14, 12, 14, 12); info_layout.addLayout(self._section_header_layout('回放信息', 'chart'))
-        self.flashback_replay_info = QPlainTextEdit(); self.flashback_replay_info.setObjectName('flashbackInfo'); self.flashback_replay_info.setReadOnly(True); self.flashback_replay_info.setPlaceholderText('选择一条回放查看 metadata、文件数量和录制摘要。'); info_layout.addWidget(self.flashback_replay_info, 1); lower.addWidget(info_card, 1)
+        self.flashback_replay_info = QPlainTextEdit(); self.flashback_replay_info.setObjectName('flashbackInfo'); self.flashback_replay_info.setReadOnly(True); self.flashback_replay_info.setMinimumHeight(190); self.flashback_replay_info.setPlaceholderText('选择一条回放查看版本、时长、录制源和压缩包内容。'); info_layout.addWidget(self.flashback_replay_info, 1); lower.addWidget(info_card, 1)
         layout.addLayout(lower, 1)
 
         log_card = GlassFrame(); log_card.setObjectName('flashbackLogCard'); log_layout = QVBoxLayout(log_card); log_layout.setContentsMargins(14, 10, 14, 10); log_layout.addLayout(self._section_header_layout('内置引擎日志', 'command'))
         self.flashback_log = QPlainTextEdit(); self.flashback_log.setObjectName('flashbackLog'); self.flashback_log.setReadOnly(True); self.flashback_log.setMaximumBlockCount(120); self.flashback_log.setMinimumHeight(70); log_layout.addWidget(self.flashback_log); layout.addWidget(log_card)
 
         self._flashback_replay_layout = self.flashback_replay_layout
-        self._flashback_status_timer = QTimer(self); self._flashback_status_timer.setInterval(800); self._flashback_status_timer.timeout.connect(self._flashback_status_tick)
+        self._flashback_status_timer = QTimer(self); self._flashback_status_timer.setInterval(1000); self._flashback_status_timer.timeout.connect(self._flashback_status_tick)
         # Preserve the form's natural height inside the outer scroll area.
         # Without an explicit minimum, ``widgetResizable`` allows the content
         # widget to shrink back to the viewport and the lower cards squeeze
@@ -5959,6 +6282,28 @@ class LargeApp(App):
         self.flashback_status.setText('录制器已启动 · 请进入世界后手动选择进程并注入。')
         self.flashback_path_hint.setText(str(executable))
 
+    def _stop_flashback_recorder_process(self):
+        """Stop the legacy external recorder without leaving a child behind."""
+        process = getattr(self, '_flashback_process', None)
+        self._flashback_process = None
+        if process is None:
+            return
+        try:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=1.2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    try:
+                        process.wait(timeout=0.8)
+                    except subprocess.TimeoutExpired:
+                        pass
+        except (OSError, ValueError, AttributeError):
+            # The recorder may have exited between poll() and terminate().
+            # There is no useful recovery action during application shutdown.
+            pass
+
     def _open_flashback_replay_folder(self):
         directories = self._flashback_replay_dirs()
         target = next((path for path in directories if path.is_dir()), directories[0])
@@ -6011,7 +6356,8 @@ class LargeApp(App):
         self._clear_layout(self.flashback_replay_layout)
         replays = self._flashback_replays()
         if not replays:
-            empty = label('还没有找到回放文件。停止录制后，文件会出现在 Videos/FlashbackRecorder。', 'cardHint')
+            output_hint = str(getattr(self, '_flashback_output_dir', Path.home() / 'Videos')).strip()
+            empty = label(f'还没有找到回放文件。停止录制后会从“{output_hint}”读取。', 'cardHint')
             empty.setWordWrap(True)
             self.flashback_replay_layout.addWidget(empty)
         else:
@@ -6521,48 +6867,52 @@ class LargeApp(App):
         # The empty-state label is reused; deleting it here makes the next
         # message fail once Qt processes DeferredDelete after startup.
         self.chat_messages_host.setUpdatesEnabled(False)
-        while self.chat_messages_layout.count():
-            item = self.chat_messages_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None and widget is not self.chat_empty_label:
-                widget.hide()
-                widget.deleteLater()
-        self.chat_empty_label.setVisible(not normalized)
-        if not normalized:
-            self.chat_messages_layout.addWidget(self.chat_empty_label)
-        for item in normalized:
-            bubble = GlassFrame()
-            bubble.setObjectName('chatMessageBubble')
-            bubble.setProperty(
-                'mine', 'true' if str(item['sender']).casefold() ==
-                self._chat_bound_game_id().casefold() else 'false')
-            bubble.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-            bubble_layout = QVBoxLayout(bubble)
-            bubble_layout.setContentsMargins(12, 8, 12, 8)
-            bubble_layout.setSpacing(3)
-            meta = QHBoxLayout()
-            meta.setSpacing(7)
-            author = label(item['sender'], 'chatMessageAuthor')
-            author.setTextFormat(Qt.TextFormat.PlainText)
-            author.setObjectName('chatMessageAuthor')
-            meta.addWidget(author)
-            if item['stamp']:
-                stamp = item['stamp']
-                try:
-                    stamp = datetime.fromisoformat(stamp.replace('Z', '+00:00')).astimezone().strftime('%H:%M')
-                except (ValueError, TypeError, OverflowError):
-                    stamp = stamp[:16]
-                meta.addWidget(label(stamp, 'chatMessageTime'))
-            meta.addStretch(1)
-            bubble_layout.addLayout(meta)
-            body = label(item['text'], 'chatMessageText')
-            body.setTextFormat(Qt.TextFormat.PlainText)
-            body.setWordWrap(True)
-            body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            bubble_layout.addWidget(body)
-            self.chat_messages_layout.addWidget(bubble)
-        self.chat_messages_layout.addStretch(1)
-        self.chat_messages_host.setUpdatesEnabled(True)
+        try:
+            while self.chat_messages_layout.count():
+                item = self.chat_messages_layout.takeAt(0)
+                widget = item.widget()
+                if widget is not None and widget is not self.chat_empty_label:
+                    widget.hide()
+                    widget.deleteLater()
+            self.chat_empty_label.setVisible(not normalized)
+            if not normalized:
+                self.chat_messages_layout.addWidget(self.chat_empty_label)
+            for item in normalized:
+                bubble = GlassFrame()
+                bubble.setObjectName('chatMessageBubble')
+                bubble.setProperty(
+                    'mine', 'true' if str(item['sender']).casefold() ==
+                    self._chat_bound_game_id().casefold() else 'false')
+                bubble.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+                bubble_layout = QVBoxLayout(bubble)
+                bubble_layout.setContentsMargins(12, 8, 12, 8)
+                bubble_layout.setSpacing(3)
+                meta = QHBoxLayout()
+                meta.setSpacing(7)
+                author = label(item['sender'], 'chatMessageAuthor')
+                author.setTextFormat(Qt.TextFormat.PlainText)
+                author.setObjectName('chatMessageAuthor')
+                meta.addWidget(author)
+                if item['stamp']:
+                    stamp = item['stamp']
+                    try:
+                        stamp = datetime.fromisoformat(stamp.replace('Z', '+00:00')).astimezone().strftime('%H:%M')
+                    except (ValueError, TypeError, OverflowError):
+                        stamp = stamp[:16]
+                    meta.addWidget(label(stamp, 'chatMessageTime'))
+                meta.addStretch(1)
+                bubble_layout.addLayout(meta)
+                body = label(item['text'], 'chatMessageText')
+                body.setTextFormat(Qt.TextFormat.PlainText)
+                body.setWordWrap(True)
+                body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                bubble_layout.addWidget(body)
+                self.chat_messages_layout.addWidget(bubble)
+            self.chat_messages_layout.addStretch(1)
+        finally:
+            # Keep this paired even when malformed realtime data or a theme
+            # callback raises while constructing one of the bubbles.
+            self.chat_messages_host.setUpdatesEnabled(True)
         self._schedule_chat_scroll_to_latest()
 
     def _build_placeholder(self, title, description, icon, bullets):
@@ -7728,23 +8078,30 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
             self._set_if_changed(self.dashboard_state, text)
 
     def closeEvent(self, event):
-        # The cache belongs to this process only. Clear it before handling
-        # either the idle or busy shutdown path so a close request can never
-        # resurrect the previous room on the next launch.
-        self._closing = True
-        bridge = getattr(self, '_flashback_bridge', None)
-        if bridge is not None and bridge.state() != QProcess.ProcessState.NotRunning:
-            # EOF asks the headless engine to run its normal shutdown/export
-            # path before the short fallback timeout below.
-            bridge.closeWriteChannel()
-            if not bridge.waitForFinished(1200):
-                bridge.terminate()
-            if bridge.state() != QProcess.ProcessState.NotRunning and not bridge.waitForFinished(800):
-                bridge.kill()
-        self._clear_chat_session_cache()
+        # App.closeEvent intentionally rejects shutdown while a cleanup scan
+        # is running.  Do not mark this window as closing on that rejected
+        # attempt: the API/chat timers and workers must remain usable until
+        # the user closes it again after the operation completes.
         if self.busy:
             super().closeEvent(event)
             return
+        if self._companion_pack_worker is not None and self._companion_pack_worker.isRunning():
+            event.ignore()
+            self._companion_pack_worker.finished.connect(self.close)
+            return
+        # Do not close the bridge by closing stdin and synchronously waiting
+        # on the GUI thread.  The child shutdown command can call back into
+        # its WinForms UI and may need up to 75 seconds to finish a recording.
+        # Keep Qt responsive and close only after the child reports finished.
+        if self._request_flashback_shutdown_for_close():
+            event.ignore()
+            return
+        # The cache belongs to this process only. Clear it before handling
+        # the idle shutdown path so a close request can never resurrect the
+        # previous room on the next launch.
+        self._closing = True
+        self._stop_flashback_recorder_process()
+        self._clear_chat_session_cache()
         if hasattr(self, '_taskbar_auto_refresh_timer'):
             self._taskbar_auto_refresh_timer.stop()
         self._api_queue.clear()

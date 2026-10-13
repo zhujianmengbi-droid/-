@@ -43,11 +43,26 @@ internal static class RuntimeAssets
             var name = Assembly.GetExecutingAssembly().GetManifestResourceNames().FirstOrDefault(n => n.EndsWith(file.Item1, StringComparison.OrdinalIgnoreCase));
             if (name is null) throw new FileNotFoundException("EXE 内未找到运行时组件", file.Item1);
             using var input = Assembly.GetExecutingAssembly().GetManifestResourceStream(name)!;
-            using (var output = File.Create(file.Item2 + ".tmp"))
+            // Use a unique CreateNew temporary file.  A shared ``.tmp`` name
+            // allowed two bridge instances to overwrite each other's JAR and
+            // also followed a pre-existing reparse point when elevated.
+            var temporary = file.Item2 + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            using (var output = new FileStream(temporary, FileMode.CreateNew,
+                FileAccess.Write, FileShare.None))
             {
                 input.CopyTo(output);
             }
-            File.Move(file.Item2 + ".tmp", file.Item2, overwrite: true);
+            try
+            {
+                if (File.Exists(file.Item2)
+                    && (File.GetAttributes(file.Item2) & FileAttributes.ReparsePoint) != 0)
+                    throw new IOException("运行时组件路径不允许符号链接或目录联接。");
+                File.Move(temporary, file.Item2, overwrite: true);
+            }
+            finally
+            {
+                if (File.Exists(temporary)) File.Delete(temporary);
+            }
         }
     }
 
@@ -57,7 +72,9 @@ internal static class RuntimeAssets
     {
         try
         {
-            if (!File.Exists(path) || new FileInfo(path).Length <= 100) return false;
+            if (!File.Exists(path)) return false;
+            var length = new FileInfo(path).Length;
+            if (length <= 100 || length > 512L * 1024 * 1024) return false;
             var name = Assembly.GetExecutingAssembly().GetManifestResourceNames()
                 .FirstOrDefault(n => n.EndsWith(resourceSuffix, StringComparison.OrdinalIgnoreCase));
             if (name is null) return false;
@@ -96,8 +113,8 @@ internal sealed class RecorderForm : Form
     readonly RecorderButton importReplay = new() { Text = "安装回放到 Flashback", Description = "选择已有 ZIP，复制回放和皮肤以便播放", Dock = DockStyle.Fill };
     readonly RecorderButton open = new() { Text = "打开保存目录", Description = "查看已经保存的录制", Dock = DockStyle.Fill };
     readonly RecorderButton export = new() { Text = "导出 / 重试", Description = "重新转换最近一次录制", Dock = DockStyle.Fill, Enabled = false };
-    readonly System.Windows.Forms.Timer processTimer = new() { Interval = 2500 };
-    readonly System.Windows.Forms.Timer statusTimer = new() { Interval = 600 };
+    readonly System.Windows.Forms.Timer processTimer = new() { Interval = 4000 };
+    readonly System.Windows.Forms.Timer statusTimer = new() { Interval = 900 };
     readonly string settingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FlashbackRecorder", "settings.json");
     readonly string javaPath;
     readonly CancellationTokenSource lifetime = new();
@@ -116,6 +133,7 @@ internal sealed class RecorderForm : Form
     string? stateDir;
     string? attachedProcessKey;
     string? replayPath;
+    string? exportedReplayPath;
     bool busy;
     bool warnedOldAgent;
     string? failedExport;
@@ -225,12 +243,24 @@ internal sealed class RecorderForm : Form
             // directly, then split complete UTF-8 JSON lines ourselves.
             using var input = Console.OpenStandardInput();
             var buffer = new byte[4096];
+            var decoder = new UTF8Encoding(false, false).GetDecoder();
+            var decoded = new char[Encoding.UTF8.GetMaxCharCount(buffer.Length)];
             var pending = new StringBuilder();
             while (!bridgeExitRequested)
             {
                 var count = await input.ReadAsync(buffer, 0, buffer.Length, lifetime.Token);
                 if (count <= 0) break;
-                pending.Append(Encoding.UTF8.GetString(buffer, 0, count));
+                // Preserve incomplete multi-byte sequences between pipe reads;
+                // markers and paths may contain Chinese text and a 4 KiB read
+                // boundary must not turn that text into replacement glyphs.
+                var charCount = decoder.GetChars(buffer, 0, count, decoded, 0, flush: false);
+                pending.Append(decoded, 0, charCount);
+                if (pending.Length > 1024 * 1024)
+                {
+                    pending.Clear();
+                    WriteBridgeResponse(BridgeError("标准输入请求过大，已丢弃未完成命令。"));
+                    continue;
+                }
                 while (true)
                 {
                     var text = pending.ToString();
@@ -325,6 +355,7 @@ internal sealed class RecorderForm : Form
             ["selected"] = selected is null ? null : ProcessRow(selected),
             ["processes"] = processes.Items.OfType<GameProcess>().Select(ProcessRow).ToArray(),
             ["sessionDir"] = stateDir, ["replay"] = replayPath,
+            ["exportedReplay"] = exportedReplayPath,
             ["assetsReady"] = assetsReady, ["busy"] = busy || exporting || scanning || polling,
             ["logs"] = rows, ["logSequence"] = bridgeLogSequence,
             ["shutdown"] = bridgeShutdownPrepared,
@@ -879,6 +910,7 @@ internal sealed class RecorderForm : Form
             stateDir = directory;
             attachedProcessKey = target.Identity;
             replayPath = null;
+            exportedReplayPath = null;
             latestStatus.Clear();
             warnedOldAgent = false;
             failedExport = null;
@@ -899,6 +931,7 @@ internal sealed class RecorderForm : Form
         stateDir = null;
         attachedProcessKey = null;
         replayPath = null;
+        exportedReplayPath = null;
         latestStatus.Clear();
         warnedOldAgent = false;
         failedExport = null;
@@ -1049,10 +1082,12 @@ internal sealed class RecorderForm : Form
             {
                 var adapted = FlashbackZip.RunProtocolAdapter(source, javaPath, RuntimeAssets.ProtocolAdapter);
                 if (!adapted.Ok) throw new InvalidDataException("1.20.1 → 1.21.11 协议转换失败：" + adapted.Text);
-                return FlashbackZip.Convert(source);
+                var converted = FlashbackZip.Convert(source);
+                return RenameReplayWithDailyId(converted, source);
             }, lifetime.Token);
             if (closing) return;
             failedExport = null;
+            exportedReplayPath = zip;
             state.Text = "导出完成";
             Log("已导出 Flashback 1.21.11 文件：" + zip);
             var targetDirectory = flashbackDirectory.Text.Trim();
@@ -1075,6 +1110,100 @@ internal sealed class RecorderForm : Form
             state.Text = "导出未完成；可点击“导出 / 重试”";
         }
         finally { exporting = false; ApplyControls(); }
+    }
+
+    static string RenameReplayWithDailyId(string source, string recordingSource)
+    {
+        if (!source.EndsWith(".flashback.zip", StringComparison.OrdinalIgnoreCase)) return source;
+        var file = new FileInfo(source);
+        var date = ReplayRecordingDate(recordingSource).ToString("dd-MM-yyyy", System.Globalization.CultureInfo.InvariantCulture);
+        var expected = new Regex("^(?<count>[0-9]+)-" + Regex.Escape(date) + "\\.flashback\\.zip$",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+        var runtimeRoot = file.Directory?.Parent?.Parent;
+        var sourceHash = string.Empty;
+        try
+        {
+            using var input = File.OpenRead(recordingSource);
+            sourceHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(input));
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+        if (runtimeRoot is not null && runtimeRoot.Exists && sourceHash.Length > 0)
+        {
+            var existing = FindReplayForSource(runtimeRoot, sourceHash, expected);
+            if (existing is not null && !string.Equals(existing.FullName, source, StringComparison.OrdinalIgnoreCase))
+            {
+                File.Move(source, existing.FullName, overwrite: true);
+                return existing.FullName;
+            }
+        }
+        if (expected.IsMatch(file.Name)) return source;
+
+        // Count only files made by this naming scheme, across all recorder
+        // sessions. Older exports keep their original names and remain usable.
+        var max = 0;
+        if (runtimeRoot is not null && runtimeRoot.Exists)
+        {
+            try
+            {
+                foreach (var candidate in runtimeRoot.EnumerateFiles("*.flashback.zip", SearchOption.AllDirectories))
+                {
+                    var match = expected.Match(candidate.Name);
+                    if (match.Success && int.TryParse(match.Groups["count"].Value, out var count))
+                        max = Math.Max(max, count);
+                }
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+        var directory = file.DirectoryName ?? Directory.GetCurrentDirectory();
+        while (true)
+        {
+            var target = Path.Combine(directory, $"{max + 1}-{date}.flashback.zip");
+            try
+            {
+                File.Move(source, target, overwrite: false);
+                return target;
+            }
+            catch (IOException) when (File.Exists(target)) { max++; }
+        }
+    }
+
+    static FileInfo? FindReplayForSource(DirectoryInfo runtimeRoot, string sourceHash, Regex expected)
+    {
+        try
+        {
+            foreach (var candidate in runtimeRoot.EnumerateFiles("*.flashback.zip", SearchOption.AllDirectories))
+            {
+                if (!expected.IsMatch(candidate.Name)) continue;
+                using var archive = System.IO.Compression.ZipFile.OpenRead(candidate.FullName);
+                var metadata = archive.GetEntry("metadata.json");
+                if (metadata is null || metadata.Length > 4 * 1024 * 1024) continue;
+                using var reader = new StreamReader(metadata.Open(), Encoding.UTF8);
+                using var document = JsonDocument.Parse(reader.ReadToEnd());
+                if (!document.RootElement.TryGetProperty("flashback_recorder", out var recorder) ||
+                    !recorder.TryGetProperty("source_sha256", out var hash) ||
+                    !string.Equals(hash.GetString(), sourceHash, StringComparison.OrdinalIgnoreCase)) continue;
+                return candidate;
+            }
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+        catch (JsonException) { }
+        return null;
+    }
+
+    static DateTime ReplayRecordingDate(string source)
+    {
+        var match = Regex.Match(Path.GetFileName(source), @"(?<year>20[0-9]{2})(?<month>[0-9]{2})(?<day>[0-9]{2})-",
+            RegexOptions.CultureInvariant);
+        if (match.Success && DateTime.TryParseExact(
+                match.Groups["year"].Value + match.Groups["month"].Value + match.Groups["day"].Value,
+                "yyyyMMdd", System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.None, out var parsed)) return parsed;
+        try { return File.GetCreationTime(source); }
+        catch (IOException) { return DateTime.Now; }
     }
 
     static bool IsStartReadyState(string? status) => status is

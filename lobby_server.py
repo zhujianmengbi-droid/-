@@ -11,18 +11,23 @@ import os
 import threading
 import time
 import uuid
-from collections import deque
+from collections import defaultdict, deque
 
 from flask import Flask, jsonify, request
 
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 64 * 1024
 _lock = threading.RLock()
 _messages = deque(maxlen=160)
 _sessions = {}
+_rate_windows = defaultdict(deque)
 _next_message_id = 1
 _SESSION_TTL = 45
 _MAX_TEXT = 240
+_MAX_SESSIONS = 2048
+_RATE_WINDOW = 10
+_RATE_LIMIT = 20
 
 
 def _clean(value, limit):
@@ -35,6 +40,21 @@ def _cors(response):
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
     return response
+
+
+def _client_key():
+    return request.headers.get('X-Forwarded-For', request.remote_addr or 'unknown').split(',')[0].strip()
+
+
+def _allow_request(key, limit=_RATE_LIMIT):
+    now = time.time()
+    window = _rate_windows[key]
+    while window and now - window[0] >= _RATE_WINDOW:
+        window.popleft()
+    if len(window) >= limit:
+        return False
+    window.append(now)
+    return True
 
 
 @app.after_request
@@ -52,11 +72,16 @@ def join():
     if request.method == 'OPTIONS':
         return ('', 204)
     payload = request.get_json(silent=True) or {}
+    if not _allow_request('join:' + _client_key()):
+        return jsonify({'ok': False, 'message': '请求过于频繁，请稍后再试'}), 429
     player_id = _clean(payload.get('player_id') or payload.get('playerId'), 32)
     if not player_id:
         return jsonify({'ok': False, 'message': '缺少游戏 ID'}), 400
     session_id = uuid.uuid4().hex
     with _lock:
+        _online_count_locked()
+        if len(_sessions) >= _MAX_SESSIONS:
+            return jsonify({'ok': False, 'message': '大厅暂时已满，请稍后再试'}), 503
         _sessions[session_id] = {'player_id': player_id, 'seen': time.time()}
         online = _online_count_locked()
     return jsonify({'ok': True, 'session_id': session_id, 'online': online})
@@ -68,6 +93,8 @@ def online():
     if request.method == 'OPTIONS':
         return ('', 204)
     payload = request.get_json(silent=True) or {}
+    if not _allow_request('online:' + _client_key()):
+        return jsonify({'ok': False, 'message': '请求过于频繁，请稍后再试'}), 429
     session_id = _clean(payload.get('session_id') or request.args.get('session_id'), 64)
     with _lock:
         if session_id in _sessions:
@@ -83,17 +110,12 @@ def messages():
         return ('', 204)
     if request.method == 'POST':
         payload = request.get_json(silent=True) or {}
+        if not _allow_request('message:' + _client_key()):
+            return jsonify({'ok': False, 'message': '请求过于频繁，请稍后再试'}), 429
         session_id = _clean(payload.get('session_id'), 64)
-        player_id = _clean(payload.get('player_id') or payload.get('playerId'), 32)
         text = _clean(payload.get('text') or payload.get('message'), _MAX_TEXT)
         with _lock:
             session = _sessions.get(session_id)
-            # Keep the original lightweight client contract usable while the
-            # newer client uses an explicit join session.
-            if session is None and player_id:
-                session_id = uuid.uuid4().hex
-                session = {'player_id': player_id, 'seen': time.time()}
-                _sessions[session_id] = session
             if session is None:
                 return jsonify({'ok': False, 'message': '聊天会话已过期，请重新进入大厅'}), 401
             session['seen'] = time.time()
@@ -116,15 +138,13 @@ def messages():
     except ValueError:
         after = 0
     session_id = _clean(request.args.get('session_id'), 64)
-    player_id = _clean(request.args.get('player_id') or request.args.get('playerId'), 32)
+    if not _allow_request('messages:' + _client_key()):
+        return jsonify({'ok': False, 'message': '请求过于频繁，请稍后再试'}), 429
     with _lock:
         session = _sessions.get(session_id)
-        if session is None and player_id:
-            session_id = uuid.uuid4().hex
-            session = {'player_id': player_id, 'seen': time.time()}
-            _sessions[session_id] = session
-        if session is not None:
-            session['seen'] = time.time()
+        if session is None:
+            return jsonify({'ok': False, 'message': '聊天会话已过期，请重新进入大厅'}), 401
+        session['seen'] = time.time()
         items = [item for item in _messages if item['id'] > after]
         online_count = _online_count_locked()
     return jsonify({'ok': True, 'online': online_count, 'messages': items[-80:]})

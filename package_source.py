@@ -11,6 +11,7 @@ SOURCE_FILES = (
     'main_large.py', 'main.py', 'bugland_api.py',
     'match_data.py', 'optimizer.py', 'startup_motion.py',
     'taskbar_switcher_core.py', 'lobby_server.py',
+    'companion_pack.py', 'companions/ZJ-HUB-modpack.zip', 'companions/README.md',
     'build_large.py', 'package_source.py', '电脑优化中心.spec',
     'make_icon.py', 'app.ico', 'zj_hub_icon.png',
     'requirements.txt', 'requirements-chat.txt', 'render.yaml',

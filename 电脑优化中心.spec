@@ -25,7 +25,8 @@ a = Analysis(
     binaries=uiautomation_binaries,
     # The engine contains its .NET runtime and all recorder JARs. Keep it as a
     # single data payload so PyInstaller does not scan/rewrite its own runtime.
-    datas=[('app.ico', '.'), (str(engine_exe), 'flashback_engine')] + uiautomation_data,
+    datas=[('app.ico', '.'), (str(engine_exe), 'flashback_engine'),
+           ('companions/ZJ-HUB-modpack.zip', 'companions')] + uiautomation_data,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
