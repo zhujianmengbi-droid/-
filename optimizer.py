@@ -6,6 +6,7 @@
 2. 垃圾清理：清理临时文件、浏览器缓存、Windows 更新缓存等磁盘垃圾。
 """
 import ctypes
+import fnmatch
 import os
 import stat
 import subprocess
@@ -58,6 +59,7 @@ _kernel32.SetProcessWorkingSetSize.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
 _kernel32.SetProcessWorkingSetSize.restype = ctypes.c_int
 _psapi.GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
 _psapi.GetProcessMemoryInfo.restype = ctypes.c_int
+_shell32.ShellExecuteW.restype = ctypes.c_void_p
 
 # ---------------------------------------------------------------- 系统信息
 
@@ -70,10 +72,15 @@ def is_admin() -> bool:
         return False
 
 
-def restart_as_admin() -> None:
-    """UAC 提权后重新启动本程序（旧进程随即退出）。"""
-    params = " ".join(f'"{a}"' for a in sys.argv)
-    _shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+def restart_as_admin() -> bool:
+    """UAC 提权后重新启动本程序。成功拉起新进程时返回 True，用户取消或失败时返回 False。"""
+    args = sys.argv[1:] if getattr(sys, "frozen", False) else sys.argv
+    params = " ".join(f'"{a}"' for a in args)
+    try:
+        rc = _shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+        return int(rc or 0) > 32
+    except Exception:
+        return False
 
 
 def get_uptime_seconds() -> int:
@@ -172,6 +179,7 @@ class CleanTarget:
     kind: str = "files"          # files | command | recycle
     requires_admin: bool = False
     default_on: bool = True
+    patterns: tuple = ()         # 可选文件名通配符（为空时匹配目录下全部普通文件）
     scanned: int = 0             # 可清理字节数
     cleaned: int = 0             # 实际已清理字节数
     skipped: int = 0             # 因占用等原因跳过的文件数
@@ -184,6 +192,15 @@ class CleanTarget:
         self.done = False
 
 
+def _matches_patterns(fp, patterns: tuple) -> bool:
+    """判断文件名是否匹配目标通配符列表。"""
+    if not patterns:
+        return True
+    name = fp.name if hasattr(fp, "name") else os.path.basename(os.fspath(fp))
+    lower_name = name.lower()
+    return any(fnmatch.fnmatch(lower_name, pat.lower()) for pat in patterns)
+
+
 def _file_size(fp) -> int:
     """读取文件大小；支持 Path、字符串和 os.DirEntry。"""
     try:
@@ -194,7 +211,7 @@ def _file_size(fp) -> int:
         return 0
 
 
-def _iter_files(root):
+def _iter_files(root, patterns: tuple = ()):
     """迭代目录中的普通文件，避免跟随符号链接和重复构造 Path。"""
     pending = [os.fspath(root)]
     while pending:
@@ -206,7 +223,8 @@ def _iter_files(root):
                         if entry.is_dir(follow_symlinks=False):
                             pending.append(entry.path)
                         elif entry.is_file(follow_symlinks=False):
-                            yield entry
+                            if _matches_patterns(entry, patterns):
+                                yield entry
                     except OSError:
                         # 文件可能在扫描过程中被其他程序移动或删除。
                         continue
@@ -234,10 +252,11 @@ def scan_target(t: CleanTarget) -> int:
         for p in t.paths:
             kind = _path_kind(p)
             if kind == "file":
-                total += _file_size(p)
+                if _matches_patterns(p, t.patterns):
+                    total += _file_size(p)
                 continue
             if kind == "dir":
-                for entry in _iter_files(p):
+                for entry in _iter_files(p, t.patterns):
                     total += _file_size(entry)
     elif t.kind == "recycle":
         total = _recycle_bin_size()
@@ -260,14 +279,17 @@ def _delete_one(fp, t: CleanTarget) -> None:
 
 def clean_target(t: CleanTarget) -> None:
     """执行清理，占用中的文件自动跳过。"""
+    t.cleaned = 0
+    t.skipped = 0
     if t.kind == "files":
         for p in t.paths:
             kind = _path_kind(p)
             if kind == "file":
-                _delete_one(p, t)
+                if _matches_patterns(p, t.patterns):
+                    _delete_one(p, t)
                 continue
             if kind == "dir":
-                for entry in _iter_files(p):
+                for entry in _iter_files(p, t.patterns):
                     _delete_one(entry, t)
     elif t.kind == "command":
         try:
@@ -275,7 +297,7 @@ def clean_target(t: CleanTarget) -> None:
                 t.paths, capture_output=True, timeout=30,
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
-            t.cleaned = 1
+            t.cleaned = 0
         except Exception:
             t.skipped += 1
     elif t.kind == "recycle":
@@ -351,8 +373,9 @@ def build_targets() -> list:
         ),
         CleanTarget(
             key="thumb", name="缩略图缓存",
-            description="资源管理器缩略图缓存",
+            description="资源管理器缩略图缓存（保留图标缓存）",
             paths=[str(Path(local) / "Microsoft" / "Windows" / "Explorer")],
+            patterns=("thumbcache_*.db",),
         ),
         CleanTarget(
             key="dns", name="DNS 缓存",

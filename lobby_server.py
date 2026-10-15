@@ -8,10 +8,11 @@ messages or long-term chat history are stored.
 from __future__ import annotations
 
 import os
+import ipaddress
 import threading
 import time
 import uuid
-from collections import defaultdict, deque
+from collections import deque
 
 from flask import Flask, jsonify, request
 
@@ -21,13 +22,19 @@ app.config['MAX_CONTENT_LENGTH'] = 64 * 1024
 _lock = threading.RLock()
 _messages = deque(maxlen=160)
 _sessions = {}
-_rate_windows = defaultdict(deque)
+_rate_windows = {}
 _next_message_id = 1
 _SESSION_TTL = 45
 _MAX_TEXT = 240
 _MAX_SESSIONS = 2048
 _RATE_WINDOW = 10
 _RATE_LIMIT = 20
+_MAX_RATE_WINDOWS = 8192
+# Empty by default: only explicitly configured reverse proxies may supply IPs.
+app.config['TRUSTED_PROXY_NETWORKS'] = tuple(
+    ipaddress.ip_network(value.strip(), strict=False)
+    for value in os.environ.get('LOBBY_TRUSTED_PROXY_CIDRS', '').split(',') if value.strip()
+)
 
 
 def _clean(value, limit):
@@ -43,18 +50,54 @@ def _cors(response):
 
 
 def _client_key():
-    return request.headers.get('X-Forwarded-For', request.remote_addr or 'unknown').split(',')[0].strip()
+    def address(value):
+        parsed = ipaddress.ip_address(value.strip())
+        return parsed.ipv4_mapped if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped else parsed
+
+    try:
+        peer = address(request.remote_addr or '')
+    except ValueError:
+        return 'unknown'
+    trusted = app.config['TRUSTED_PROXY_NETWORKS']
+    forwarded = request.headers.get('X-Forwarded-For', '')
+    if not trusted or len(forwarded) > 2048:
+        return str(peer)
+    try:
+        hops = forwarded.split(',') if forwarded else []
+        if len(hops) > 32:
+            return str(peer)
+        chain = [address(value) for value in hops]
+    except ValueError:
+        return str(peer)
+    # Stop at the first untrusted hop, walking from the known socket peer.
+    for previous in reversed(chain):
+        if not any(peer in network for network in trusted):
+            break
+        peer = previous
+    return str(peer)
 
 
 def _allow_request(key, limit=_RATE_LIMIT):
-    now = time.time()
-    window = _rate_windows[key]
-    while window and now - window[0] >= _RATE_WINDOW:
-        window.popleft()
-    if len(window) >= limit:
-        return False
-    window.append(now)
-    return True
+    now = time.monotonic()
+    with _lock:
+        if key not in _rate_windows and len(_rate_windows) >= _MAX_RATE_WINDOWS:
+            expired_keys = [
+                k for k, q in list(_rate_windows.items())
+                if not q or now - q[-1] >= _RATE_WINDOW
+            ]
+            for k in expired_keys:
+                _rate_windows.pop(k, None)
+        if key not in _rate_windows:
+            if len(_rate_windows) >= _MAX_RATE_WINDOWS:
+                return False
+            _rate_windows[key] = deque()
+        window = _rate_windows[key]
+        while window and now - window[0] >= _RATE_WINDOW:
+            window.popleft()
+        if len(window) >= limit:
+            return False
+        window.append(now)
+        return True
 
 
 @app.after_request
@@ -100,7 +143,7 @@ def online():
         if session_id in _sessions:
             _sessions[session_id]['seen'] = time.time()
         count = _online_count_locked()
-    return jsonify({'ok': True, 'online': count})
+    return jsonify({'ok': True, 'online': count, 'online_count': count})
 
 
 @app.route('/api/messages', methods=['GET', 'POST', 'OPTIONS'])
@@ -109,55 +152,81 @@ def messages():
     if request.method == 'OPTIONS':
         return ('', 204)
     if request.method == 'POST':
-        payload = request.get_json(silent=True) or {}
-        if not _allow_request('message:' + _client_key()):
-            return jsonify({'ok': False, 'message': '请求过于频繁，请稍后再试'}), 429
-        session_id = _clean(payload.get('session_id'), 64)
-        text = _clean(payload.get('text') or payload.get('message'), _MAX_TEXT)
-        with _lock:
-            session = _sessions.get(session_id)
-            if session is None:
-                return jsonify({'ok': False, 'message': '聊天会话已过期，请重新进入大厅'}), 401
-            session['seen'] = time.time()
-            if not text:
-                return jsonify({'ok': False, 'message': '消息不能为空'}), 400
-            global _next_message_id
-            item = {
-                'id': _next_message_id,
-                'player_id': session['player_id'],
-                'text': text,
-                'message': text,
-                'created_at': int(time.time()),
-            }
-            _next_message_id += 1
-            _messages.append(item)
-        return jsonify({'ok': True, 'message': item})
-
-    try:
-        after = int(request.args.get('after', '0'))
-    except ValueError:
-        after = 0
-    session_id = _clean(request.args.get('session_id'), 64)
-    if not _allow_request('messages:' + _client_key()):
+        return _post_message()
+    if not _allow_request('read:' + _client_key(), limit=45):
         return jsonify({'ok': False, 'message': '请求过于频繁，请稍后再试'}), 429
+    session_id = _clean(request.args.get('session_id'), 64)
     with _lock:
-        session = _sessions.get(session_id)
-        if session is None:
-            return jsonify({'ok': False, 'message': '聊天会话已过期，请重新进入大厅'}), 401
-        session['seen'] = time.time()
-        items = [item for item in _messages if item['id'] > after]
+        if session_id in _sessions:
+            _sessions[session_id]['seen'] = time.time()
         online_count = _online_count_locked()
-    return jsonify({'ok': True, 'online': online_count, 'messages': items[-80:]})
+        items = list(_messages)
+    return jsonify({
+        'ok': True,
+        'online': online_count,
+        'online_count': online_count,
+        'messages': items,
+    })
+
+
+@app.route('/api/send', methods=['POST', 'OPTIONS'])
+def send():
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    return _post_message()
+
+
+def _post_message():
+    global _next_message_id
+    payload = request.get_json(silent=True) or {}
+    if not _allow_request('send:' + _client_key(), limit=8):
+        return jsonify({'ok': False, 'message': '发送过快，请稍后再试'}), 429
+    session_id = _clean(payload.get('session_id'), 64)
+    player_id = _clean(payload.get('player_id') or payload.get('username'), 32)
+    text = _clean(payload.get('message') or payload.get('text'), _MAX_TEXT)
+    if not player_id:
+        return jsonify({'ok': False, 'message': '请先设置游戏 ID'}), 400
+    if not text:
+        return jsonify({'ok': False, 'message': '消息不能为空'}), 400
+    now = time.strftime('%H:%M:%S')
+    with _lock:
+        if session_id in _sessions:
+            _sessions[session_id]['seen'] = time.time()
+            _sessions[session_id]['player_id'] = player_id
+        elif len(_sessions) < _MAX_SESSIONS:
+            _sessions[session_id or uuid.uuid4().hex] = {'player_id': player_id, 'seen': time.time()}
+        item = {
+            'id': _next_message_id,
+            'player_id': player_id,
+            'message': text,
+            'created_at': now,
+        }
+        _next_message_id += 1
+        _messages.append(item)
+        online_count = _online_count_locked()
+        items = list(_messages)
+    return jsonify({
+        'ok': True,
+        'online': online_count,
+        'online_count': online_count,
+        'message': item,
+        'messages': items,
+    })
 
 
 def _online_count_locked():
     cutoff = time.time() - _SESSION_TTL
-    expired = [key for key, value in _sessions.items() if value['seen'] < cutoff]
+    expired = [key for key, item in _sessions.items() if item.get('seen', 0) < cutoff]
     for key in expired:
         _sessions.pop(key, None)
-    return len(_sessions)
+    players = {
+        item.get('player_id')
+        for item in _sessions.values()
+        if item.get('player_id')
+    }
+    return len(players)
 
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', '10000'))
+    port = int(os.environ.get('PORT', '5000'))
     app.run(host='0.0.0.0', port=port)

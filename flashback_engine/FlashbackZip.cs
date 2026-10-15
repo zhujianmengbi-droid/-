@@ -16,12 +16,16 @@ namespace FlashbackRecorder;
 /// chunks and real per-tick position actions), icon.png for the replay browser
 /// and the level_chunk_caches stream. When the protocol adapter sidecars are
 /// present, the archive also carries the converted 1.21.11 configuration and
-/// game packets produced from a 1.20.1 capture.
+/// game packets produced from a 1.20.1 or 1.21.10 capture.
 ///
 /// A structurally valid archive is not proof that every game state was captured.
 /// </summary>
 internal static class FlashbackZip
 {
+    // A LOGIN is followed by the destination world's initial Respawn during
+    // a server transfer.  Respawns much later are ordinary deaths/respawns and
+    // must not move the transfer spawn to a later position sample.
+    const long TransferRespawnWindowTicks = 40;
     static readonly string[] Actions =
     {
         "flashback:action/next_tick",
@@ -98,7 +102,9 @@ internal static class FlashbackZip
         public int PlayerEntityId = -1;
     }
 
-    public static string Convert(string source)
+    public static string Convert(string source, string? skinCacheDirectory = null) => Convert(source, skinCacheDirectory, out _);
+
+    public static string Convert(string source, string? skinCacheDirectory, out CaptureQualityReport captureQuality)
     {
         var sourceFingerprint = Fingerprint(source);
         var meta = new MetaInfo();
@@ -156,9 +162,20 @@ internal static class FlashbackZip
             File.Exists(Path.Combine(Path.GetDirectoryName(source) ?? "", "converted.properties"))))
             throw new InvalidDataException("协议适配结果缺失、过期或属于另一条录制，请重新执行协议适配后导出。");
         if (adapted) ValidateAdaptation(source, null, verifyHashes: true);
+        captureQuality = ReadCaptureQuality(source);
         var packetSidecar = adapted ? "converted-packets.bin" : "runtime-packets.bin";
         var packets = ReadPacketSidecar(source, packetSidecar);
         var timeline = adapted ? ReadTimelineSidecar(source) : null;
+        var modernTransfers = meta.Version == "1.21.10" && meta.Format >= 5;
+        if (modernTransfers && timeline != null)
+            captureQuality = captureQuality with { CoalescedTransitionMarkers = CoalesceUnobservedRespawnMarkers(timeline, samples) };
+        var transferStates = timeline == null ? new Dictionary<TimelineRow, TransferState>()
+            : ResolveTransferStates(timeline, samples, allowMissing: modernTransfers);
+        if (modernTransfers && timeline != null)
+        {
+            var skipped = RemoveUnsampledTransitions(timeline, samples, packets, transferStates);
+            captureQuality = captureQuality with { SkippedUnsampledWorldTransitions = skipped };
+        }
         var firstTick = samples.Min(s => s.Tick);
         var lastTick = samples.Max(s => s.Tick);
         if (packets.Count > 0)
@@ -188,7 +205,6 @@ internal static class FlashbackZip
         var registrySnapshot = ReadSidecar(source, "forge_registry_snapshot.nbt");
         var initialLocalState = adapted
             ? InitialLocalState(source, meta, snapshotSample.Tick, packets) : new List<byte[]>();
-        var transferStates = timeline == null ? new Dictionary<TimelineRow, TransferState>() : ResolveTransferStates(timeline, samples);
 
         var chunk = adapted
             ? BuildAdaptedChunk(snapshotSample, meta, playerUuid, configurationPackets, gameSnapshotPackets,
@@ -206,19 +222,20 @@ internal static class FlashbackZip
         // Editor state belongs to the recording, not to an export attempt.
         // Reuse only a verified prior export of this same source.
         var replayUuid = previousOutput == null ? Guid.NewGuid() : ExistingReplayUuid(output, source, identity);
-        var metadata = BuildMetadata(source, meta, replayUuid, duration, marks, samples, firstTick, lastTick, identity, adapted);
+        var metadata = BuildMetadata(source, meta, replayUuid, duration, marks, samples, firstTick, lastTick, identity, adapted, captureQuality);
         var tempOutput = output + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {
             using (var archive = ZipFile.Open(tempOutput, ZipArchiveMode.Create))
             {
                 WriteEntry(archive, "metadata.json", Encoding.UTF8.GetBytes(metadata), CompressionLevel.Optimal);
+                WriteEntry(archive, "capture-diagnostics.json", captureQuality.ToJson(), CompressionLevel.Optimal);
                 WriteEntry(archive, "c0.flashback", chunk, CompressionLevel.Optimal);
                 WriteEntry(archive, "icon.png", BuildIconPng(), CompressionLevel.Optimal);
                 WriteEntry(archive, "level_chunk_caches/0", cache, CompressionLevel.NoCompression);
                 if (registrySnapshot is { Length: > 0 })
                     WriteEntry(archive, "forge_registry_snapshot.nbt", registrySnapshot, CompressionLevel.Optimal);
-                RecordedSkins.WriteToArchive(source, archive);
+                RecordedSkins.WriteToArchive(source, archive, skinCacheDirectory);
             }
             if (Fingerprint(source) != sourceFingerprint)
                 throw new IOException("录制文件在导出期间发生变化，未替换已有回放。");
@@ -227,14 +244,22 @@ internal static class FlashbackZip
             try { File.Move(tempOutput, output, overwrite: true); }
             catch (IOException) when (File.Exists(output))
             {
-                output = Path.Combine(Path.GetDirectoryName(output) ?? "", Path.GetFileNameWithoutExtension(output)
-                    + "-" + Guid.NewGuid().ToString("N")[..8] + ".zip");
+                var baseName = Path.GetFileName(output);
+                if (baseName.EndsWith(".flashback.zip", StringComparison.OrdinalIgnoreCase))
+                    baseName = baseName[..^".flashback.zip".Length] + "-" + Guid.NewGuid().ToString("N")[..8] + ".flashback.zip";
+                else
+                    baseName = Path.GetFileNameWithoutExtension(output) + "-" + Guid.NewGuid().ToString("N")[..8] + ".zip";
+                output = Path.Combine(Path.GetDirectoryName(output) ?? "", baseName);
                 File.Move(tempOutput, output);
             }
         }
         finally { if (File.Exists(tempOutput)) File.Delete(tempOutput); }
         return output;
     }
+
+    internal static CaptureQualityReport ReadCaptureQuality(string source) =>
+        CaptureQualityReport.FromCaptureProperties(ReadSidecar(source, "capture.properties"))
+            .WithConversionProperties(HasProtocolAdaptation(source) ? ReadSidecar(source, "converted.properties") : null);
 
     sealed record ExportIdentity(string SourceName, string SourceSha256, string ChunkSha256, string CacheSha256);
 
@@ -290,8 +315,10 @@ internal static class FlashbackZip
     }
 
     const string ReplayPlayerFile = "replay-player.properties";
-    static readonly string[] CaptureFiles = { "snapshot-packets.bin", "snapshot-chunks.bin", "snapshot-entities.bin",
-        "snapshot-world.bin", "runtime-packets.bin", "forge_registry_snapshot.nbt", "capture.properties", ReplayPlayerFile };
+    const string RecordedSkinManifest = "recorded-skins.json";
+    const string RuntimeConfigurations = "runtime-configurations.bin";
+    static readonly string[] CaptureFiles = { "snapshot-config.bin", "snapshot-packets.bin", "snapshot-chunks.bin", "snapshot-entities.bin",
+        "snapshot-world.bin", "runtime-packets.bin", RuntimeConfigurations, "forge_registry_snapshot.nbt", "capture.properties", RecordedSkinManifest, ReplayPlayerFile };
     static readonly string[] ConvertedFiles = { "converted.properties", "converted-config.bin",
         "converted-game-snapshot.bin", "converted-chunks.bin", "converted-entities.bin", "converted-packets.bin" };
     static readonly string[] OptionalConvertedFiles = { "converted-world.bin", "converted-timeline.bin" };
@@ -335,6 +362,17 @@ internal static class FlashbackZip
             if (!manifest.Files.ContainsKey(name)) throw new InvalidDataException("协议适配结果缺少 " + name);
         foreach (var name in new[] { "snapshot-packets.bin", "snapshot-chunks.bin" })
             if (!manifest.Files.ContainsKey(name)) throw new InvalidDataException("协议适配输入缺少 " + name);
+        if (ReadSourceProtocol(source) == 773)
+        {
+            if (!manifest.Files.TryGetValue("snapshot-config.bin", out var config) || config is null || config.Length <= 0)
+                throw new InvalidDataException("1.21.10 协议适配缺少配置注册表快照。");
+            var properties = File.ReadAllLines(Path.Combine(dir, "converted.properties"));
+            if (!properties.Contains("sourceProtocol=773") || !properties.Contains("targetProtocol=774"))
+                throw new InvalidDataException("1.21.10 协议适配版本不匹配。");
+            if (ValidateClosedModernCapture(dir) && !manifest.Files.ContainsKey(RuntimeConfigurations))
+                throw new InvalidDataException("格式 5 协议适配输入缺少转服配置文件指纹，请重新适配。");
+            VerifyCurrentModernSidecars(source, manifest.Files, verifyHashes);
+        }
         if (manifest.Files.ContainsKey("snapshot-world.bin") && !manifest.Files.ContainsKey("converted-world.bin"))
             throw new InvalidDataException("协议适配结果缺少初始计分板、时间与天气数据");
         if (File.ReadLines(Path.Combine(dir, "converted.properties")).Any(line => line.Trim() == "timelineFormat=1")
@@ -357,6 +395,20 @@ internal static class FlashbackZip
             throw new InvalidDataException("录制或转换文件已改变，请重新适配：" + Path.GetFileName(path));
     }
 
+    static void VerifyCurrentModernSidecars(string source, Dictionary<string, FileFingerprint> files, bool verifyHashes)
+    {
+        // The immutable cache remains usable after the raw sidecar was removed.
+        // While present, late flushes must invalidate older profiles/configuration.
+        foreach (var name in new[] { RecordedSkinManifest, RuntimeConfigurations, "capture.properties" })
+        {
+            var raw = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(source))!, name);
+            if (!File.Exists(raw)) continue;
+            if (!files.TryGetValue(name, out var expected) || expected is null)
+                throw new InvalidDataException("协议适配输入缺少当前录制的采集文件，请重新适配：" + name);
+            VerifyFile(raw, expected, verifyHashes);
+        }
+    }
+
     static void CheckCaptureOwnership(string source)
     {
         var dir = Path.GetDirectoryName(Path.GetFullPath(source))!;
@@ -373,36 +425,76 @@ internal static class FlashbackZip
         }
         // Older agents overwrote sidecars in one session directory. Only its
         // latest recording can still own those files; an older FBRL cannot be recovered by guessing.
-        if (Directory.EnumerateFiles(dir, "*.fbrl").Any(path => !Path.GetFullPath(path).Equals(info.FullName,
+        var captures = Directory.EnumerateFiles(dir, "*.fbrl").ToArray();
+        var format5 = ValidateClosedModernCapture(dir);
+        if (captures.Any(path => !Path.GetFullPath(path).Equals(info.FullName,
                 StringComparison.OrdinalIgnoreCase) && File.GetLastWriteTimeUtc(path) > info.LastWriteTimeUtc))
             throw new InvalidDataException("旧会话的采集文件已被下一次录制覆盖，不能用于这条旧录制。请使用已导出的回放或重新录制。");
+        if (format5 || File.Exists(Path.Combine(dir, RecordedSkinManifest)))
+        {
+            if (captures.Length != 1 || !Path.GetFullPath(captures[0]).Equals(info.FullName, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("皮肤清单必须位于这条录制独占的目录，不能复用共享会话中的皮肤。");
+            if (!recordedStartUtc.HasValue)
+                throw new InvalidDataException("录制缺少开始时间，无法验证皮肤清单是否属于这次录制。");
+        }
         foreach (var name in CaptureFiles)
         {
             if (name == ReplayPlayerFile) continue; // Derived from the FBRL, never adopted from shared sidecars.
             var sidecar = new FileInfo(Path.Combine(dir, name));
             // Stop appends diagnostics after closing the FBRL. If the player
             // left the world earlier, the trace's last write can be much older.
-            if (sidecar.Exists && name != "capture.properties" && sidecar.LastWriteTimeUtc > info.LastWriteTimeUtc.AddSeconds(2))
+            var closedDynamicFile = format5 && name is "runtime-packets.bin" or RuntimeConfigurations;
+            if (sidecar.Exists && name != "capture.properties" && name != RecordedSkinManifest && !closedDynamicFile
+                && sidecar.LastWriteTimeUtc > info.LastWriteTimeUtc.AddSeconds(2))
                 throw new InvalidDataException("采集文件比录制更新，可能仍在录制或已被覆盖：" + name);
             if (sidecar.Exists && recordedStartUtc.HasValue && sidecar.LastWriteTimeUtc < recordedStartUtc.Value.AddSeconds(-2))
                 throw new InvalidDataException("采集文件早于这次录制，可能是上次快照残留：" + name);
         }
     }
 
-    public static (bool Ok, string Text) RunProtocolAdapter(string source, string javaPath, string adapterJar)
+    static bool ValidateClosedModernCapture(string directory)
     {
+        var file = Path.Combine(directory, "capture.properties");
+        if (!File.Exists(file)) return false;
+        var properties = File.ReadLines(file).Select(line => line.Trim().Split('=', 2))
+            .Where(parts => parts.Length == 2).GroupBy(parts => parts[0])
+            .ToDictionary(group => group.Key, group => group.Last()[1]);
+        if (properties.GetValueOrDefault("captureFormat") != "5") return false;
+        if (properties.GetValueOrDefault("captureClosed") != "true")
+            throw new InvalidDataException("录制文件尚未完成收尾，请停止录制后再导出。");
+        if (!File.Exists(Path.Combine(directory, RuntimeConfigurations)))
+            throw new InvalidDataException("格式 5 录制缺少转服配置文件：" + RuntimeConfigurations);
+        return true;
+    }
+
+    public static (bool Ok, string Text) RunProtocolAdapter(string source, string javaPath, string adapterJar)
+        => RunProtocolAdapterAsync(source, javaPath, adapterJar).GetAwaiter().GetResult();
+
+    public static async Task<(bool Ok, string Text)> RunProtocolAdapterAsync(string source, string javaPath,
+        string adapterJar, CancellationToken cancellation = default)
+    {
+        cancellation.ThrowIfCancellationRequested();
         if (!File.Exists(javaPath)) return (false, "Java 17+ 不存在");
         if (!File.Exists(adapterJar)) return (false, "协议适配器组件不存在");
         string? staging = null;
         try
         {
-            if (HasProtocolAdaptation(source, adapterJar)
+            var existingInput = HasProtocolAdaptation(source) ? AdaptationDirectory(source) : null;
+            // Size/mtime checks above are cheap for UI polling; on the worker,
+            // also rebuild if a raw skin manifest changed without a timestamp change.
+            if (existingInput != null && ReadSourceProtocol(source) == 773)
+                foreach (var name in new[] { RecordedSkinManifest, RuntimeConfigurations, "capture.properties" })
+                {
+                    var raw = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(source))!, name);
+                    if (File.Exists(raw) && Fingerprint(raw) != Fingerprint(Path.Combine(existingInput, name)))
+                    { existingInput = null; break; }
+                }
+            if (existingInput != null && HasProtocolAdaptation(source, adapterJar)
                 && File.Exists(Path.Combine(AdaptationDirectory(source), ReplayPlayerFile)))
             {
                 ValidateAdaptation(source, adapterJar, verifyHashes: true);
                 return (true, "已验证此录制专用的协议适配结果");
             }
-            var existingInput = HasProtocolAdaptation(source) ? AdaptationDirectory(source) : null;
             // Rebuilding with a new adapter can use a previous immutable copy
             // even if a legacy agent has overwritten the shared session sidecars.
             if (existingInput != null) ValidateAdaptation(source, null, verifyHashes: true);
@@ -414,6 +506,7 @@ internal static class FlashbackZip
             Directory.CreateDirectory(staging);
             foreach (var name in CaptureFiles)
             {
+                cancellation.ThrowIfCancellationRequested();
                 if (name == ReplayPlayerFile) continue;
                 var input = Path.Combine(inputDir, name);
                 if (File.Exists(input))
@@ -437,10 +530,14 @@ internal static class FlashbackZip
             };
             psi.ArgumentList.Add("-cp");
             psi.ArgumentList.Add(adapterJar);
-            psi.ArgumentList.Add("FlashbackProtocolAdapter");
+            var sourceProtocol = ReadSourceProtocol(source);
+            if (sourceProtocol == 773 && (!File.Exists(Path.Combine(staging, "snapshot-config.bin"))
+                || new FileInfo(Path.Combine(staging, "snapshot-config.bin")).Length == 0))
+                throw new InvalidDataException("1.21.10 录制缺少配置注册表快照，不能安全转换。");
+            psi.ArgumentList.Add(sourceProtocol == 773 ? "ModernFlashbackProtocolAdapter" : "FlashbackProtocolAdapter");
             psi.ArgumentList.Add(staging);
-            var result = RunAdapterProcess(psi, 120000);
-            if (result.ExitCode != 0) return (false, result.Text);
+            var result = await ChildProcess.RunAsync(psi, TimeSpan.FromSeconds(120), cancellation).ConfigureAwait(false);
+            if (result.ExitCode != 0) return (false, result.Output);
             if (Fingerprint(source) != before)
                 throw new IOException("转换期间录制文件发生变化，请停止录制后重试");
             foreach (var name in ConvertedFiles)
@@ -454,7 +551,7 @@ internal static class FlashbackZip
                 .FirstOrDefault(line => line.StartsWith("dynamicPacketErrors=", StringComparison.Ordinal));
             if (errorProperty != null && int.TryParse(errorProperty[(errorProperty.IndexOf('=') + 1)..], out var packetErrors)
                 && packetErrors > 0)
-                throw new InvalidDataException($"协议转换有 {packetErrors} 个动态数据包失败，未发布不完整回放。\n" + result.Text);
+                throw new InvalidDataException($"协议转换有 {packetErrors} 个动态数据包失败，未发布不完整回放。\n" + result.Output);
             foreach (var name in new[] { "converted-config.bin", "converted-game-snapshot.bin", "converted-chunks.bin" })
                 if (EnumerateFramedPayloads(File.ReadAllBytes(Path.Combine(staging, name))).Count() == 0)
                     throw new InvalidDataException("适配器生成的世界数据为空：" + name);
@@ -466,9 +563,11 @@ internal static class FlashbackZip
                 _ = ReadTimelineSidecarAt(Path.Combine(staging, "converted-timeline.bin"));
             var fingerprints = CaptureFiles.Concat(ConvertedFiles).Concat(OptionalConvertedFiles).Where(name => File.Exists(Path.Combine(staging, name)))
                 .ToDictionary(name => name, name => Fingerprint(Path.Combine(staging, name)));
+            if (sourceProtocol == 773) VerifyCurrentModernSidecars(source, fingerprints, verifyHashes: true);
             var manifest = new AdaptationManifest(AdaptationManifestVersion, Path.GetFileName(source), before, adapterHash, fingerprints);
             File.WriteAllText(Path.Combine(staging, "manifest.json"), JsonSerializer.Serialize(manifest));
             var destination = AdaptationDirectory(source);
+            cancellation.ThrowIfCancellationRequested();
             // Keep any previous successful conversion until the replacement is ready.
             var previous = Directory.Exists(destination) ? destination + ".previous-" + Guid.NewGuid().ToString("N") : null;
             if (previous != null) Directory.Move(destination, previous);
@@ -480,8 +579,9 @@ internal static class FlashbackZip
                 catch (IOException) { /* Successful replacement remains valid if old files are still open. */ }
                 catch (UnauthorizedAccessException) { }
             }
-            return (true, result.Text);
+            return (true, result.Output);
         }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { throw; }
         catch (Exception ex) { return (false, ex.Message); }
         finally
         {
@@ -493,6 +593,26 @@ internal static class FlashbackZip
                 catch (UnauthorizedAccessException) { }
             }
         }
+    }
+
+    static int ReadSourceProtocol(string source)
+    {
+        var first = File.ReadLines(source).FirstOrDefault(line => !string.IsNullOrWhiteSpace(line))
+            ?? throw new InvalidDataException("FBRL 没有录制元数据。");
+        using var document = JsonDocument.Parse(first);
+        var meta = document.RootElement;
+        if (GetString(meta, "type", "") != "meta")
+            throw new InvalidDataException("FBRL 缺少开头的录制元数据。");
+        var version = GetString(meta, "version", "");
+        var expected = version switch { "1.20.1" => 763, "1.21.10" => 773, _ => -1 };
+        if (expected < 0)
+            throw new InvalidDataException($"尚不支持录制版本 {version}，已保留原录制。");
+        var protocol = GetInt(meta, "protocolVersion", expected);
+        if (protocol is not (763 or 773))
+            throw new InvalidDataException($"尚不支持源协议 {protocol}，已保留原录制。");
+        if (protocol != expected)
+            throw new InvalidDataException($"录制版本 {version} 与源协议 {protocol} 不一致，已保留原录制。");
+        return protocol;
     }
 
     static void WriteReplayPlayerIdentity(string source, string destination)
@@ -519,26 +639,12 @@ internal static class FlashbackZip
                 "sourcePlayerId=" + sourcePlayerId.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\n"
                 + "playerUuid=" + playerUuid.ToString("D") + "\n"
                 + "playerNameBase64=" + System.Convert.ToBase64String(Encoding.UTF8.GetBytes(playerName)) + "\n"
-                + "gametype=" + Math.Clamp(GetInt(meta, "gametype", 0), 0, 3).ToString(System.Globalization.CultureInfo.InvariantCulture) + "\n",
+                + "gametype=" + Math.Clamp(GetInt(meta, "gametype", 0), 0, 3).ToString(System.Globalization.CultureInfo.InvariantCulture) + "\n"
+                + "sourceProtocol=" + ReadSourceProtocol(source).ToString(System.Globalization.CultureInfo.InvariantCulture) + "\n",
                 new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
             return;
         }
         throw new InvalidDataException("FBRL 没有录制元数据。");
-    }
-
-    internal static (int ExitCode, string Text) RunAdapterProcess(ProcessStartInfo psi, int timeoutMilliseconds)
-    {
-        using var process = Process.Start(psi) ?? throw new IOException("无法启动协议适配器");
-        var stdout = process.StandardOutput.ReadToEndAsync();
-        var stderr = process.StandardError.ReadToEndAsync();
-        if (!process.WaitForExit(timeoutMilliseconds))
-        {
-            try { process.Kill(entireProcessTree: true); } catch (InvalidOperationException) { }
-            process.WaitForExit(5000);
-            return (-1, "协议适配器超时，转换已停止；原录制文件已保留。");
-        }
-        if (!Task.WhenAll(stdout, stderr).Wait(5000)) return (-1, "协议适配器输出未关闭，原录制文件已保留。");
-        return (process.ExitCode, (stdout.Result + "\n" + stderr.Result).Trim());
     }
 
     // ---------------------------------------------------------------- chunk
@@ -617,25 +723,178 @@ internal static class FlashbackZip
         return (data[0], dimension);
     }
 
-    static Dictionary<TimelineRow, TransferState> ResolveTransferStates(List<TimelineRow> timeline, List<SampleRow> samples)
+    static int CoalesceUnobservedRespawnMarkers(List<TimelineRow> timeline, List<SampleRow> samples)
+    {
+        bool VerifiedBoundary(int index)
+        {
+            if (index == 0 || timeline[index - 1].Kind != 0 || timeline[index - 1].Tick != timeline[index].Tick)
+                return false;
+            var previous = index - 1;
+            var id = PacketId(timeline[previous].Data);
+            if (id == 80) return TryReadRespawnDimension(timeline[previous].Data, out var dimension)
+                && dimension == ParseTransferMarker(timeline[index].Data).Dimension;
+            // The modern adapter inserts one local PlayerInfo immediately after LOGIN.
+            if (id == 68 && previous > 0) previous--;
+            if (timeline[previous].Kind != 0 || PacketId(timeline[previous].Data) != 48
+                || timeline[previous].Tick != timeline[index].Tick) return false;
+            return previous > 0 && timeline[previous - 1].Kind == 1
+                && timeline[previous - 1].Tick == timeline[index].Tick;
+        }
+        var count = 0;
+        for (var i = 0; i + 2 < timeline.Count; i++)
+        {
+            var marker = timeline[i]; var respawn = timeline[i + 1]; var destination = timeline[i + 2];
+            if (marker.Kind != 2 || respawn.Kind != 0 || destination.Kind != 2
+                || respawn.Tick < marker.Tick || respawn.Tick != destination.Tick || !VerifiedBoundary(i)
+                || samples.Any(sample => sample.Tick > marker.Tick && sample.Tick < respawn.Tick)
+                || !TryReadRespawnDimension(respawn.Data, out var dimension)
+                || dimension != ParseTransferMarker(destination.Data).Dimension) continue;
+            // LOGIN -> Respawn (and proxy dummy-dimension Respawns) may be one
+            // unobserved transition even if packet handling crosses tick boundaries.
+            // Require no intervening sample or real packet; no elapsed-time
+            // threshold can establish that invariant. Preserve the actual ticks
+            // and every real packet in order, and create
+            // the local entity only after the final Respawn, using its actual
+            // later destination sample. No world packet may intervene here.
+            timeline.RemoveAt(i);
+            count++;
+        }
+        return count;
+    }
+
+    static Dictionary<TimelineRow, TransferState> ResolveTransferStates(List<TimelineRow> timeline, List<SampleRow> samples, bool allowMissing = false)
     {
         var result = new Dictionary<TimelineRow, TransferState>();
-        var markers = timeline.Where(row => row.Kind == 2).ToList();
+        // Keep the source position of each marker.  A transfer marker and the
+        // following Respawn packet can share a tick, and ordering between the
+        // recorder's sample queue and packet queue is not stable enough to
+        // recover that relationship from ticks alone.
+        var markers = timeline.Select((row, index) => (row, index))
+            .Where(item => item.row.Kind == 2).ToList();
         for (var i = 0; i < markers.Count; i++)
         {
-            var marker = markers[i];
+            var marker = markers[i].row;
             var (gametype, dimension) = ParseTransferMarker(marker.Data);
-            var nextTransition = i + 1 < markers.Count ? markers[i + 1].Tick : long.MaxValue;
+            var nextTransition = i + 1 < markers.Count ? markers[i + 1].row.Tick : long.MaxValue;
+            var sampleAfter = marker.Tick;
+            // A LOGIN alone does not mean the client has entered the new
+            // server world.  On a repeated transfer to the same dimension the
+            // first samples after LOGIN may still be flushed from the old
+            // level.  A matching-dimension Respawn is the earliest ordered
+            // boundary we have in the converted stream; require a strictly
+            // later sample.  A Respawn into another dimension belongs to a
+            // later in-server world change and must not delay this marker.
+            for (var j = markers[i].index + 1; j < timeline.Count; j++)
+            {
+                var row = timeline[j];
+                if (row.Tick >= nextTransition || row.Kind == 2
+                    || row.Tick - marker.Tick > TransferRespawnWindowTicks) break;
+                if (row.Kind != 0) continue;
+                var cursor = 0;
+                if (ReadPacketVarInt(row.Data, ref cursor) == 80
+                    && TryReadRespawnDimension(row.Data, out var respawnDimension)
+                    && respawnDimension == dimension)
+                {
+                    sampleAfter = Math.Max(sampleAfter, row.Tick);
+                    break;
+                }
+            }
             // Samples and queued packets are flushed by different parts of the
-            // recorder loop, so same-tick JSON ordering is not proof of which
-            // world the sample belongs to. Require an observed later sample.
-            var sample = samples.FirstOrDefault(row => row.Tick > marker.Tick && row.Tick < nextTransition
+            // recorder loop, so a later sample is preferred.  At a fast sample
+            // rate the first destination sample can land on the exact Respawn
+            // tick, however, and the next sample may already belong to the
+            // following transfer.  Accept that same-tick sample only when we
+            // observed a matching Respawn boundary; without it, same-tick data
+            // could still be a stale sample from the old world.
+            var sample = samples.FirstOrDefault(row => row.Tick > sampleAfter && row.Tick < nextTransition
                 && TryDimensionKey(row.Dimension, out var key) && key == dimension);
+            if (sample == null && sampleAfter > marker.Tick)
+                sample = samples.FirstOrDefault(row => row.Tick == sampleAfter && row.Tick < nextTransition
+                    && TryDimensionKey(row.Dimension, out var key) && key == dimension);
             if (sample == null)
-                throw new InvalidDataException($"tick {marker.Tick} 转入 {dimension} 后，没有在下一次转场前采到该世界的人物位置；原录制保留。");
+            {
+                if (allowMissing) continue;
+                throw new InvalidDataException($"tick {marker.Tick} 转入 {dimension} 后，没有在 Respawn 边界之后、下一次转场之前采到该世界的人物位置；原录制保留。");
+            }
             result.Add(marker, new TransferState(sample, dimension, gametype));
         }
         return result;
+    }
+
+    static int RemoveUnsampledTransitions(List<TimelineRow> timeline, List<SampleRow> samples,
+        List<PacketRow> packets, Dictionary<TimelineRow, TransferState> states)
+    {
+        var markers = timeline.Select((row, index) => (row, index)).Where(item => item.row.Kind == 2).ToArray();
+        if (markers.All(item => states.ContainsKey(item.row))) return 0;
+        int FullConfigurationStart(int i)
+        {
+            var previous = i == 0 ? -1 : markers[i - 1].index;
+            var join = -1;
+            for (var j = markers[i].index - 1; j > previous; j--)
+                if (timeline[j].Kind == 0 && PacketId(timeline[j].Data) == 48)
+                { join = j; break; }
+            if (join < 0 || timeline[join].Tick != markers[i].row.Tick) return -1;
+            return timeline.FindIndex(previous + 1, join - previous - 1,
+                row => row.Kind == 1 && row.Tick == markers[i].row.Tick);
+        }
+        int RemovalStart(int i)
+        {
+            var start = FullConfigurationStart(i);
+            if (start >= 0) return start;
+            // Ordinary Respawn has no configuration phase. Its packet is the
+            // ordered boundary, but a subsequent Respawn alone cannot restore
+            // chunks/entities discarded with this incomplete world segment.
+            var previous = markers[i].index - 1;
+            if (previous >= 0 && timeline[previous].Kind == 0
+                && timeline[previous].Tick == markers[i].row.Tick
+                && TryReadRespawnDimension(timeline[previous].Data, out var dimension)
+                && dimension == ParseTransferMarker(markers[i].row.Data).Dimension)
+                return previous;
+            throw new InvalidDataException("未采样转服缺少可验证的配置登录或重生边界，不能安全保留后续片段；原录制已保留。");
+        }
+        var ranges = new List<(int Start, int End, long FromTick, long ToTick)>();
+        var skipped = 0;
+        // Remove complete configuration/world segments, never just their local-player marker.
+        // A later retained world starts with its own complete config and LOGIN.
+        for (var i = 0; i < markers.Length; i++)
+        {
+            if (states.ContainsKey(markers[i].row)) continue;
+            var start = RemovalStart(i);
+            var next = i + 1;
+            var end = timeline.Count;
+            for (; next < markers.Length; next++)
+                if (states.ContainsKey(markers[next].row) && FullConfigurationStart(next) is var resume && resume >= 0)
+                { end = resume; break; }
+            ranges.Add((start, end, timeline[start].Tick, next < markers.Length ? timeline[end].Tick : long.MaxValue));
+            skipped += next - i;
+            i = next - 1;
+        }
+        foreach (var range in ranges.AsEnumerable().Reverse())
+        {
+            timeline.RemoveRange(range.Start, range.End - range.Start);
+            samples.RemoveAll(row => row.Tick >= range.FromTick && row.Tick < range.ToTick);
+            packets.RemoveAll(row => row.Tick >= range.FromTick && row.Tick < range.ToTick);
+        }
+        if (samples.Count == 0) throw new InvalidDataException("未采到任何已完成世界的人物位置，不能生成回放；原录制已保留。");
+        return skipped;
+    }
+
+    static int PacketId(byte[] packet) { var cursor = 0; return ReadPacketVarInt(packet, ref cursor); }
+
+    static bool TryReadRespawnDimension(byte[] data, out string dimension)
+    {
+        dimension = "";
+        var cursor = 0;
+        if (ReadPacketVarInt(data, ref cursor) != 80) return false;
+        // The adapted 1.21 play Respawn packet starts with the dimension type
+        // registry id, followed by the destination dimension resource key.
+        ReadPacketVarInt(data, ref cursor);
+        var length = ReadPacketVarInt(data, ref cursor);
+        if (length <= 0 || length > data.Length - cursor)
+            throw new InvalidDataException("Respawn 数据包的维度长度无效。");
+        try { dimension = new UTF8Encoding(false, true).GetString(data, cursor, length); }
+        catch (DecoderFallbackException ex) { throw new InvalidDataException("Respawn 数据包的维度不是有效 UTF-8。", ex); }
+        return TryDimensionKey(dimension, out var key) && key == dimension;
     }
 
     static List<byte[]> InitialLocalState(string source, MetaInfo meta, long firstSampleTick, List<PacketRow> packets)
@@ -643,9 +902,9 @@ internal static class FlashbackZip
         var properties = Encoding.UTF8.GetString(ReadSidecar(source, "capture.properties") ?? Array.Empty<byte>())
             .Split('\n').Select(line => line.TrimEnd('\r').Split('=', 2)).Where(parts => parts.Length == 2)
             .GroupBy(parts => parts[0]).ToDictionary(group => group.Key, group => group.Last()[1]);
-        if (properties.GetValueOrDefault("captureFormat") != "4") return new List<byte[]>();
+        if (properties.GetValueOrDefault("captureFormat") is not ("4" or "5")) return new List<byte[]>();
         if (properties.GetValueOrDefault("localHotbarSlots") != "true")
-            throw new InvalidDataException("格式 4 录制缺少本地快捷栏采集标记，不能可靠重建首帧。");
+            throw new InvalidDataException("格式 4/5 录制缺少本地快捷栏采集标记，不能可靠重建首帧。");
         var start = -1;
         for (var i = 0; i < packets.Count; i++)
         {
@@ -833,6 +1092,10 @@ internal static class FlashbackZip
             }
             foreach (var packet in EnumerateFramedPayloads(configurationPackets))
                 snapshotRecords.Add(BuildRecord(AdaptedIdConfigurationPacket, packet));
+            // Register the local profile before rewriting any snapshot packet.
+            // A PlayerInfoRemove can legally precede the first AddEntity; the
+            // rewriter must still recognize our UUID as the local profile.
+            playerInfos.SetLocalPlayer(entityId, playerUuid, snapshot.Dimension);
             var initialGamePackets = EnumerateFramedPayloads(gameSnapshotPackets).ToList();
             var allRecordedDimensions = byTick.Values.SelectMany(rows => rows).Select(row => row.Dimension)
                 .Concat(timeline is null ? Enumerable.Empty<string>() : timeline
@@ -872,8 +1135,14 @@ internal static class FlashbackZip
                 foreach (var normalized in playerInfos.Rewrite(packet))
                     writer.Write(BuildRecord(AdaptedIdGamePacket, normalized));
                 var cursor = 0;
-                if (ReadPacketVarInt(packet, ref cursor) == 48)
+                if (timeline is not null && ReadPacketVarInt(packet, ref cursor) == 48)
                 {
+                    // Force the local entity to be recreated when a server
+                    // reuses its id. RemoveEntities discards the current
+                    // level's entity; CreateLocalPlayer then spawns it again.
+                    var remove = BuildRemoveEntities(entityId);
+                    foreach (var normalized in playerInfos.Rewrite(remove))
+                        writer.Write(BuildRecord(AdaptedIdGamePacket, normalized));
                     foreach (var reset in scoreboardResets) writer.Write(BuildRecord(AdaptedIdGamePacket, reset));
                     foreach (var reset in destructionResets) writer.Write(BuildRecord(AdaptedIdGamePacket, reset));
                     writer.Write(BuildRecord(AdaptedIdGamePacket, new byte[] { 117, 0 }));
@@ -1090,11 +1359,17 @@ internal static class FlashbackZip
         const int PlayerEntityType = 155; // EntityTypes1_21_11.PLAYER
         readonly Dictionary<int, Guid> entities = new();
         readonly HashSet<Guid> deferred = new();
+        // Keep the local profile known across LOGIN.  Flashback clears its
+        // entity map while rebuilding a transferred world, but a remove packet
+        // from the old connection can arrive before CreateLocalPlayer.
+        Guid profileUuid;
+        bool hasProfile;
         int localId = -1;
         string dimension = "";
 
         public void SetLocalPlayer(int id, Guid uuid, string world)
         {
+            profileUuid = uuid; hasProfile = true;
             localId = id; entities[id] = uuid;
             dimension = TryDimensionKey(world, out var key) ? key : "";
         }
@@ -1129,7 +1404,8 @@ internal static class FlashbackZip
                 for (var i = 0; i < count; i++)
                 {
                     var uuid = ReadNetworkUuid(packet, ref cursor);
-                    if (entities.ContainsValue(uuid)) { deferred.Add(uuid); hidden.Add(uuid); }
+                    if ((hasProfile && uuid == profileUuid) || entities.ContainsValue(uuid))
+                    { deferred.Add(uuid); hidden.Add(uuid); }
                     else { deferred.Remove(uuid); removed.Add(uuid); }
                 }
                 if (cursor != packet.Length) throw new InvalidDataException("玩家资料移除列表存在多余数据。");
@@ -1163,7 +1439,10 @@ internal static class FlashbackZip
             // live entity's profile. A subsequent ADD_PLAYER cancels old removal.
             if (id is 1 or 75 or 80)
             {
-                var removed = deferred.Where(uuid => !entities.ContainsValue(uuid)).OrderBy(uuid => uuid).ToArray();
+                // Our own profile must also survive the gap between LOGIN
+                // and CreateLocalPlayer, when no local entity is registered.
+                var removed = deferred.Where(uuid => !(hasProfile && uuid == profileUuid)
+                    && !entities.ContainsValue(uuid)).OrderBy(uuid => uuid).ToArray();
                 foreach (var uuid in removed) deferred.Remove(uuid);
                 if (removed.Length > 0) yield return PlayerInfoPacket(removed, hide: false);
             }
@@ -1303,6 +1582,17 @@ internal static class FlashbackZip
         return stream.ToArray();
     }
 
+    static byte[] BuildRemoveEntities(int entityId)
+    {
+        using var stream = new MemoryStream();
+        using var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
+        WriteVarInt(writer, 75); // ClientboundRemoveEntities
+        WriteVarInt(writer, 1);
+        WriteVarInt(writer, entityId);
+        writer.Flush();
+        return stream.ToArray();
+    }
+
     static byte[] BuildRecord(int actionId, byte[] payload)
     {
         using var stream = new MemoryStream();
@@ -1407,7 +1697,8 @@ internal static class FlashbackZip
     // -------------------------------------------------------------- metadata
 
     static string BuildMetadata(string source, MetaInfo meta, Guid uuid, int duration, List<MarkRow> marks,
-        List<SampleRow> samples, long firstTick, long lastTick, ExportIdentity identity, bool adapted = false)
+        List<SampleRow> samples, long firstTick, long lastTick, ExportIdentity identity, bool adapted,
+        CaptureQualityReport quality)
     {
         var version = adapted ? "1.21.11" : (string.IsNullOrWhiteSpace(meta.Version) ? "1.20.1" : meta.Version);
         var (dataVersion, protocolVersion) = adapted ? (4671, 774) : ResolveVersion(version, meta);
@@ -1430,6 +1721,17 @@ internal static class FlashbackZip
             writer.WriteString("source_sha256", identity.SourceSha256);
             writer.WriteString("chunk_sha256", identity.ChunkSha256);
             writer.WriteString("cache_sha256", identity.CacheSha256);
+            writer.WritePropertyName("quality");
+            writer.WriteStartObject();
+            writer.WriteBoolean("available", quality.Available);
+            writer.WriteString("status", quality.Status);
+            writer.WriteBoolean("complete", quality.IsComplete);
+            writer.WriteBoolean("hasDataLoss", quality.HasDataLoss);
+            writer.WriteBoolean("hasCompatibilityLimitations", quality.HasCompatibilityLimitations);
+            writer.WriteNumber("packetErrors", quality.PacketErrors);
+            writer.WriteNumber("packetDrops", quality.PacketDrops);
+            writer.WriteNumber("packetSkippedCustomPayload", quality.PacketSkippedCustomPayload);
+            writer.WriteEndObject();
             writer.WriteEndObject();
             WriteMarkers(writer, marks, samples, firstTick, lastTick);
             writer.WritePropertyName("chunks");
@@ -1458,7 +1760,7 @@ internal static class FlashbackZip
         if (marks.Count == 0 || samples.Count == 0) return;
         writer.WritePropertyName("markers");
         writer.WriteStartObject();
-        var written = 0;
+        var grouped = new Dictionary<long, (SampleRow Position, List<string> Names)>();
         foreach (var mark in marks)
         {
             if (string.IsNullOrWhiteSpace(mark.Name)) continue;
@@ -1470,8 +1772,20 @@ internal static class FlashbackZip
                 if (delta < best) { best = delta; nearest = sample; }
             }
             var tick = Math.Clamp(nearest.Tick, firstTick, lastTick);
+            var offset = Math.Max(0L, tick - firstTick);
+            if (!grouped.TryGetValue(offset, out var group))
+            {
+                if (grouped.Count >= 100) continue;
+                group = (nearest, new List<string>());
+                grouped.Add(offset, group);
+            }
+            if (!group.Names.Contains(mark.Name)) group.Names.Add(mark.Name);
+        }
+        foreach (var (offset, group) in grouped.OrderBy(entry => entry.Key))
+        {
+            var nearest = group.Position;
             var dimension = TryDimensionKey(nearest.Dimension, out var parsed) ? parsed : "minecraft:overworld";
-            writer.WritePropertyName((tick - firstTick).ToString(System.Globalization.CultureInfo.InvariantCulture));
+            writer.WritePropertyName(offset.ToString(System.Globalization.CultureInfo.InvariantCulture));
             writer.WriteStartObject();
             writer.WriteNumber("colour", MarkerColour);
             writer.WritePropertyName("position");
@@ -1484,12 +1798,10 @@ internal static class FlashbackZip
             writer.WriteEndArray();
             writer.WriteString("dimension", dimension);
             writer.WriteEndObject();
-            writer.WriteString("description", mark.Name);
+            writer.WriteString("description", string.Join(" / ", group.Names));
             writer.WritePropertyName("event");
             writer.WriteNullValue();
             writer.WriteEndObject();
-            written++;
-            if (written >= 100) break;
         }
         writer.WriteEndObject();
     }
@@ -1502,6 +1814,7 @@ internal static class FlashbackZip
     {
         if (meta.DataVersion > 0 && meta.ProtocolVersion > 0) return (meta.DataVersion, meta.ProtocolVersion);
         var normalized = version.Trim();
+        if (normalized == "1.21.10") return (4556, 773);
         if (normalized.StartsWith("1.20.1")) return (3465, 763);
         if (normalized.StartsWith("1.20.2")) return (3578, 764);
         if (normalized.StartsWith("1.20.3")) return (3698, 765);

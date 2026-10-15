@@ -18,6 +18,8 @@ import tempfile
 import wave
 import subprocess
 import shutil
+import threading
+import queue
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from functools import lru_cache
@@ -26,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QByteArray, QEasingCurve, QPropertyAnimation, QSettings, QThread, QTimer, QSize, Qt, QRectF, QPoint, QUrl, Signal, QEvent, QObject, QProcess,
+    QByteArray, QEasingCurve, QPropertyAnimation, QSettings, QThread, QTimer, QSize, Qt, QRectF, QPoint, QUrl, Signal, QEvent, QObject, QProcess, QSignalBlocker,
 )
 from PySide6.QtGui import (QColor, QDesktopServices, QIcon, QKeySequence,
                            QLinearGradient, QPainter, QPalette,
@@ -70,13 +72,34 @@ import match_data
 import optimizer
 import taskbar_switcher_core
 from companion_pack import save_companion_pack
-from main import App, STYLE, Backdrop, TitleBar, label, panel
+from replay_catalog import ReplayCatalog, directory_key, read_replay_details, scan_replays
+from runtime_paths import skin_cache_directory, cleanup_skin_cache
+from ui_preferences import DEFAULTS as UI_DEFAULTS, LIMITS as UI_LIMITS, read_preferences, save_preference
+from scroll_motion import MOTION_EVENTS, ScrollMotion
+from ui_controls import NumberField, SettingsRow, ToggleSwitch, VolumeSlider, control_style, paint_combo_arrow, scrollbar_style, surface_for
+from theme_redesign import THEMES as REDESIGNED_THEMES, semantic_palettes, theme_style, neutralize_legacy_css
+from main import App, STYLE, Backdrop, TitleBar, label
 from startup_motion import reveal_main_window
+from onboarding import (
+    GUIDE_COMPLETE_KEY, GUIDE_SEEN_KEY, GUIDE_VERSION, DirectorySearch,
+    QuickStartDialog,
+)
+
+
+# QApplication delivers paint, style and layout events to this filter too.
+# Only navigation badges, scroll input and window dragging need Python work.
+_WINDOW_FILTER_EVENTS = MOTION_EVENTS | frozenset((
+    QEvent.Type.Resize, QEvent.Type.Show,
+    QEvent.Type.MouseButtonDblClick, QEvent.Type.MouseButtonRelease,
+    QEvent.Type.MouseMove, QEvent.Type.ApplicationDeactivate,
+    QEvent.Type.UngrabMouse,
+))
 
 
 # The version is also used as the GitHub release tag (for example, v2026.09.29).
 # Bump it when publishing a new release so existing installations can discover it.
-APP_VERSION = '1.6.3'
+APP_VERSION = '1.6.26'
+QUICK_START_VERSION = GUIDE_VERSION
 GITHUB_REPOSITORY = 'zhujianmengbi-droid/-'
 GITHUB_REPOSITORY_URL = f'https://github.com/{GITHUB_REPOSITORY}'
 GITHUB_LATEST_RELEASE_API = (
@@ -100,6 +123,88 @@ TASKBAR_DEFAULT_BINDINGS = {
     index: f'Alt+{digit}'
     for index, digit in enumerate('1234567890')
 }
+
+# ZJ HUB keeps a small rolling text log outside the packaged application.  It
+# is deliberately separate from the Flashback engine's log so a bridge crash
+# still leaves the UI action that triggered it visible to support.
+APP_LOG_ROOT = Path(os.environ.get('LOCALAPPDATA') or (Path.home() / 'AppData' / 'Local')) / 'ZJ HUB' / 'logs'
+
+
+def _program_skin_cache_directory():
+    """Disposable ZJ HUB cache; player assets live in the selected game directory."""
+    return skin_cache_directory()
+_APP_LOG_QUEUE = queue.Queue(maxsize=512)
+_APP_LOG_WORKER = None
+_APP_LOG_WORKER_LOCK = threading.Lock()
+
+
+def _app_log_path():
+    return APP_LOG_ROOT / f'zj-hub-{datetime.now():%Y%m%d}.log'
+
+
+def _app_log_worker_loop():
+    """Write diagnostic lines away from Qt's GUI thread.
+
+    Flashback status can produce several log rows in one response.  Opening,
+    stat'ing and flushing the log file synchronously for every row used to
+    steal time from paint/input processing.  The queue is deliberately bounded
+    so a broken recorder cannot grow the process indefinitely; losing a
+    diagnostic row is preferable to stalling the interface.
+    """
+    while True:
+        try:
+            first = _APP_LOG_QUEUE.get()
+        except Exception:
+            return
+        if first is None:
+            return
+        batch = [str(first)]
+        for _ in range(63):
+            try:
+                item = _APP_LOG_QUEUE.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                return
+            batch.append(str(item))
+        try:
+            APP_LOG_ROOT.mkdir(parents=True, exist_ok=True)
+            path = _app_log_path()
+            if path.exists() and path.stat().st_size > 8 * 1024 * 1024:
+                previous = path.with_suffix('.previous.log')
+                try:
+                    path.replace(previous)
+                except OSError:
+                    pass
+            stamp = datetime.now().astimezone().isoformat(timespec='seconds')
+            with path.open('a', encoding='utf-8') as handle:
+                handle.writelines(f'[{stamp}] {line}\n' for line in batch)
+        except (OSError, UnicodeError):
+            # Logging must never make a UI action fail, especially when a user
+            # has redirected LOCALAPPDATA to a read-only location.
+            continue
+
+
+def _write_app_log(text):
+    """Queue a diagnostic line without doing filesystem I/O on the GUI thread."""
+    text = str(text or '').strip()
+    if not text:
+        return
+    global _APP_LOG_WORKER
+    try:
+        with _APP_LOG_WORKER_LOCK:
+            if _APP_LOG_WORKER is None or not _APP_LOG_WORKER.is_alive():
+                _APP_LOG_WORKER = threading.Thread(
+                    target=_app_log_worker_loop,
+                    name='zj-hub-log-writer',
+                    daemon=True,
+                )
+                _APP_LOG_WORKER.start()
+        _APP_LOG_QUEUE.put_nowait(text)
+    except (queue.Full, RuntimeError):
+        # A full queue means diagnostics are arriving faster than the disk can
+        # accept them.  Drop this line and keep input/painting responsive.
+        pass
 
 
 def _windows_hotkey_parts(sequence):
@@ -149,11 +254,13 @@ def _is_newer_release(tag_name):
     return remote + (0,) * (width - len(remote)) > current + (0,) * (width - len(current))
 
 
-class GlassFrame(QFrame):
-    """Shared surface frame used by every page without hidden repaint work."""
-
-    def __init__(self, parent=None, flags=Qt.WindowFlags()):
-        super().__init__(parent, flags)
+def panel():
+    widget = QFrame()
+    widget.setObjectName('glass')
+    layout = QVBoxLayout(widget)
+    layout.setContentsMargins(22, 20, 22, 20)
+    layout.setSpacing(12)
+    return widget, layout
 
 
 class ThemedComboBox(QComboBox):
@@ -170,6 +277,10 @@ class ThemedComboBox(QComboBox):
         self.setFrame(False)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._prepare_popup()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        paint_combo_arrow(self)
 
     def _prepare_popup(self):
         view = self.view()
@@ -274,10 +385,7 @@ QAbstractItemView#comboPopupView {{ color: {popup_text}; background: transparent
 QAbstractItemView#comboPopupView::item {{ color: {popup_text}; background: transparent; min-height: 32px; padding: 7px 12px; border-radius: 7px; }}
 QAbstractItemView#comboPopupView::item:hover, QAbstractItemView#comboPopupView::item:selected {{ color: {popup_text}; background: {popup_hover}; }}
 QComboBoxPrivateScroller {{ background: {popup_fill}; border: none; }}
-QScrollBar {{ background: transparent; border: none; }}
-QScrollBar::handle {{ background: {popup_border}; border-radius: 4px; min-height: 20px; }}
-QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
-""")
+""" + scrollbar_style(theme))
 
     def showPopup(self):
         self._prepare_popup()
@@ -336,7 +444,7 @@ QLineEdit { border-radius: 9px; padding: 10px 12px; min-height: 20px; }
    theme controlled below. */
 QComboBox, QAbstractSpinBox { border-radius: 8px; }
 QToolTip { border-radius: 8px; }
-QScrollBar::handle:horizontal, QScrollBar::handle:vertical { border-radius: 4px; }
+QScrollArea#preferencesScroll { background: transparent; border: none; }
 QFrame#updateBanner { min-height: 42px; background: rgba(63,121,180,34); border: 1px solid rgba(63,121,180,96); border-radius: 10px; }
 QLabel#updateTitle { color: #1c2c3d; font-size: 12px; font-weight: 700; }
 QLabel#updateHint { color: #5b6d80; font-size: 11px; }
@@ -348,6 +456,9 @@ QLabel#statLabel { font-size: 10px; color: #6f8296; }
 QLabel#statValue { font-size: 17px; font-weight: 700; }
 QLabel#brand { font-size: 17px; font-weight: 600; color: #f2f7ff; }
 QLabel#brandHint { color: #8ea5c0; font-size: 11px; }
+QFrame#communityChannel { background: #f8d5a4; border: 1px solid #e2a24f; border-radius: 9px; }
+QLabel#communityCaption { color: #704211; background: transparent; font-size: 11px; font-weight: 600; }
+QLabel#communityNumber { color: #39250f; background: transparent; font-size: 19px; font-weight: 700; }
 QLabel#brandMark { color: #102640; background: #b7d7ff; border-radius: 12px; font-size: 12px; font-weight: 700; padding: 7px 6px; }
 QLabel#eyebrow { color: #86c8ff; font-size: 10px; font-weight: 700; }
 QLabel#pageTitle { font-size: 25px; font-weight: 650; }
@@ -573,6 +684,7 @@ class PlayerLoginDialog(QDialog):
         self._theme = theme if theme in THEME_PALETTES else 'light'
         self._worker = None
         self.player_name = ''
+        self.skipped_login = False
         self.setObjectName('playerLoginDialog')
         self.setWindowTitle('ZJ HUB · 登录游戏 ID')
         self.setModal(True)
@@ -584,7 +696,7 @@ class PlayerLoginDialog(QDialog):
         self.setWindowFlags(
             Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowSystemMenuHint)
-        self.setFixedSize(500, 330)
+        self.setFixedSize(500, 395)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAutoFillBackground(False)
@@ -604,13 +716,13 @@ class PlayerLoginDialog(QDialog):
         title = QLabel('登录游戏 ID')
         title.setObjectName('playerLoginTitle')
         copy.addWidget(title)
-        subtitle = QLabel('验证布吉岛玩家后，再打开 ZJ HUB')
+        subtitle = QLabel('验证布吉岛玩家后同步战局与大厅身份；也可稍后在设置中绑定')
         subtitle.setObjectName('playerLoginSubtitle')
         copy.addWidget(subtitle)
         heading.addLayout(copy, 1)
         outer.addLayout(heading)
 
-        card = GlassFrame()
+        card = QFrame()
         card.setObjectName('playerLoginCard')
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(16, 14, 16, 14)
@@ -622,12 +734,19 @@ class PlayerLoginDialog(QDialog):
         self.player_input.setObjectName('themedInput')
         self.player_input.setPlaceholderText('输入布吉岛游戏 ID')
         self.player_input.setMaxLength(64)
-        self.player_input.setMinimumHeight(44)
+        self.player_input.setMinimumHeight(42)
         self.player_input.setClearButtonEnabled(True)
         self.player_input.returnPressed.connect(self.verify_player)
         if initial_name:
             self.player_input.setText(str(initial_name))
         card_layout.addWidget(self.player_input)
+        self.token_input = QLineEdit()
+        self.token_input.setObjectName('themedInput')
+        self.token_input.setPlaceholderText('可选：高峰期若遇 429 限流，可在此粘贴 /openapi 个人 Token')
+        self.token_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.token_input.setMinimumHeight(38)
+        self.token_input.setClearButtonEnabled(True)
+        card_layout.addWidget(self.token_input)
         self.status_label = QLabel('输入后点击验证，成功后会保存到本机。')
         self.status_label.setObjectName('playerLoginStatus')
         self.status_label.setWordWrap(True)
@@ -636,12 +755,18 @@ class PlayerLoginDialog(QDialog):
         outer.addStretch(1)
 
         actions = QHBoxLayout()
-        actions.addStretch(1)
         cancel = QPushButton('退出')
         cancel.setObjectName('playerLoginCancel')
         cancel.setMinimumHeight(38)
         cancel.clicked.connect(self.reject)
         actions.addWidget(cancel)
+        actions.addStretch(1)
+        self.skip_button = QPushButton('稍后登录')
+        self.skip_button.setObjectName('playerLoginCancel')
+        self.skip_button.setMinimumHeight(38)
+        self.skip_button.setToolTip('先进入 ZJ HUB 使用快捷工具和 Flashback 录制，稍后可在设置中绑定 ID')
+        self.skip_button.clicked.connect(self.skip_login)
+        actions.addWidget(self.skip_button)
         self.verify_button = QPushButton('验证并进入')
         self.verify_button.setObjectName('primary')
         self.verify_button.setMinimumHeight(38)
@@ -651,21 +776,26 @@ class PlayerLoginDialog(QDialog):
         outer.addLayout(actions)
         self.player_input.setFocus()
 
+    def skip_login(self):
+        if self._worker is not None and self._worker.isRunning():
+            return
+        custom_token = self.token_input.text().strip()
+        if custom_token:
+            bugland_api.save_token(custom_token)
+            self._token = custom_token
+        self.skipped_login = True
+        self.accept()
+
     def _apply_dialog_style(self):
         colors = INPUT_SURFACES.get(self._theme, INPUT_SURFACES['light'])
         palette = MATCH_ROW_PALETTES.get(self._theme, MATCH_ROW_PALETTES['light'])
         if self._theme == 'light':
             dialog_bg, text, muted, card_bg = '#f5f7fa', '#1e2e3e', '#60758a', '#ffffff'
             accent, accent_text = '#3f79b4', '#ffffff'
-        elif self._theme == 'glass':
-            dialog_bg, text, muted, card_bg = '#171b21', '#f1f2f4', '#b2b6be', '#252a32'
-            accent, accent_text = '#cfd2d8', '#202124'
-        elif self._theme == 'blue':
-            dialog_bg, text, muted, card_bg = '#082650', '#eef7ff', '#b8cce5', '#0b2e5e'
-            accent, accent_text = '#a9d0fa', '#092448'
         else:
-            dialog_bg, text, muted, card_bg = '#091421', '#eef5ff', '#b8c8dc', '#16263a'
-            accent, accent_text = '#a9cef7', '#102640'
+            surface = surface_for(self._theme)
+            dialog_bg, text, muted, card_bg = (surface[name] for name in ('page', 'text', 'muted', 'card'))
+            accent, accent_text = surface['on'], surface['fill']
         self._dialog_background = dialog_bg
         self._dialog_outline = palette.get('outline', '#8aa6c1')
         self.setStyleSheet(f"""
@@ -712,11 +842,19 @@ QLineEdit#themedInput:focus {{ border-color: {colors['focus']}; }}
             self.status_label.setText('请输入游戏 ID。')
             self.player_input.setFocus()
             return
+        custom_token = self.token_input.text().strip() if hasattr(self, 'token_input') else ''
+        if custom_token:
+            bugland_api.save_token(custom_token)
+            self._token = custom_token
         if not self._token:
-            self.status_label.setText('尚未设置 API Token，请先在设置中配置。')
+            self.status_label.setText('尚未设置 API Token，请在上方输入框填入个人 Token。')
             return
         self.verify_button.setEnabled(False)
+        if hasattr(self, 'skip_button'):
+            self.skip_button.setEnabled(False)
         self.player_input.setEnabled(False)
+        if hasattr(self, 'token_input'):
+            self.token_input.setEnabled(False)
         self.status_label.setText('正在访问布吉岛验证玩家……')
         worker = BuglandRequestWorker(
             'player_login', bugland_api.PLAYER_INFO_ENDPOINT,
@@ -731,7 +869,11 @@ QLineEdit#themedInput:focus {{ border-color: {colors['focus']}; }}
             return
         self._worker = None
         self.verify_button.setEnabled(True)
+        if hasattr(self, 'skip_button'):
+            self.skip_button.setEnabled(True)
         self.player_input.setEnabled(True)
+        if hasattr(self, 'token_input'):
+            self.token_input.setEnabled(True)
         if error:
             lowered = error.casefold()
             if '没有找到' in error or '404' in lowered or 'not found' in lowered:
@@ -791,6 +933,10 @@ class SupabaseRealtimeChatClient(QObject):
         self._heartbeat_timer = QTimer(self)
         self._heartbeat_timer.setInterval(20_000)
         self._heartbeat_timer.timeout.connect(self._send_heartbeat)
+        self._join_timeout_timer = QTimer(self)
+        self._join_timeout_timer.setSingleShot(True)
+        self._join_timeout_timer.setInterval(10_000)
+        self._join_timeout_timer.timeout.connect(self._on_join_timeout)
         self._player_id = ''
         # Presence key must be unique per running client.  The displayed ID is
         # still included in the track payload, but two windows using the same
@@ -803,6 +949,8 @@ class SupabaseRealtimeChatClient(QObject):
         self._wanted = False
         self._backoff_ms = 1000
         self._presence_state = {}
+        self._presence_synced = False
+        self._presence_pending_diffs = []
         # ref -> {'id': str, 'payload': dict}.  A broadcast is kept here until
         # its ACK or self echo arrives; no automatic retry is performed because
         # a retry could duplicate a message that was accepted by Realtime.
@@ -820,12 +968,72 @@ class SupabaseRealtimeChatClient(QObject):
     def joined(self):
         return self._joined
 
+    @property
+    def presence_synced(self):
+        return self._joined and self._presence_synced
+
+    def online_players(self):
+        """A local presence snapshot: (display ID, connection count), or None.
+
+        Presence metadata is self-reported, not identity verification. Never
+        expose presence keys or transport references as fallback player IDs.
+        """
+        if not self.presence_synced:
+            return None
+        players = {}
+        for value in self._presence_state.values():
+            for meta in self._presence_metas(value):
+                player_id = next((meta.get(field).strip() for field in
+                                  ('user_id', 'player_id', 'name', 'username')
+                                  if isinstance(meta.get(field), str) and meta.get(field).strip()), '')
+                player_id = ''.join(character for character in player_id
+                                    if character.isprintable())[:64].strip()
+                if not player_id:
+                    continue
+                identity = player_id.casefold()
+                if identity not in players:
+                    players[identity] = [player_id, 0]
+                players[identity][1] += 1
+        return tuple((name, count) for name, count in sorted(
+            players.values(), key=lambda item: (item[0].casefold(), item[0])))
+
+    @staticmethod
+    def _presence_metas(value):
+        metas = value.get('metas') if isinstance(value, dict) else None
+        if not isinstance(metas, list):
+            return []
+        result = []
+        refs = set()
+        for meta in metas:
+            if not isinstance(meta, dict):
+                continue
+            ref = meta.get('phx_ref')
+            if isinstance(ref, str) and ref:
+                if ref in refs:
+                    continue
+                refs.add(ref)
+            elif meta in result:
+                continue
+            clean = dict(meta)
+            if not isinstance(ref, str):
+                clean.pop('phx_ref', None)
+            result.append(clean)
+        return result
+
+    def _reset_presence(self):
+        self._presence_state = {}
+        self._presence_synced = False
+        self._presence_pending_diffs = []
+        self.presenceChanged.emit(0)
+
     def start(self, player_id):
         player_id = str(player_id or '').strip()
         if not player_id:
             self.stop()
             return
         identity_changed = player_id != self._player_id
+        if identity_changed:
+            self._reset_presence()
         self._player_id = player_id
         self._wanted = True
         self._reconnect_timer.stop()
@@ -844,6 +1052,7 @@ class SupabaseRealtimeChatClient(QObject):
         self._wanted = False
         self._reconnect_timer.stop()
         self._heartbeat_timer.stop()
+        self._join_timeout_timer.stop()
         self._fail_pending('大厅连接已停止，消息未确认。')
         if self._socket.state() == QAbstractSocket.SocketState.ConnectedState:
             self._send({
@@ -856,12 +1065,11 @@ class SupabaseRealtimeChatClient(QObject):
         self._close_socket()
         self._joined = False
         self._join_ref = None
-        self._presence_state = {}
-        self.presenceChanged.emit(0)
+        self._reset_presence()
 
     def send_message(self, text):
         text = str(text or '').strip()
-        if not text or not self._joined:
+        if not text or text.startswith('/') or not self._joined:
             return False
         message_id = uuid.uuid4().hex
         payload = {
@@ -909,12 +1117,14 @@ class SupabaseRealtimeChatClient(QObject):
             return
         self._joined = False
         self._join_ref = None
+        self._reset_presence()
         self.statusChanged.emit('连接中…')
         url = (SUPABASE_REALTIME_URL + '?apikey=' + SUPABASE_PUBLISHABLE_KEY +
                '&vsn=1.0.0')
         self._socket.open(QUrl(url))
 
     def _close_socket(self):
+        self._reset_presence()
         if self._socket.state() != QAbstractSocket.SocketState.UnconnectedState:
             self._socket.abort()
 
@@ -939,7 +1149,8 @@ class SupabaseRealtimeChatClient(QObject):
     def _on_connected(self):
         self._ref = 0
         self._join_ref = self._next_ref()
-        self._send({
+        self._join_timeout_timer.start()
+        if not self._send({
             'topic': self._topic,
             'event': 'phx_join',
             'payload': {
@@ -952,7 +1163,10 @@ class SupabaseRealtimeChatClient(QObject):
             },
             'ref': self._join_ref,
             'join_ref': self._join_ref,
-        })
+        }):
+            self._join_timeout_timer.stop()
+            self._close_socket()
+            self._schedule_reconnect()
 
     def _track_presence(self):
         self._send({
@@ -997,6 +1211,7 @@ class SupabaseRealtimeChatClient(QObject):
             status = payload.get('status')
             ref = str(message.get('ref') or '')
             if ref == self._join_ref:
+                self._join_timeout_timer.stop()
                 if status == 'ok':
                     self._joined = True
                     self._backoff_ms = 1000
@@ -1022,12 +1237,32 @@ class SupabaseRealtimeChatClient(QObject):
                     self._fail_pending_ref(
                         ref, str(reason or '服务器未确认消息。'))
             return
-        if event == 'presence_state':
-            self._presence_state = dict(payload)
-            self._emit_presence_count()
-            return
-        if event == 'presence_diff':
-            self._apply_presence_diff(payload)
+        if event in {'presence_state', 'presence_diff'}:
+            frame_join = message.get('join_ref')
+            if (not self._joined or message.get('topic') != self._topic or
+                    (frame_join is not None and str(frame_join) != str(self._join_ref))):
+                return
+            if event == 'presence_state':
+                self._presence_state = {
+                    str(key): {'metas': self._presence_metas(value)}
+                    for key, value in payload.items() if isinstance(value, dict)}
+                self._presence_synced = True
+                pending = self._presence_pending_diffs
+                self._presence_pending_diffs = []
+                for diff in pending:
+                    self._apply_presence_diff(diff)
+            elif self._presence_synced:
+                self._apply_presence_diff(payload)
+            else:
+                # A diff is not a complete roster. Apply early updates after
+                # this join's snapshot, without exposing a partial player list.
+                if len(self._presence_pending_diffs) >= 256:
+                    self.error.emit('在线名单同步超时，正在重新连接大厅。')
+                    self._close_socket()
+                    self._schedule_reconnect()
+                    return
+                self._presence_pending_diffs.append(dict(payload))
+                return
             self._emit_presence_count()
             return
         if event == 'broadcast':
@@ -1123,33 +1358,31 @@ class SupabaseRealtimeChatClient(QObject):
         if not isinstance(leaves, dict):
             leaves = {}
         for key, value in joins.items():
-            if isinstance(value, dict):
-                self._presence_state[str(key)] = value
+            incoming = self._presence_metas(value)
+            if not incoming:
+                continue
+            key = str(key)
+            replaced = {meta[field] for meta in incoming
+                        for field in ('phx_ref', 'phx_ref_prev')
+                        if isinstance(meta.get(field), str) and meta[field]}
+            kept = [meta for meta in self._presence_metas(self._presence_state.get(key))
+                    if meta.get('phx_ref') not in replaced]
+            self._presence_state[key] = {'metas': self._presence_metas({'metas': kept + incoming})}
         for key, value in leaves.items():
             key = str(key)
-            current = self._presence_state.get(key)
-            if not isinstance(current, dict) or not isinstance(value, dict):
-                self._presence_state.pop(key, None)
+            leaving = {meta['phx_ref'] for meta in self._presence_metas(value)
+                       if isinstance(meta.get('phx_ref'), str) and meta['phx_ref']}
+            if not leaving:
                 continue
-            metas = value.get('metas')
-            if not isinstance(metas, list):
-                metas = []
-            leaving = {str(item.get('phx_ref')) for item in metas
-                       if isinstance(item, dict)}
-            current_metas = current.get('metas')
-            if not isinstance(current_metas, list):
-                current_metas = []
-            kept = [item for item in current_metas
-                    if isinstance(item, dict) and
-                    str(item.get('phx_ref')) not in leaving]
+            kept = [meta for meta in self._presence_metas(self._presence_state.get(key))
+                    if meta.get('phx_ref') not in leaving]
             if kept:
-                current['metas'] = kept
+                self._presence_state[key] = {'metas': kept}
             else:
                 self._presence_state.pop(key, None)
 
     def _emit_presence_count(self):
-        count = sum(1 for value in self._presence_state.values()
-                    if isinstance(value, dict) and value.get('metas'))
+        count = sum(connections for _name, connections in (self.online_players() or ()))
         self.presenceChanged.emit(count)
 
     def _schedule_reconnect(self):
@@ -1157,16 +1390,24 @@ class SupabaseRealtimeChatClient(QObject):
             self._reconnect_timer.start(self._backoff_ms)
             self._backoff_ms = min(self._backoff_ms * 2, 10_000)
 
+    def _on_join_timeout(self):
+        if self._joined or not self._wanted:
+            return
+        self._fail_pending('加入大厅超时，正在重连…')
+        self.statusChanged.emit('加入超时，正在重连…')
+        self._close_socket()
+        self._schedule_reconnect()
+
     def _on_disconnected(self):
         self._heartbeat_timer.stop()
+        self._join_timeout_timer.stop()
         self._fail_pending('连接已断开，消息未确认。')
         was_joined = self._joined
         self._joined = False
         self._join_ref = None
         if was_joined:
             self.statusChanged.emit('已断开，正在重连…')
-        self.presenceChanged.emit(0)
-        self._presence_state = {}
+        self._reset_presence()
         self._schedule_reconnect()
 
     def _on_socket_error(self, _error):
@@ -1422,15 +1663,6 @@ class MatchHistoryScrollArea(QScrollArea):
 THEME_PALETTES = {
     # 玻璃主题只保留轻微的中性遮罩，让桌面色彩能够透过来；卡片本身
     # 负责建立层级，避免整块灰底把玻璃材质压成一张灰色背景。
-    'glass': {
-        'name': '玻璃',
-        'description': '透明玻璃材质，使用柔和边界区分层级',
-        'icon': 'layers',
-        'start': (18, 20, 24, 28),
-        'end': (10, 12, 16, 46),
-        'glow1': (180, 205, 232, 22),
-        'glow2': (108, 145, 165, 16),
-    },
     'dark': {
         'name': '暗色',
         'description': '低亮度深色界面，适合夜间使用',
@@ -1461,81 +1693,18 @@ THEME_PALETTES = {
 }
 
 
+# The legacy blue key remains valid for existing callers; its appearance is
+# now Warm Sand. The light theme is deliberately left byte-for-byte unchanged.
+THEME_PALETTES.update(REDESIGNED_THEMES)
+
 # Both editable inputs use a fully opaque surface in every interactive state.
 # This prevents a focused editor from revealing the translucent window backdrop.
-INPUT_SURFACES = {
-    'glass': {
-        # Editable fields stay opaque to prevent the old hollow/flicker bug;
-        # their neutral tint still matches the transparent glass surfaces.
-        'fill': '#252a31', 'text': '#f6f8fb', 'border': '#8a99aa',
-        'focus': '#e1edf9', 'selection': '#536f8d',
-    },
-    'dark': {
-        'fill': '#0c1521', 'text': '#e8eef8', 'border': '#53667e',
-        'focus': '#a7c7ea', 'selection': '#5f7795',
-    },
-    'light': {
-        'fill': '#ffffff', 'text': '#1c2c3d', 'border': '#71849a',
-        'focus': '#3f79b4', 'selection': '#8ca9c5',
-    },
-    'blue': {
-        'fill': '#082248', 'text': '#e6f0ff', 'border': '#577da8',
-        'focus': '#9ed1ff', 'selection': '#4879b3',
-    },
-}
+INPUT_SURFACES = {theme: {
+    key: surface_for(theme)[key] for key in ('fill', 'text', 'border', 'focus', 'selection')
+} for theme in THEME_PALETTES}
 
 
 THEME_OVERRIDES = {
-    'glass': """
-QWidget { color: #ececef; }
-QDialog { color: #f2f6fb; background: #171b21; }
-QMessageBox { color: #f2f6fb; background: #171b21; }
-QToolTip { color: #f1f1f2; background: #303236; border: 1px solid #55575c; padding: 6px; }
-QFrame#updateBanner { background: rgba(195,197,202,24); border-color: rgba(220,222,226,72); }
-QLabel#updateTitle { color: #f1f1f2; }
-QLabel#updateHint { color: #b7b9be; }
-QPushButton#updateOpen { background: #c4c6ca; border-color: #dadce0; color: #202124; }
-QPushButton#updateOpen:hover { background: #d5d7da; }
-QPushButton#updateDismiss { color: #b7b9be; }
-QPushButton#updateDismiss:hover { color: #f5f5f6; background: rgba(205,207,211,28); }
-QLineEdit { color: #f2f6fb; background: #252a31; border: 1px solid rgba(255,255,255,86); selection-background-color: #536f8d; }
-QLineEdit:focus { color: #f2f6fb; background: #252a31; border: 1px solid #d9eaff; }
-QLabel#brandMark { color: #202124; background: #c3c5c9; }
-QLabel#brandHint, QLabel#muted, QLabel#pageHint, QLabel#metricLabel, QLabel#cardHint { color: #b7b9be; }
-QLabel#statLabel { color: #aeb0b5; }
-QLabel#eyebrow { color: #c4c6ca; }
-QLabel#placeholderIcon { color: #d0d2d6; }
-QFrame#navLine { background: rgba(215,217,221,20); }
-QFrame#heroIconTile { background: rgba(220,222,226,30); }
-QFrame#moduleIconTile { background: rgba(205,207,211,24); }
-QFrame#sectionIcon, QFrame#rowGlyph { background: rgba(192,194,199,20); }
-QLabel#metricIcon { background: rgba(192,194,199,22); }
-QFrame#row { background: rgba(215,217,221,5); border-bottom-color: rgba(215,217,221,14); }
-QPushButton { color: #e1e2e5; background: rgba(195,197,202,14); border-color: rgba(195,197,202,28); }
-QPushButton:hover { background: rgba(205,207,211,30); border-color: rgba(220,222,226,44); }
-QPushButton:pressed { background: rgba(205,207,211,42); }
-QPushButton#primary { color: #202124; background: #c4c6ca; border-color: #dadce0; }
-QPushButton#primary:hover { background: #d5d7da; }
-QPushButton#navButton, QPushButton#settingsButton, QPushButton#settingsCategory, QPushButton#themeOption { color: #c4c6ca; }
-QPushButton#navButton:hover, QPushButton#settingsButton:hover, QPushButton#settingsCategory:hover, QPushButton#themeOption:hover { color: #f5f5f6; background: rgba(205,207,211,28); }
-QPushButton#navButton:checked, QPushButton#settingsButton:checked, QPushButton#settingsCategory:checked, QPushButton#themeOption:checked { color: #202124; background: #b9bbc0; border-color: #d5d7da; }
-QPushButton#windowControl { background: rgba(195,197,202,15); }
-QPushButton#windowControl:hover { background: rgba(205,207,211,30); }
-QCheckBox::indicator:unchecked { background: #25272b; border: 1px solid #65676c; border-radius: 4px; }
-QCheckBox::indicator:checked { background: #c4c6ca; border: 1px solid #dedfe2; border-radius: 4px; }
-QPlainTextEdit { color: #c7c9ce; }
-QLabel#matchWinBadge { color: #a9e8c9; background: rgba(45,145,101,55); border-radius: 9px; padding: 5px 9px; font-weight: 700; }
-QLabel#matchLossBadge { color: #ffb4b1; background: rgba(201,75,75,55); border-radius: 9px; padding: 5px 9px; font-weight: 700; }
-QLabel#matchUnknownBadge { color: #c4c6ca; background: rgba(195,197,202,24); border-radius: 9px; padding: 5px 9px; }
-QLabel#mvpBadge { color: #ffe29a; background: rgba(190,143,38,48); border-radius: 9px; padding: 4px 8px; font-weight: 700; }
-QProgressBar { background: rgba(194,196,200,24); }
-QProgressBar::chunk { background: #aeb1b6; }
-QScrollBar:vertical { width: 8px; margin: 3px 1px 3px 1px; background: transparent; }
-QScrollBar::handle:vertical { min-height: 24px; background: rgba(194,196,200,45); border-radius: 4px; }
-QScrollBar::handle:vertical:hover { background: rgba(215,217,221,75); }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
-""",
     'dark':"""
 QWidget { color: #e8eef8; }
 QDialog { color: #e8eef8; background: #111923; }
@@ -1669,38 +1838,6 @@ QProgressBar::chunk { background: #8fc2f5; }
 # 所有主题都明确区分侧栏、主工作区、主卡片、信息卡和内嵌行五级表面；
 # 这样切换主题时只换材质色，不会因为透明度叠加让层级消失。
 REFINED_SURFACES = {
-    'glass': """
-/* Glass uses a quiet neutral tint plus a single clean perimeter.  The old
-   opaque gradients looked like rough gray slabs and made every border merge
-   into the background. */
-QFrame#sidebar { background: rgba(255,255,255,24); border: 1px solid rgba(255,255,255,76); border-radius: 18px; }
-QFrame#glass { background: rgba(255,255,255,20); border: 1px solid rgba(255,255,255,82); border-radius: 16px; }
-QFrame#matchDetailPanel { background: rgba(8,12,18,94); border: 1px solid rgba(255,255,255,54); border-radius: 16px; }
-QFrame#hero { background: rgba(255,255,255,34); border: 1px solid rgba(255,255,255,112); border-left: 4px solid rgba(224,239,255,220); border-radius: 16px; }
-QFrame#metricCard { background: rgba(255,255,255,22); border: 1px solid rgba(255,255,255,76); border-radius: 14px; }
-QFrame#featureCard { background: rgba(255,255,255,18); border: 1px solid rgba(255,255,255,68); border-radius: 16px; }
-QFrame#featureRow { background: rgba(255,255,255,22); border: 1px solid rgba(255,255,255,56); border-radius: 11px; }
-QFrame#matchRecord { background: rgba(255,255,255,24); border: 1px solid transparent; }
-QFrame#matchRecord:hover { background: rgba(255,255,255,38); }
-QFrame#matchRecord[selected="true"] { background: rgba(255,255,255,54); border-left-color: #dcecff; }
-QFrame#statChip { background: rgba(255,255,255,26); }
-QFrame#matchDetailHero { background: rgba(255,255,255,32); border: 1px solid rgba(255,255,255,98); }
-QFrame#placeholder { background: rgba(255,255,255,22); border: 1px solid rgba(255,255,255,72); border-radius: 16px; }
-QFrame#settingsSidebar { background: rgba(255,255,255,28); border: 1px solid rgba(255,255,255,84); border-radius: 16px; }
-QFrame#settingsCard { background: rgba(255,255,255,30); border: 1px solid rgba(255,255,255,92); border-radius: 16px; }
-QFrame#settingsOverlay { background: #171b21; border: 1px solid rgba(255,255,255,92); }
-QFrame#row { background: rgba(215,217,221,5); border-bottom: 1px solid rgba(215,217,221,14); }
-QPushButton { border: 1px solid rgba(255,255,255,54); border-radius: 10px; }
-QPushButton#navButton { border: none; border-left: 4px solid transparent; border-radius: 8px; }
-QPushButton#navButton:hover { background: rgba(255,255,255,34); border-radius: 8px; color: #f7f7f8; }
-QPushButton#navButton:checked { border: none; border-left: 4px solid #dcecff; border-radius: 8px; background: rgba(255,255,255,48); color: #f7f7f8; }
-QPushButton#settingsButton { border: none; border-radius: 8px; }
-QPushButton#settingsButton:hover { background: rgba(255,255,255,34); border-radius: 8px; color: #f7f7f8; }
-QPushButton#settingsButton:checked { border: none; border-left: 4px solid #dcecff; border-radius: 8px; background: rgba(255,255,255,48); color: #f7f7f8; }
-QPushButton#settingsCategory:checked { border: none; border-left: 3px solid #dcecff; background: rgba(255,255,255,48); color: #f7f7f8; }
-QPushButton#themeOption { border: 1px solid rgba(255,255,255,54); }
-QPushButton#themeOption:checked { border: 1px solid rgba(255,255,255,105); border-left: 3px solid #dcecff; background: rgba(255,255,255,48); color: #f7f7f8; }
-""",
     'dark': """
 QFrame#sidebar { background: rgba(7,13,22,248); border: 1px solid rgba(122,155,194,52); border-radius: 18px; }
 QFrame#glass { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 rgba(20,34,52,236), stop:1 rgba(11,20,32,232)); border: 1px solid rgba(137,174,218,46); border-radius: 16px; }
@@ -1800,13 +1937,6 @@ QPushButton#themeOption:checked { border: none; border-left: 3px solid #d4eaff; 
 # defaults are black on Windows when a QComboBox/QSpinBox is created without
 # a theme-specific background.
 FLASHBACK_SURFACES = {
-    'glass': {
-        'card': 'rgba(255,255,255,30)', 'raised': 'rgba(255,255,255,42)',
-        'border': 'rgba(255,255,255,88)', 'input': 'rgba(255,255,255,50)',
-        'text': '#f2f4f7', 'muted': '#c2c5ca', 'accent': '#dcecff',
-        'error': '#ffb4b1',
-        'check': '#c4c6ca', 'check_border': '#e1e4e8',
-    },
     'dark': {
         'card': '#16263a', 'raised': '#1d3048', 'border': '#536f91',
         'input': '#0f1c2c', 'text': '#e8eef8', 'muted': '#a8b9cc',
@@ -1838,20 +1968,17 @@ QFrame#flashbackReplayRow {{ background: {colors['raised']}; border: 1px solid {
 QFrame#flashbackReplayRow:hover {{ background: {colors['card']}; border-color: {colors['accent']}; }}
 QLabel#flashbackStatus {{ color: {colors['muted']}; }}
 QLabel#flashbackStatus[statusTone="error"] {{ color: {colors['error']}; font-weight: 700; }}
-QComboBox#flashbackProcessCombo, QAbstractSpinBox#flashbackRate {{
+QComboBox#flashbackProcessCombo {{
     color: {colors['text']}; background: {colors['input']}; border: 1px solid {colors['border']};
     border-radius: 9px; padding: 6px 10px; min-height: 26px;
 }}
-QComboBox#flashbackProcessCombo:hover, QAbstractSpinBox#flashbackRate:hover,
-QComboBox#flashbackProcessCombo:focus, QAbstractSpinBox#flashbackRate:focus {{ border-color: {colors['accent']}; }}
+QComboBox#flashbackProcessCombo:hover,
+QComboBox#flashbackProcessCombo:focus {{ border-color: {colors['accent']}; }}
 QComboBox#flashbackProcessCombo::drop-down {{ width: 26px; border: none; border-left: 1px solid {colors['border']}; }}
 QComboBox#flashbackProcessCombo QAbstractItemView {{ color: {colors['text']}; background: {colors['input']}; border: 1px solid {colors['border']}; border-radius: 9px; padding: 4px; outline: none; }}
 QComboBox#flashbackProcessCombo QAbstractItemView::item {{ color: {colors['text']}; background: transparent; padding: 7px 10px; border-radius: 6px; }}
 QComboBox#flashbackProcessCombo QAbstractItemView::item:hover,
 QComboBox#flashbackProcessCombo QAbstractItemView::item:selected {{ background: {colors['raised']}; color: {colors['text']}; }}
-QAbstractSpinBox#flashbackRate::up-button, QAbstractSpinBox#flashbackRate::down-button {{ width: 18px; background: transparent; border: none; }}
-QAbstractSpinBox#flashbackRate::up-button:hover, QAbstractSpinBox#flashbackRate::down-button:hover {{ background: {colors['raised']}; }}
-QAbstractSpinBox#flashbackRate::up-arrow, QAbstractSpinBox#flashbackRate::down-arrow {{ width: 8px; height: 8px; }}
 QCheckBox#flashbackAutoZip {{ color: {colors['text']}; background: transparent; spacing: 8px; }}
 QCheckBox#flashbackAutoZip::indicator {{ width: 17px; height: 17px; border-radius: 5px; background: {colors['input']}; border: 1px solid {colors['border']}; }}
 QCheckBox#flashbackAutoZip::indicator:checked {{ background: {colors['check']}; border-color: {colors['check_border']}; }}
@@ -1866,17 +1993,6 @@ QPlainTextEdit#flashbackLog, QPlainTextEdit#flashbackInfo {{ color: {colors['tex
 
 
 MATCH_ROW_PALETTES = {
-    'glass': {
-        'win_bg': 'rgba(62,160,107,92)', 'win_hover': 'rgba(74,184,123,112)', 'win_text': '#e4f7e9',
-        'win_meta': '#b7ddc2', 'win_border': 'rgba(130,227,164,145)',
-        'loss_bg': 'rgba(206,82,94,92)', 'loss_hover': 'rgba(226,98,111,112)', 'loss_text': '#ffe9e9',
-        'loss_meta': '#e8b9bc', 'loss_border': 'rgba(255,163,171,145)',
-        'unknown_bg': 'rgba(255,255,255,38)', 'unknown_hover': 'rgba(255,255,255,58)',
-        'unknown_text': '#ececef', 'unknown_meta': '#c2c4c8',
-        'daily_bg': 'rgba(255,255,255,34)', 'recent_bg': 'rgba(255,255,255,54)', 'recent_hover': 'rgba(255,255,255,72)',
-        'recent_text': '#f0f0f2', 'positive': '#a6e6bd', 'negative': '#ffb5b5',
-        'neutral': '#ececef', 'outline': 'rgba(255,255,255,108)',
-    },
     'dark': {
         'win_bg': '#17452f', 'win_hover': '#20583a', 'win_text': '#e0f7e8',
         'win_meta': '#add9bb', 'win_border': '#2f7049',
@@ -1917,12 +2033,6 @@ MATCH_ROW_PALETTES = {
 # remains recognizable in every theme without making the card look like a
 # win/loss status chip.
 TEAM_PLAYER_PALETTES = {
-    'glass': {
-        'red': {'bg': '#492c34', 'hover': '#5a3540', 'border': '#d36b79', 'text': '#ffdfe3'},
-        'blue': {'bg': '#293c58', 'hover': '#334d70', 'border': '#75a9ec', 'text': '#e1efff'},
-        'yellow': {'bg': '#4a4029', 'hover': '#5d5030', 'border': '#e2bd58', 'text': '#ffe9ac'},
-        'green': {'bg': '#294436', 'hover': '#345743', 'border': '#67c694', 'text': '#d9f7e7'},
-    },
     'dark': {
         'red': {'bg': '#3b222a', 'hover': '#4f2d38', 'border': '#d85b6b', 'text': '#ffd9df'},
         'blue': {'bg': '#1d334f', 'hover': '#274664', 'border': '#6fa9ef', 'text': '#d9ebff'},
@@ -1973,13 +2083,6 @@ DETAIL_METRIC_ICONS = {
 # 排行榜层级色独立于战绩的胜负色，避免把“名次”误读成“胜负”。
 # 每套主题都保留金/银/铜的高光关系，第四名以后逐渐收敛到普通表面。
 LEADERBOARD_RANK_PALETTES = {
-    'glass': {
-        '1': {'bg': '#5c4b22', 'hover': '#725f2b', 'border': '#d6b45e', 'text': '#ffe7a0'},
-        '2': {'bg': '#4a4d54', 'hover': '#5d6068', 'border': '#bfc6d1', 'text': '#edf1f6'},
-        '3': {'bg': '#553d2d', 'hover': '#684a35', 'border': '#d59a68', 'text': '#ffd0a4'},
-        '4': {'bg': '#3e4045', 'hover': '#4a4c52', 'border': '#777a82', 'text': '#d6d8dc'},
-        '5': {'bg': '#393b40', 'hover': '#45474c', 'border': '#62656c', 'text': '#bfc2c8'},
-    },
     'dark': {
         '1': {'bg': '#493a17', 'hover': '#5d4a1e', 'border': '#d8b24f', 'text': '#ffe59a'},
         '2': {'bg': '#2c3948', 'hover': '#3a4b5e', 'border': '#91a5bb', 'text': '#e8f0f8'},
@@ -2002,6 +2105,14 @@ LEADERBOARD_RANK_PALETTES = {
         '5': {'bg': '#122f4c', 'hover': '#1b4164', 'border': '#4c7399', 'text': '#adc7df'},
     },
 }
+
+
+for _theme_key in REDESIGNED_THEMES:
+    _semantic = semantic_palettes(_theme_key)
+    FLASHBACK_SURFACES[_theme_key] = _semantic['flashback']
+    MATCH_ROW_PALETTES[_theme_key] = _semantic['match']
+    TEAM_PLAYER_PALETTES[_theme_key] = _semantic['team']
+    LEADERBOARD_RANK_PALETTES[_theme_key] = _semantic['rank']
 
 
 def _match_state_style(theme_key):
@@ -2177,11 +2288,18 @@ def build_style(theme_key):
     """返回完整主题样式，并在所有分区共用统一的材质层级。"""
     if theme_key not in THEME_PALETTES:
         theme_key = 'light'
-    return (LARGE_STYLE + THEME_OVERRIDES[theme_key]
+    style = (LARGE_STYLE + THEME_OVERRIDES[theme_key]
             + REFINED_SURFACES[theme_key] + _match_state_style(theme_key)
             + _flashback_style(theme_key)
             + _taskbar_switcher_style(theme_key)
-            + _lobby_chat_style(theme_key))
+            + _lobby_chat_style(theme_key)
+            + control_style(theme_key))
+    if theme_key == 'light':
+        return style
+    legacy = (LARGE_STYLE + THEME_OVERRIDES[theme_key] + REFINED_SURFACES[theme_key]
+              + _taskbar_switcher_style(theme_key) + _lobby_chat_style(theme_key))
+    return (neutralize_legacy_css(legacy, theme_key) + _match_state_style(theme_key)
+            + _flashback_style(theme_key) + control_style(theme_key) + theme_style(theme_key))
 
 
 def _lobby_chat_style(theme_key):
@@ -2192,11 +2310,6 @@ def _lobby_chat_style(theme_key):
         mine, mine_border = '#dfeeff', '#8db6df'
         online = '#168052'
         badge_outline = '#ffffff'
-    elif theme_key == 'glass':
-        surface, raised, text, muted = 'rgba(255,255,255,28)', 'rgba(255,255,255,48)', '#f0f0f2', '#c2c4c8'
-        mine, mine_border = 'rgba(185,218,255,56)', 'rgba(185,218,255,138)'
-        online = '#a6e6bd'
-        badge_outline = '#34363a'
     elif theme_key == 'blue':
         surface, raised, text, muted = '#0d2e5d', '#123b73', '#e6f0ff', '#afc8e5'
         mine, mine_border = '#174476', '#78aee9'
@@ -2222,7 +2335,8 @@ QFrame#chatMessageBubble[mine="true"] {{ background: {mine}; border-color: {mine
 QLabel#chatMessageAuthor {{ color: {text}; font-size: 11px; font-weight: 700; }}
 QLabel#chatMessageTime {{ color: {muted}; font-size: 10px; }}
 QLabel#chatMessageText {{ color: {text}; font-size: 12px; padding-top: 2px; }}
-QPushButton#chatRefreshButton, QPushButton#chatSendButton {{ min-height: 36px; padding: 8px 15px; border-radius: 10px; }}
+QPushButton#chatRefreshButton, QPushButton#chatSendButton, QPushButton#chatHelpButton {{ min-height: 36px; padding: 8px 15px; border-radius: 10px; }}
+QPlainTextEdit#chatCommandOutput {{ color: {text}; background: {raised}; border: 1px solid {colors['outline']}; border-radius: 10px; padding: 10px; }}
 QPushButton#chatEmojiButton {{ color: {text}; background: {raised}; border: 1px solid {colors['outline']}; border-radius: 10px; min-width: 38px; min-height: 36px; padding: 0; font-size: 18px; }}
 QPushButton#chatEmojiButton:hover {{ background: {colors['recent_hover']}; border-color: {mine_border}; }}
 QPushButton#chatEmojiButton:pressed {{ background: {mine}; }}
@@ -2237,13 +2351,6 @@ QPushButton#chatEmojiItem:pressed {{ background: {mine}; }}
 def _taskbar_switcher_style(theme_key):
     """快捷工具的任务栏窗口列表共用应用主题的颜色和层级。"""
     palettes = {
-        'glass': {
-            'surface': 'rgba(255,255,255,28)', 'raised': 'rgba(255,255,255,42)',
-            'field': '#252a31', 'text': '#f2f6fb', 'muted': '#c0ccd8',
-            'border': 'rgba(255,255,255,76)', 'accent': '#d9eaff',
-            'accent_text': '#152233', 'hover': 'rgba(255,255,255,44)',
-            'selected': 'rgba(185,218,255,76)', 'error': '#ffb4b1',
-        },
         'dark': {
             'surface': '#16263a', 'raised': '#0d1928', 'field': '#0c1521',
             'text': '#e8eef8', 'muted': '#a9c1de', 'border': '#53667e',
@@ -2364,6 +2471,14 @@ def _render_svg_icon(name, color, size=22, stroke_width=1.8):
 
 def line_icon(name, normal='#b8c8dc', active='#eff7ff', size=22, hovered=None):
     """创建主题一致、支持悬停和选中状态的轻量线性图标。"""
+    app = QApplication.instance()
+    theme = app.property('_themeKey') if app is not None else 'light'
+    if theme in REDESIGNED_THEMES:
+        def icon_color(value):
+            return neutralize_legacy_css(f'color: {value};', theme).partition(':')[2].strip().rstrip(';')
+        normal = icon_color(normal)
+        active = icon_color(active)
+        hovered = icon_color(hovered) if hovered else None
     icon = QIcon()
     icon.addPixmap(_render_svg_icon(name, normal, size), QIcon.Mode.Normal, QIcon.State.Off)
     icon.addPixmap(_render_svg_icon(name, active, size), QIcon.Mode.Normal, QIcon.State.On)
@@ -2375,7 +2490,7 @@ def line_icon(name, normal='#b8c8dc', active='#eff7ff', size=22, hovered=None):
 
 def primary_icon_color(theme_key):
     """Return a readable glyph color for the current primary button fill."""
-    return '#ffffff' if theme_key == 'light' else '#102640'
+    return '#ffffff' if theme_key == 'light' else surface_for(theme_key)['fill']
 
 
 def resolve_icon_name(name):
@@ -2384,7 +2499,12 @@ def resolve_icon_name(name):
 
 def icon_tile(name, object_name='moduleIconTile', color='#a9d4ff', size=24, tile_size=48):
     """创建统一的线性图标容器，页面模块和状态行共用同一套视觉语言。"""
-    tile = GlassFrame()
+    app = QApplication.instance()
+    theme = app.property('_themeKey') if app is not None else 'light'
+    if theme in REDESIGNED_THEMES:
+        color = (MATCH_ROW_PALETTES[theme]['positive'] if object_name == 'statusGlyph'
+                 else surface_for(theme)['on'])
+    tile = QFrame()
     tile.setObjectName(object_name)
     tile.setFixedSize(tile_size, tile_size)
     tile_layout = QHBoxLayout(tile)
@@ -2405,12 +2525,31 @@ def icon_tile(name, object_name='moduleIconTile', color='#a9d4ff', size=24, tile
 
 
 class ThemeBackdrop(Backdrop):
-    """Theme background rendered once and reused until the window resizes."""
+    """Cache the fixed gradient and the slower-moving decorative light layer."""
 
     def __init__(self, theme='light', parent=None):
         self.theme = theme if theme in THEME_PALETTES else 'light'
+        self._parallax_offset = 0
+        self._glow_cache = None
         super().__init__(parent)
-        self.setMouseTracking(True)
+
+    def set_parallax_offset(self, offset):
+        offset = max(-24, min(24, round(offset)))
+        if offset != self._parallax_offset:
+            self._parallax_offset = offset
+            self.update()
+
+    def paintEvent(self, event):
+        cache_key = (self.width(), self.height(), round(self.devicePixelRatioF(), 2))
+        if self._background_cache is None or self._cache_key != cache_key:
+            self._rebuild_cache()
+        painter = QPainter(self)
+        painter.setClipRegion(event.region())
+        if self._background_cache is not None:
+            painter.drawPixmap(0, 0, self._background_cache)
+            if self._glow_cache is not None:
+                painter.drawPixmap(0, self._parallax_offset - 24, self._glow_cache)
+        painter.end()
 
     def set_theme(self, theme):
         if theme not in THEME_PALETTES:
@@ -2436,6 +2575,11 @@ class ThemeBackdrop(Backdrop):
         base.setColorAt(0, QColor(*palette['start']))
         base.setColorAt(1, QColor(*palette['end']))
         painter.fillRect(0, 0, width, height, base)
+        painter.end()
+        lights = QPixmap(width, height + 48)
+        lights.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(lights)
+        painter.translate(0, 24)
         for x, y, radius, color in [
             (.05, .0, .65, palette['glow1']),
             (.95, .65, .5, palette['glow2']),
@@ -2443,9 +2587,10 @@ class ThemeBackdrop(Backdrop):
             glow = QRadialGradient(width * x, height * y, width * radius)
             glow.setColorAt(0, QColor(*color))
             glow.setColorAt(1, QColor(0, 0, 0, 0))
-            painter.fillRect(0, 0, width, height, glow)
+            painter.fillRect(0, -24, width, height + 48, glow)
         painter.end()
         self._background_cache = cache
+        self._glow_cache = lights
         self._cache_key = (width, height, round(self.devicePixelRatioF(), 2))
 
 
@@ -2457,6 +2602,8 @@ class LargeApp(App):
         settings = QSettings('DEV King', '逐渐工具箱')
         self.animation_speed = str(settings.value('ui/animationSpeed', 'standard') or 'standard')
         self._settings = settings
+        self._ui_preferences = read_preferences(settings)
+        self._preference_controls = {}
         if self.animation_speed not in {'off', 'fast', 'standard', 'slow'}:
             self.animation_speed = 'standard'
         self._button_effects = {}
@@ -2522,17 +2669,30 @@ class LargeApp(App):
         self._flashback_busy = False
         self._flashback_replay_path = ''
         self._flashback_exported_replay_path = ''
+        self._flashback_pending_open_path = None
         self._flashback_replay_signature = None
         self._flashback_replay_cache = []
         self._flashback_replay_cache_at = 0.0
         self._flashback_replay_cache_dirs = ()
+        self._flashback_replay_entries = ()
+        self._flashback_replay_catalog = ReplayCatalog()
+        self._flashback_replay_info_reader = ReplayCatalog(scanner=read_replay_details)
+        self._flashback_replay_scan_timer = None
         self._companion_pack_worker = None
         self._flashback_process_signature = None
-        self._flashback_pending_start_rate = None
         self._flashback_log_keys = set()
         self._flashback_log_order = deque()
+        self._flashback_output_dirty = False
+        self._flashback_target_dirty = False
+        self._flashback_rate_dirty = False
+        self._flashback_syncing_settings = False
+        self._quick_start_dialog = None
+        self._quick_start_snapshot_seen = False
+        self._quick_start_search = None
         self._chat_messages = []
         self._chat_message_keys = set()
+        # Avoid rebuilding the same styled message list after reconnects.
+        self._chat_render_signature = None
         self._chat_unread = False
         self._chat_unread_badges = {}
         self._chat_pending_message = ''
@@ -2548,7 +2708,13 @@ class LargeApp(App):
             self.chat_sound_volume = 65
         self._chat_sound_effect = None
         self._chat_sound_path = ''
+        self._chat_sound_hints = []
+        self._chat_sound_toggles = []
+        self._chat_sound_sliders = []
+        self._chat_sound_values = []
         self._chat_poll_timer = None
+        self._chat_render_timer = None
+        self._chat_cache_save_timer = None
         self._game_id = str(settings.value(GAME_ID_SETTINGS_KEY, '') or '').strip()
         # ``chat/gameId`` was used by an earlier preview build.  Migrate it
         # once so an existing login is not lost when the shared profile key is
@@ -2561,6 +2727,15 @@ class LargeApp(App):
             key = f'plugins/taskbar_switcher/hotkeys/{index}'
             stored = settings.value(key, default)
             self._taskbar_bindings[index] = str(default if stored is None else stored)
+        self.memory = QLabel('—')
+        self.memory_hint = QLabel('读取中')
+        self.memory_bar = QProgressBar()
+        self.uptime = QLabel('—')
+        self.log_text = QPlainTextEdit()
+        self.junk = QLabel('')
+        self.scan_progress = QProgressBar()
+        self.checks = {}
+        self.sizes = {}
         super().__init__()
         self._chat_client = SupabaseRealtimeChatClient(self)
         self._chat_client.statusChanged.connect(self._on_supabase_chat_status)
@@ -2575,10 +2750,17 @@ class LargeApp(App):
         # room while navigating between pages does not lose visible messages.
         self._restore_chat_session_cache()
         self.setWindowTitle('ZJ HUB')
-        self.resize(1180, 800)
-        # 留出标题、指标和两张功能卡的完整空间，避免缩放到窄窗口时说明文字被挤成一行。
-        self.setMinimumSize(1020, 700)
+        screen = self.screen() or QApplication.primaryScreen()
+        width, height = (screen.availableGeometry().width() - 24, screen.availableGeometry().height() - 24) if screen else (1180, 800)
+        width, height = max(320, width), max(240, height)
+        self.setMinimumSize(min(1020, width), min(700, height))
+        self.resize(min(1180, width), min(800, height))
         self.apply_theme(self.current_theme)
+        self._scroll_motion = ScrollMotion(
+            self, self.backdrop,
+            lambda: self._ui_preferences['ui/parallaxScrolling'] and self.animation_speed != 'off',
+            self._animation_duration)
+        self._apply_ui_preferences()
         self._taskbar_hotkey_worker = TaskbarHotkeyWorker(self._taskbar_bindings, self)
         self._taskbar_hotkey_worker.hotkeysReady.connect(self._on_taskbar_hotkeys_ready)
         self._taskbar_hotkey_worker.pressed.connect(self._on_taskbar_hotkey_pressed)
@@ -2605,6 +2787,8 @@ class LargeApp(App):
             return
         self._player_id = normalized
         self.set_game_id(normalized)
+        if hasattr(self, 'dashboard_player'):
+            self._set_if_changed(self.dashboard_player, normalized)
         if hasattr(self, 'match_player_input'):
             self.match_player_input.setText(normalized)
         if hasattr(self, 'chat_account_input'):
@@ -2615,14 +2799,27 @@ class LargeApp(App):
             self._remember_recent_query(normalized)
         self._refresh_player_settings()
 
+    def log(self, text):
+        """Show an activity entry and persist it for later bug reports."""
+        message = str(text or '').strip()
+        if not message:
+            return
+        _write_app_log(message)
+        # App.log owns the bounded on-screen activity history.  Keep that
+        # behavior while adding a durable file copy for the Settings page.
+        super().log(message)
+
     def _open_player_login_dialog(self, initial_name=None):
         token = self._api_token or bugland_api.load_token()
         if initial_name is None and hasattr(self, 'chat_account_input'):
             initial_name = self.chat_account_input.text().strip()
         dialog = PlayerLoginDialog(
             token, initial_name or self._player_id, self.current_theme, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.player_name:
-            self._save_player_identity(dialog.player_name, add_recent=True)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._api_token = bugland_api.load_token()
+            self._api_token_is_default = self._api_token == bugland_api.DEFAULT_API_TOKEN
+            if dialog.player_name:
+                self._save_player_identity(dialog.player_name, add_recent=True)
 
     def _refresh_player_settings(self):
         if not hasattr(self, 'player_id_value'):
@@ -2737,6 +2934,8 @@ class LargeApp(App):
         QSettings('DEV King', '逐渐工具箱').setValue('ui/animationSpeed', value)
         if value == 'off':
             self._stop_ui_animations()
+            if getattr(self, '_scroll_motion', None) is not None:
+                self._scroll_motion.reset()
         if hasattr(self, 'animation_speed_hint'):
             text = {'off': '已关闭过渡动画。', 'fast': '快速反馈，适合低功耗设备。',
                     'standard': '平衡反馈和流畅度。', 'slow': '更明显的过渡和层级变化。'}[value]
@@ -2759,7 +2958,15 @@ class LargeApp(App):
         title_copy = QVBoxLayout()
         title_copy.setSpacing(4)
         title_copy.addWidget(label('ZJ HUB', 'title'))
-        title_copy.addWidget(label('DEV King', 'muted'))
+        channel_badge = QFrame()
+        channel_badge.setObjectName('communityChannel')
+        channel_badge.setAccessibleName('OOPZ交流频道881695')
+        channel_layout = QHBoxLayout(channel_badge)
+        channel_layout.setContentsMargins(10, 4, 10, 4)
+        channel_layout.setSpacing(10)
+        channel_layout.addWidget(label('OOPZ 交流频道', 'communityCaption'))
+        channel_layout.addWidget(label('881695', 'communityNumber'))
+        title_copy.addWidget(channel_badge, 0, Qt.AlignmentFlag.AlignLeft)
         header.addLayout(title_copy)
         header.addStretch()
         header.addWidget(label('管理员模式' if optimizer.is_admin() else '普通模式', 'badge'))
@@ -2805,7 +3012,6 @@ class LargeApp(App):
         self._section_page_indices = {}
         pages = [
             ('overview', 'home', '总览', '查看起床战争工具状态', self._build_dashboard()),
-            ('optimizer', 'sparkles', '电脑清理', '扫描并清理临时文件', self._build_optimizer_page()),
             ('memory', 'chart', '战局数据', '查询最近对局与单局详情', self._build_match_data_page()),
             ('leaderboard', 'chart', '排行榜', '查询各个模式的日榜、周榜、年榜和总榜', self._build_leaderboard_page()),
             ('startup', 'command', '快捷工具', '用快捷键快速切换任务栏窗口', self._build_taskbar_switcher_page()),
@@ -2827,7 +3033,7 @@ class LargeApp(App):
         self.switch_section('overview')
 
     def _build_update_banner(self):
-        banner = GlassFrame()
+        banner = QFrame()
         banner.setObjectName('updateBanner')
         banner_layout = QHBoxLayout(banner)
         banner_layout.setContentsMargins(14, 7, 8, 7)
@@ -2894,7 +3100,7 @@ class LargeApp(App):
         QDesktopServices.openUrl(QUrl(url))
 
     def _build_sidebar(self):
-        sidebar = GlassFrame()
+        sidebar = QFrame()
         sidebar.setObjectName('sidebar')
         sidebar.setMinimumWidth(208)
         sidebar.setMaximumWidth(236)
@@ -2912,10 +3118,9 @@ class LargeApp(App):
         brand_copy = QVBoxLayout()
         brand_copy.setSpacing(2)
         brand_copy.addWidget(label('ZJ HUB', 'brand'))
-        brand_copy.addWidget(label('DEV King', 'brandHint'))
         brand_row.addLayout(brand_copy)
         layout.addLayout(brand_row)
-        line = GlassFrame()
+        line = QFrame()
         line.setObjectName('navLine')
         line.setFixedHeight(1)
         layout.addWidget(line)
@@ -2945,7 +3150,6 @@ class LargeApp(App):
         for key, icon, title, hint, _page in pages:
             icon_name = {
                 'overview': 'home',
-                'optimizer': 'sparkles',
                 'memory': 'chart',
                 'leaderboard': 'chart',
                 'startup': 'command',
@@ -2996,6 +3200,8 @@ class LargeApp(App):
         )
 
     def switch_section(self, key):
+        if getattr(self, '_scroll_motion', None) is not None:
+            self._scroll_motion.reset()
         if key == 'settings':
             self.show_settings_overlay()
             return
@@ -3009,16 +3215,17 @@ class LargeApp(App):
         self.page_stack.setCurrentIndex(index)
         if key == 'lobby-chat':
             self._set_lobby_chat_unread(False)
-        # TaskbarSwitcher 页面包含原生 QTableWidget viewport。对整页施加
-        # QGraphicsOpacityEffect 时，Windows 合成器会在首帧把 viewport
-        # 画成黑色镂空条；页面本身保持稳定，内部控件仍可正常交互。
         if key != 'startup' and not same_section:
-            self._animate_widget(self.page_stack.currentWidget(), 210)
+            # Full-page opacity effects force every child to be composited on
+            # each frame, which is costly for this translucent window. Show
+            # the already-built page directly; small targeted animations stay
+            # enabled for banners and detail cards.
+            self.page_stack.currentWidget().setGraphicsEffect(None)
         for name, button in self.nav_buttons.items():
             button.setChecked(name == key)
         if hasattr(self, 'settings_button'):
             self.settings_button.setChecked(False)
-        if key in {'overview', 'optimizer'}:
+        if key == 'overview':
             self.refresh()
         if hasattr(self, '_taskbar_auto_refresh_timer'):
             if key == 'startup':
@@ -3053,7 +3260,7 @@ class LargeApp(App):
         heading.addWidget(label('战绩、榜单与大厅工具，一处进入。', 'pageHint'))
         layout.addLayout(heading)
 
-        hero = GlassFrame()
+        hero = QFrame()
         hero.setObjectName('hero')
         hero_layout = QHBoxLayout(hero)
         hero_layout.setContentsMargins(18, 16, 18, 16)
@@ -3079,31 +3286,27 @@ class LargeApp(App):
         self.dashboard_memory = self._metric_card(metrics, '运行内存', '—', 'chart')
         self.dashboard_cpu = self._metric_card(metrics, '运行负载', '读取中', 'sparkles')
         self.dashboard_uptime = self._metric_card(metrics, '本机运行', '—', 'command', True)
-        self.dashboard_junk = self._metric_card(metrics, '可释放空间', '尚未扫描', 'settings')
+        self.dashboard_player = self._metric_card(
+            metrics, '游戏 ID', self._game_id or self._player_id or '未绑定', 'shield', True)
         layout.addLayout(metrics)
 
         lower = QHBoxLayout()
         lower.setSpacing(12)
-        actions, actions_layout = panel()
-        actions.setObjectName('featureCard')
-        self._section_header(actions_layout, '电脑清理', 'sparkles')
-        actions_layout.addWidget(label('整理临时文件，或释放当前占用的运行内存。', 'muted'))
-        actions_row = QHBoxLayout()
-        actions_row.setSpacing(8)
-        scan_button = self.button('扫描可释放空间', self._dashboard_scan, True)
-        scan_button.setProperty('themeIconName', 'chart')
-        scan_button.setIcon(line_icon(
-            'chart', normal=primary_icon_color(self.current_theme),
+        flashback_card, flashback_layout = panel()
+        flashback_card.setObjectName('featureCard')
+        self._section_header(flashback_layout, 'Flashback 录制', 'blocks')
+        flashback_layout.addWidget(label('在 ZJ HUB 内直接录制、标记与管理 Minecraft 回放。', 'muted'))
+        fb_actions_row = QHBoxLayout()
+        fb_actions_row.setSpacing(8)
+        fb_open_button = self.button('进入录制与管理', lambda: self.switch_section('flashback'), True)
+        fb_open_button.setProperty('themeIconName', 'blocks')
+        fb_open_button.setIcon(line_icon(
+            'blocks', normal=primary_icon_color(self.current_theme),
             active=primary_icon_color(self.current_theme), size=17))
-        scan_button.setIconSize(QSize(17, 17))
-        actions_row.addWidget(scan_button, 1)
-        free_button = self.button('释放运行内存', self.free_memory)
-        free_button.setProperty('themeIconName', 'sparkles')
-        free_button.setIcon(line_icon('sparkles', size=17))
-        free_button.setIconSize(QSize(17, 17))
-        actions_row.addWidget(free_button, 1)
-        actions_layout.addLayout(actions_row)
-        lower.addWidget(actions, 1)
+        fb_open_button.setIconSize(QSize(17, 17))
+        fb_actions_row.addWidget(fb_open_button, 1)
+        flashback_layout.addLayout(fb_actions_row)
+        lower.addWidget(flashback_card, 1)
 
         shortcuts, shortcuts_layout = panel()
         shortcuts.setObjectName('featureCard')
@@ -3137,7 +3340,7 @@ class LargeApp(App):
         grid.addWidget(button, row, column)
 
     def _feature_row(self, parent_layout, title, description, mark='●'):
-        row = GlassFrame()
+        row = QFrame()
         row.setObjectName('featureRow')
         row.setMinimumHeight(42)
         row_layout = QHBoxLayout(row)
@@ -3164,7 +3367,7 @@ class LargeApp(App):
         parent_layout.addLayout(header)
 
     def _metric_card(self, parent_layout, title, value, icon_name='command', compact=False):
-        card = GlassFrame()
+        card = QFrame()
         card.setObjectName('metricCard')
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(15, 13, 15, 13)
@@ -3189,140 +3392,6 @@ class LargeApp(App):
         parent_layout.addWidget(card, 1)
         return value_label
 
-    def _dashboard_scan(self):
-        self.switch_section('optimizer')
-        self.scan()
-
-    def _build_optimizer_page(self):
-        page = QWidget()
-        page_layout = QVBoxLayout(page)
-        page_layout.setContentsMargins(4, 0, 4, 0)
-        page_layout.setSpacing(14)
-
-        heading = QVBoxLayout()
-        heading.setSpacing(4)
-        heading.addWidget(label('MATCH PREP / SYSTEM TUNING', 'eyebrow'))
-        heading.addWidget(label('电脑清理', 'pageTitle'))
-        heading.addWidget(label('为起床战争整理运行环境，减少卡顿，准备开始战斗。', 'pageHint'))
-        page_layout.addLayout(heading)
-
-        body = QHBoxLayout()
-        body.setSpacing(16)
-        page_layout.addLayout(body, 1)
-
-        left = QVBoxLayout()
-        left.setSpacing(14)
-        body.addLayout(left, 3)
-
-        status, status_layout = panel()
-        left.addWidget(status)
-        self._section_header(status_layout, '运行概览', 'chart')
-        status_layout.addWidget(label('运行内存', 'muted'))
-        self.memory = label('—', 'metric')
-        status_layout.addWidget(self.memory)
-        self.memory_bar = self._progress_bar()
-        status_layout.addWidget(self.memory_bar)
-        self.memory_hint = label('读取中', 'muted')
-        status_layout.addWidget(self.memory_hint)
-        status_layout.addSpacing(8)
-        status_layout.addWidget(label('连续运行', 'muted'))
-        self.uptime = label('—', 'section')
-        status_layout.addWidget(self.uptime)
-        self.memory_button = self.button('释放运行内存', self.free_memory)
-        self.memory_button.setIcon(line_icon('sparkles', size=17))
-        self.memory_button.setIconSize(QSize(17, 17))
-        self.memory_button.setToolTip('压缩工作集不等于解决内存泄漏，应用再次访问页面时可能暂时变慢。')
-        status_layout.addWidget(self.memory_button)
-
-        activity, activity_layout = panel()
-        left.addWidget(activity, 1)
-        self._section_header(activity_layout, '操作记录', 'command')
-        from PySide6.QtWidgets import QPlainTextEdit
-        self.log_text = QPlainTextEdit()
-        self.log_text.setObjectName('activityLog')
-        self.log_text.setReadOnly(True)
-        self.log_text.setUndoRedoEnabled(False)
-        self.log_text.setFrameShape(QFrame.Shape.NoFrame)
-        self.log_text.setAutoFillBackground(False)
-        self.log_text.viewport().setAutoFillBackground(False)
-        self.log_text.document().setMaximumBlockCount(150)
-        self.log_text.setMinimumHeight(65)
-        activity_layout.addWidget(self.log_text, 1)
-        self.log('准备就绪。扫描只统计文件，不会删除内容。')
-
-        cleanup, clean_layout = panel()
-        body.addWidget(cleanup, 6)
-        summary = QHBoxLayout()
-        summary.addWidget(icon_tile('shield', 'sectionIcon', '#bfe1ff', 15, 28))
-        summary.addWidget(label('运行环境整理', 'section'))
-        summary.addStretch()
-        self.scan_button = self.button('扫描文件', self.scan)
-        self.scan_button.setIcon(line_icon('chart', size=17))
-        self.scan_button.setIconSize(QSize(17, 17))
-        summary.addWidget(self.scan_button)
-        clean_layout.addLayout(summary)
-        self.junk = label('先扫描，了解可以整理的内容', 'muted')
-        self.junk.setWordWrap(True)
-        clean_layout.addWidget(self.junk)
-        self.scan_progress = self._progress_bar()
-        self.scan_progress.setRange(0, len(self.targets))
-        self.scan_progress.hide()
-        clean_layout.addWidget(self.scan_progress)
-
-        from PySide6.QtWidgets import QCheckBox, QScrollArea
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        rows = QWidget()
-        rows.setObjectName('cleanRows')
-        rows.setStyleSheet('QWidget#cleanRows { background: transparent; }')
-        rows_layout = QVBoxLayout(rows)
-        rows_layout.setContentsMargins(0, 0, 4, 0)
-        rows_layout.setSpacing(0)
-        for target in self.targets:
-            row = GlassFrame()
-            row.setObjectName('row')
-            row_layout = QHBoxLayout(row)
-            row_layout.setContentsMargins(0, 10, 0, 10)
-            checkbox = QCheckBox(target.name)
-            checkbox.setChecked(target.default_on)
-            checkbox.toggled.connect(self.update_selection)
-            checkbox.setAccessibleName(target.name)
-            checkbox.setToolTip(target.description)
-            copy = QVBoxLayout()
-            copy.setSpacing(3)
-            copy.addWidget(checkbox)
-            hint = label(target.description, 'muted')
-            hint.setWordWrap(True)
-            hint.setContentsMargins(29, 0, 0, 0)
-            hint.setStyleSheet('font-size: 11px;')
-            copy.addWidget(hint)
-            row_layout.addLayout(copy, 1)
-            size = label('未扫描', 'muted')
-            size.setMinimumWidth(76)
-            size.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            row_layout.addWidget(size)
-            rows_layout.addWidget(row)
-            self.checks[target.key], self.sizes[target.key] = checkbox, size
-        rows_layout.addStretch()
-        scroll.setWidget(rows)
-        clean_layout.addWidget(scroll, 1)
-
-        actions = QHBoxLayout()
-        reset_button = self.button('重置选择', self.reset_selection)
-        reset_button.setIcon(line_icon('close', size=17))
-        reset_button.setIconSize(QSize(17, 17))
-        actions.addWidget(reset_button)
-        actions.addStretch()
-        self.optimize_button = self.button('一键优化', self.optimize, True)
-        self.optimize_button.setProperty('themeIconName', 'check')
-        self.optimize_button.setIcon(line_icon(
-            'check', normal=primary_icon_color(self.current_theme),
-            active=primary_icon_color(self.current_theme), size=17))
-        self.optimize_button.setIconSize(QSize(17, 17))
-        actions.addWidget(self.optimize_button)
-        clean_layout.addLayout(actions)
-        return page
 
     def _build_leaderboard_page(self):
         """排行榜查询页：按玩法、指标和周期请求 BuGLand /leaderboard。"""
@@ -3530,7 +3599,7 @@ class LargeApp(App):
                 if widget is not None:
                     widget.deleteLater()
             for index, entry in enumerate(entries[:100]):
-                row = GlassFrame()
+                row = QFrame()
                 row.setObjectName('leaderboardRow')
                 # 将官方名次归一为五档视觉层级：1/2/3 使用金银铜高光，
                 # 4 与 5+ 逐渐降低对比度，确保榜单从上往下自然收束。
@@ -3627,7 +3696,7 @@ class LargeApp(App):
         recent_grid.setHorizontalSpacing(6)
         recent_grid.setVerticalSpacing(5)
         self.recent_query_buttons = []
-        for index in range(5):
+        for index in range(UI_LIMITS['match/recentLimit'][1]):
             recent_button = QPushButton()
             recent_button.setObjectName('recentQueryButton')
             recent_button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -3669,11 +3738,11 @@ class LargeApp(App):
         self.match_page_label.setMinimumWidth(46)
         self.match_page_label.setVisible(False)
         result_header.addWidget(self.match_page_label)
-        self.match_next_button = self.button('›', lambda: self._change_match_page(1))
-        self.match_next_button.setFixedWidth(38)
-        self.match_next_button.setToolTip('下一页')
+        self.match_next_button = self.button('加载更多', lambda: self._maybe_load_next_match_page(manual=True))
+        self.match_next_button.setFixedWidth(96)
+        self.match_next_button.setToolTip('加载下一批对局')
         self.match_next_button.setEnabled(False)
-        self.match_next_button.setVisible(False)
+        self.match_next_button.setVisible(not self._ui_preferences['match/autoLoad'])
         result_header.addWidget(self.match_next_button)
         result_layout.addLayout(result_header)
         self.match_status = label('输入玩家昵称后开始查询。双击对局查看详情。', 'muted')
@@ -3704,7 +3773,7 @@ class LargeApp(App):
         self.match_rows_widget.setStyleSheet('QWidget#matchRows { background: transparent; }')
         self.match_rows_layout = QVBoxLayout(self.match_rows_widget)
         self.match_rows_layout.setContentsMargins(0, 0, 4, 0)
-        self.match_rows_layout.setSpacing(5)
+        self.match_rows_layout.setSpacing(self._ui_preferences['match/cardGap'])
         self.match_pull_hint = QLabel('')
         self.match_pull_hint.setObjectName('matchPullHint')
         self.match_pull_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -3724,7 +3793,7 @@ class LargeApp(App):
         self.match_scroll.setWidget(self.match_rows_widget)
         result_layout.addWidget(self.match_scroll, 1)
 
-        daily_summary = GlassFrame()
+        daily_summary = QFrame()
         daily_summary.setObjectName('dailySummary')
         daily_summary_layout = QVBoxLayout(daily_summary)
         daily_summary_layout.setContentsMargins(0, 2, 0, 0)
@@ -3741,7 +3810,7 @@ class LargeApp(App):
         for key, title in (
                 ('win_rate', '胜率'), ('final_kills', '最终击杀'),
                 ('beds', '最终拆床'), ('final_deaths', '最终死亡')):
-            chip = GlassFrame()
+            chip = QFrame()
             chip.setObjectName('dailyStatChip')
             chip.setMinimumHeight(42)
             chip_layout = QVBoxLayout(chip)
@@ -3761,7 +3830,7 @@ class LargeApp(App):
 
         # Details stay inside the selected page so the main GUI does not
         # spawn a separate window.  The panel is populated lazily on demand.
-        self.match_detail_panel = GlassFrame(page)
+        self.match_detail_panel = QFrame(page)
         self.match_detail_panel.setObjectName('matchDetailPanel')
         self.match_detail_panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.match_detail_panel.setVisible(False)
@@ -3842,8 +3911,7 @@ class LargeApp(App):
         self._enter_match_detail()
         self._request_match_detail(record)
 
-    @staticmethod
-    def _load_recent_queries():
+    def _load_recent_queries(self):
         settings = QSettings('DEV King', '逐渐工具箱')
         recent = settings.value('matchHistory/recentQueries', [])
         if not isinstance(recent, (list, tuple)):
@@ -3853,7 +3921,7 @@ class LargeApp(App):
             normalized = str(name).strip()
             if normalized and normalized.casefold() not in {item.casefold() for item in names}:
                 names.append(normalized)
-            if len(names) == 5:
+            if len(names) >= self._ui_preferences['match/recentLimit']:
                 break
         return names
 
@@ -3887,7 +3955,7 @@ class LargeApp(App):
             name for name in self._recent_queries
             if name.casefold() != player_name.casefold()]
         self._recent_queries.insert(0, player_name)
-        self._recent_queries = self._recent_queries[:5]
+        self._recent_queries = self._recent_queries[:self._ui_preferences['match/recentLimit']]
         QSettings('DEV King', '逐渐工具箱').setValue(
             'matchHistory/recentQueries', self._recent_queries)
         self._refresh_recent_query_buttons()
@@ -4096,18 +4164,24 @@ class LargeApp(App):
         then fade it away.  The normal scrollbar and API page loader continue
         to receive their events unchanged.
         """
-        if (watched in getattr(self, '_chat_unread_badges', {}) and
-                event.type() in (QEvent.Type.Resize, QEvent.Type.Show)):
+        event_type = event.type()
+        if event_type not in _WINDOW_FILTER_EVENTS:
+            return False
+        if (event_type in (QEvent.Type.Resize, QEvent.Type.Show) and
+                watched in getattr(self, '_chat_unread_badges', {})):
             self._position_chat_unread_dot(watched)
-        if (hasattr(self, 'match_scroll') and watched in (
-                self.match_scroll.viewport(), self.match_scroll.verticalScrollBar())
-                and event.type() == QEvent.Type.Wheel):
+        if (event_type == QEvent.Type.Wheel and
+                hasattr(self, 'match_scroll') and watched in (
+                self.match_scroll.viewport(), self.match_scroll.verticalScrollBar())):
             delta = event.angleDelta().y()
             scrollbar = self.match_scroll.verticalScrollBar()
             at_bottom = scrollbar.maximum() > 0 and scrollbar.value() >= scrollbar.maximum() - 2
             if delta < 0 and at_bottom:
                 self._show_match_pull_feedback()
                 self._maybe_load_next_match_page()
+        motion = getattr(self, '_scroll_motion', None)
+        if motion is not None and motion.handle_event(watched, event, event_type):
+            return True
         return super().eventFilter(watched, event)
 
     def _show_match_pull_feedback(self):
@@ -4125,10 +4199,15 @@ class LargeApp(App):
             if animation is not None:
                 animation.stop()
         self.match_pull_hint_effect.setOpacity(1.0)
+        if self._animation_factor() == 0:
+            hint.setMinimumHeight(0)
+            hint.setMaximumHeight(28)
+            QTimer.singleShot(520, self._fade_match_pull_feedback)
+            return
         hint.setMinimumHeight(0)
         hint.setMaximumHeight(0)
         expand = QPropertyAnimation(hint, b'maximumHeight', self)
-        expand.setDuration(180)
+        expand.setDuration(self._animation_duration(180))
         expand.setStartValue(0)
         expand.setEndValue(28)
         expand.setEasingCurve(QEasingCurve.Type.OutCubic)
@@ -4144,8 +4223,14 @@ class LargeApp(App):
         effect = getattr(self, 'match_pull_hint_effect', None)
         if hint is None or effect is None or not hint.isVisible():
             return
+        if self._animation_factor() == 0:
+            hint.setVisible(False)
+            hint.setMinimumHeight(0)
+            hint.setMaximumHeight(0)
+            hint.clearFocus()
+            return
         fade = QPropertyAnimation(effect, b'opacity', self)
-        fade.setDuration(260)
+        fade.setDuration(self._animation_duration(260))
         fade.setStartValue(effect.opacity())
         fade.setEndValue(0.0)
         fade.setEasingCurve(QEasingCurve.Type.InOutCubic)
@@ -4171,8 +4256,10 @@ class LargeApp(App):
         fade.finished.connect(collapse)
         fade.start(QPropertyAnimation.DeletionPolicy.KeepWhenStopped)
 
-    def _maybe_load_next_match_page(self):
+    def _maybe_load_next_match_page(self, manual=False):
         """Load the next API page when the continuous history list nears its end."""
+        if not manual and not self._ui_preferences['match/autoLoad']:
+            return
         if not hasattr(self, 'match_scroll') or not self._match_player_name:
             return
         if not self._history_has_more or self._api_generation <= 0:
@@ -4180,7 +4267,7 @@ class LargeApp(App):
         scrollbar = self.match_scroll.verticalScrollBar()
         # With an empty/short first page max() is zero; loading once here also
         # makes the list fill the viewport without requiring a hidden page tap.
-        if scrollbar.maximum() > 0 and scrollbar.value() < scrollbar.maximum() - 24:
+        if not manual and scrollbar.maximum() > 0 and scrollbar.value() < scrollbar.maximum() - 24:
             return
         loaded_pages = [page for page in self._history_pages if isinstance(page, int)]
         next_page = max(loaded_pages or [0]) + 1
@@ -4201,7 +4288,7 @@ class LargeApp(App):
             return
         self._match_page = next_page
         self._history_loading_pages.add(next_page)
-        self.match_status.setText('继续下滑以加载更多对局……')
+        self.match_status.setText('正在加载更多对局……')
         self._start_api_request(
             'history', bugland_api.MATCH_HISTORY_ENDPOINT,
             {'username': self._match_player_name, 'page': str(next_page)},
@@ -4302,8 +4389,8 @@ class LargeApp(App):
             self._page_size = page_size
             # A short/empty response is the end of the continuous history
             # stream.  A full page remains eligible for one more lazy load.
-            if action == 'history':
-                self._history_has_more = bool(records) and len(records) >= max(1, page_size)
+            self._history_has_more = bool(records) and len(records) >= max(1, page_size)
+            self.match_next_button.setEnabled(self._history_has_more)
             if player_uuid:
                 self._match_player_uuid = player_uuid
             known = {match_data.record_key(item): item for item in self._match_records_accumulated}
@@ -4322,15 +4409,16 @@ class LargeApp(App):
                 merged.append(current)
             already_loaded = page in self._history_pages
             self._history_pages[page] = merged
-            if action == 'history':
-                # Render every page received so scrolling feels like one list;
-                # this also fixes the old hidden "page 2" state not appearing
-                # until a pager button was pressed.
+            if action == 'history' or (action == 'today' and added > 0):
+                # Render every page received (including pages fetched by the
+                # background today-summary scanner) so scrolling feels like one
+                # continuous list and page 2+ never gets swallowed.
                 self._show_history_page(page)
-                if records and added == 0 and not already_loaded:
-                    # Avoid spinning through the API if it repeats a page.
-                    self._history_has_more = False
-                    self.match_status.setText('接口返回重复页，已停止继续加载。')
+            if action == 'history' and records and added == 0 and not already_loaded:
+                # Avoid spinning through the API if it repeats a page.
+                self._history_has_more = False
+                self.match_next_button.setEnabled(False)
+                self.match_status.setText('接口返回重复页，已停止继续加载。')
             if action == 'today' and records and added == 0 and not already_loaded:
                 self._today_scan_error = '接口返回重复页，统计未完成'
             elif (page == 1 or action == 'today') and not self._today_scan_complete:
@@ -4344,7 +4432,11 @@ class LargeApp(App):
                     self._history_sorted = False
                 if valid_dates:
                     self._history_scan_last = valid_dates[-1]
-                crossed_day = self._history_sorted and any(value.date() < today for value in valid_dates)
+                crossed_day = (
+                    (self._history_sorted and any(value.date() < today for value in valid_dates))
+                    or (bool(valid_dates) and all(value.date() < today for value in valid_dates))
+                    or page >= 15
+                )
                 if not records or crossed_day:
                     self._today_scan_complete = True
                 elif not self._today_scan_error:
@@ -4397,13 +4489,15 @@ class LargeApp(App):
         self.match_page_label.setText(f'已载入 {len(self._match_records)} 场')
         self._render_match_records(self._match_records)
         if self._match_records:
-            more_hint = ' · 下滑加载更多' if self._history_has_more else ''
+            more_hint = ''
+            if self._history_has_more:
+                more_hint = ' · 下滑加载更多' if self._ui_preferences['match/autoLoad'] else ' · 点击“加载更多”'
             self.match_status.setText(
                 f'已载入 {len(self._match_records)} 场{more_hint} · 双击查看详情，地图和时长会自动补齐。')
         else:
             self.match_status.setText('这一页没有对局记录。')
         self.match_previous_button.setEnabled(page > 1)
-        self.match_next_button.setEnabled(len(self._match_records) >= self._page_size)
+        self.match_next_button.setEnabled(self._history_has_more)
         for record in self._match_records:
             self._queue_record_metadata(record, refresh=False)
         self._refresh_record_metadata()
@@ -4601,7 +4695,7 @@ class LargeApp(App):
             summary_bits.append(f'胜方：{winner_name}')
         self.match_detail_state.setText('  ·  '.join(summary_bits))
 
-        hero = GlassFrame()
+        hero = QFrame()
         hero.setObjectName('matchDetailHero')
         hero.setProperty('recordOutcome', outcome or 'unknown')
         hero_layout = QVBoxLayout(hero)
@@ -4662,7 +4756,7 @@ class LargeApp(App):
             queried_player or {}, 'bed_destory', 'bed_destroy', 'bedDestroy'))
         query_final_deaths = self._display_stat_value(self._numeric_stat(
             queried_player or {}, 'final_death', 'finalDeath'))
-        ribbon = GlassFrame()
+        ribbon = QFrame()
         ribbon.setObjectName('matchDetailRibbon')
         ribbon.setProperty('recordOutcome', outcome or 'unknown')
         ribbon_layout = QVBoxLayout(ribbon)
@@ -4710,7 +4804,7 @@ class LargeApp(App):
         # A compact team overview gives the detail view a clear second level:
         # team identity and aggregate performance are separated from the
         # player-level positive/negative metric colors below.
-        team_overview = GlassFrame()
+        team_overview = QFrame()
         team_overview.setObjectName('teamOverviewCard')
         team_overview_layout = QVBoxLayout(team_overview)
         team_overview_layout.setContentsMargins(13, 12, 13, 13)
@@ -4729,7 +4823,7 @@ class LargeApp(App):
             if not isinstance(team_players, list):
                 continue
             team_name = str(team_name)
-            team_item = GlassFrame()
+            team_item = QFrame()
             team_item.setObjectName('teamOverviewItem')
             team_item.setProperty('teamTint', team_tints[team_index % len(team_tints)])
             team_item.setProperty('teamResult', 'win' if winner_team and team_name == winner_team
@@ -4799,7 +4893,7 @@ class LargeApp(App):
                     (self._match_player_name and player_name.casefold() == self._match_player_name.casefold())
                     or (self._match_player_uuid and player_uuid.casefold() == self._match_player_uuid.casefold())
                 )
-                player_row = GlassFrame()
+                player_row = QFrame()
                 player_row.setObjectName('featureRow')
                 player_row.setProperty('teamTint', team_tint)
                 player_row.setProperty('queryTarget', 'true' if player_is_target else 'false')
@@ -4907,7 +5001,7 @@ class LargeApp(App):
             return
         self._clear_detail_layout()
         self.match_detail_title.setText(title)
-        placeholder = GlassFrame()
+        placeholder = QFrame()
         placeholder.setObjectName('featureCard')
         placeholder_layout = QVBoxLayout(placeholder)
         placeholder_layout.setContentsMargins(20, 24, 20, 24)
@@ -5081,7 +5175,7 @@ class LargeApp(App):
         return str(value)
 
     def _stat_chip(self, title, value):
-        chip = GlassFrame()
+        chip = QFrame()
         chip.setObjectName('statChip')
         chip_layout = QVBoxLayout(chip)
         chip_layout.setContentsMargins(9, 7, 9, 7)
@@ -5161,6 +5255,8 @@ class LargeApp(App):
             content.update()
 
     def _fade_detail_widget(self, widget, duration=220):
+        if self._animation_factor() == 0:
+            return
         effect = QGraphicsOpacityEffect(widget)
         effect.setOpacity(0.0)
         widget.setGraphicsEffect(effect)
@@ -5254,7 +5350,7 @@ class LargeApp(App):
         heading.addWidget(label('公共大厅频道 · 仅使用登录游戏 ID 发言，没有私聊。', 'pageHint'))
         layout.addLayout(heading)
 
-        overview = GlassFrame()
+        overview = QFrame()
         overview.setObjectName('chatOverviewCard')
         overview_layout = QHBoxLayout(overview)
         overview_layout.setContentsMargins(16, 12, 16, 12)
@@ -5274,7 +5370,7 @@ class LargeApp(App):
         self.chat_server_hint.setObjectName('chatServerHint')
         status_copy.addWidget(self.chat_server_hint)
         overview_layout.addLayout(status_copy, 1)
-        online_box = GlassFrame()
+        online_box = QFrame()
         online_box.setObjectName('chatOnlineCard')
         online_layout = QVBoxLayout(online_box)
         online_layout.setContentsMargins(12, 7, 12, 7)
@@ -5290,9 +5386,13 @@ class LargeApp(App):
         refresh.setObjectName('chatRefreshButton')
         refresh.setProperty('themeIconName', 'refresh')
         overview_layout.addWidget(refresh)
+        self.chat_help_button = self.button('指令 /help', lambda: self._run_lobby_command('/help'))
+        self.chat_help_button.setObjectName('chatHelpButton')
+        self.chat_help_button.setToolTip('查看本地指令；无需登录，不会发送公共消息')
+        overview_layout.addWidget(self.chat_help_button)
         layout.addWidget(overview)
 
-        chat_card = GlassFrame()
+        chat_card = QFrame()
         chat_card.setObjectName('chatCard')
         chat_layout = QVBoxLayout(chat_card)
         chat_layout.setContentsMargins(14, 13, 14, 14)
@@ -5318,6 +5418,18 @@ class LargeApp(App):
         self._chat_scroll_timer = QTimer(self)
         self._chat_scroll_timer.setSingleShot(True)
         self._chat_scroll_timer.timeout.connect(self._scroll_lobby_chat_to_latest)
+        # Realtime can deliver a burst of messages in the same event-loop
+        # turn.  Rebuilding up to 80 bubble widgets for every message made
+        # the chat page contend with mouse/paint events; coalesce a burst into
+        # one render shortly after the transport update.
+        self._chat_render_timer = QTimer(self)
+        self._chat_render_timer.setSingleShot(True)
+        self._chat_render_timer.setInterval(50)
+        self._chat_render_timer.timeout.connect(self._flush_chat_render)
+        self._chat_cache_save_timer = QTimer(self)
+        self._chat_cache_save_timer.setSingleShot(True)
+        self._chat_cache_save_timer.setInterval(300)
+        self._chat_cache_save_timer.timeout.connect(self._save_chat_session_cache)
         chat_scrollbar.rangeChanged.connect(
             lambda _minimum, _maximum: self._schedule_chat_scroll_to_latest())
         self.chat_messages_host = QWidget()
@@ -5399,11 +5511,12 @@ class LargeApp(App):
         self._companion_pack_worker = None
         worker.deleteLater()
 
-    def _flashback_search_roots(self):
+    def _flashback_search_roots(self, resolve_paths=True):
         """Return possible companion-plugin locations without touching the UI."""
         roots = []
-        for base in (Path(sys.executable).resolve().parent,
-                     Path(__file__).resolve().parent):
+        paths = (Path(sys.executable), Path(__file__))
+        for path in paths:
+            base = (path.resolve() if resolve_paths else Path(os.path.abspath(path))).parent
             roots.extend((base / 'plugins' / 'FlashbackRecorder', base / 'FlashbackRecorder', base))
         roots.append(Path.home() / 'Desktop' / FLASHBACK_PACKAGE_NAME / '软件')
         result = []
@@ -5432,7 +5545,7 @@ class LargeApp(App):
         if configured:
             candidates.append(Path(configured).expanduser())
         candidates.extend([self._flashback_output_dir, Path.home() / 'Videos' / 'FlashbackRecorder'])
-        for root in self._flashback_search_roots():
+        for root in self._flashback_search_roots(resolve_paths=False):
             candidates.append(root.parent / '回放')
             candidates.append(root / '回放')
         result = []
@@ -5445,51 +5558,17 @@ class LargeApp(App):
         return result
 
     def _flashback_replays(self, force=False):
-        """Return recent exports from both the normal and session folders.
-
-        The embedded recorder writes into ``.flashback-runtime/session-*``;
-        scanning only the output root made a completed recording appear to be
-        missing until it was manually copied elsewhere.
-        """
+        """Synchronous discovery for non-UI callers; the page uses ReplayCatalog."""
         now = time.monotonic()
         directories = tuple(self._flashback_replay_dirs())
         if (not force and directories == self._flashback_replay_cache_dirs and
-                now - self._flashback_replay_cache_at < 1.0):
-            return list(self._flashback_replay_cache)
-        files = []
-        seen = set()
-        for directory in directories:
-            if not directory.is_dir():
-                continue
-            patterns = [directory.glob('*.flashback.zip')]
-            runtime = directory / '.flashback-runtime'
-            if runtime.is_dir():
-                # Keep traversal bounded to the recorder's own layout and do
-                # not follow arbitrary links from a user-selected directory.
-                patterns.append(runtime.glob('session-*/*.flashback.zip'))
-                patterns.append(runtime.glob('session-*/*/*.flashback.zip'))
-            for entries in patterns:
-                try:
-                    paths = entries
-                    for path in paths:
-                        try:
-                            if path.is_symlink() or not path.is_file():
-                                continue
-                            key = str(path.resolve()).casefold()
-                            if key in seen:
-                                continue
-                            seen.add(key)
-                            stat_result = path.stat()
-                            files.append((path, stat_result.st_mtime_ns, stat_result.st_size))
-                        except OSError:
-                            continue
-                except OSError:
-                    continue
-        files.sort(key=lambda item: item[1], reverse=True)
-        self._flashback_replay_cache = [path for path, _mtime, _size in files[:24]]
+                now - self._flashback_replay_cache_at < 2.0):
+            return list(self._flashback_replay_cache[:self._ui_preferences['flashback/replayLimit']])
+        self._flashback_replay_entries = scan_replays(directories)
+        self._flashback_replay_cache = [item.path for item in self._flashback_replay_entries]
         self._flashback_replay_cache_at = now
         self._flashback_replay_cache_dirs = directories
-        return list(self._flashback_replay_cache)
+        return list(self._flashback_replay_cache[:self._ui_preferences['flashback/replayLimit']])
 
     # ------------------------------------------------------------------
     # Native Flashback bridge.  The recorder engine is kept headless and
@@ -5547,6 +5626,108 @@ class LargeApp(App):
         process.start()
         return True
 
+    def _quick_start_failed(self, message):
+        dialog = getattr(self, '_quick_start_dialog', None)
+        if dialog is not None:
+            dialog.operation_failed(message)
+
+    def show_quick_start(self, force=False):
+        """Open one reusable first-use guide, without duplicating dialogs."""
+        dialog = getattr(self, '_quick_start_dialog', None)
+        if dialog is not None:
+            dialog.raise_()
+            dialog.activateWindow()
+            return dialog
+        if not force and str(self._settings.value(GUIDE_SEEN_KEY, '') or '') == QUICK_START_VERSION:
+            return None
+        dialog = QuickStartDialog(self, getattr(self, 'current_theme', 'light'))
+        self._quick_start_dialog = dialog
+        self._settings.setValue(GUIDE_SEEN_KEY, QUICK_START_VERSION)
+        self._settings.sync()
+        dialog.settingsRequested.connect(self._quick_start_request_settings)
+        dialog.saveRequested.connect(self._quick_start_save_settings)
+        dialog.findRequested.connect(self._quick_start_find_directory)
+        dialog.recordingRequested.connect(self._quick_start_recording)
+        dialog.finished.connect(self._quick_start_dialog_finished)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        return dialog
+
+    def _quick_start_dialog_finished(self, _result):
+        dialog = getattr(self, '_quick_start_dialog', None)
+        if dialog is not None:
+            self._quick_start_dialog = None
+        self._cancel_directory_search('_quick_start_search')
+
+    def _quick_start_recording(self):
+        self._settings.setValue(GUIDE_COMPLETE_KEY, QUICK_START_VERSION)
+        self._settings.sync()
+        self.switch_section('flashback')
+
+    def _quick_start_request_settings(self):
+        dialog = getattr(self, '_quick_start_dialog', None)
+        if dialog is None:
+            return
+        if self._flashback_bridge and self._flashback_bridge.state() == QProcess.ProcessState.Running:
+            self._flashback_request('status')
+        elif not self._flashback_request('status'):
+            self._quick_start_failed(self._flashback_bridge_error or '未找到内置录制引擎。')
+
+    def _quick_start_save_settings(self, payload):
+        dialog = getattr(self, '_quick_start_dialog', None)
+        if dialog is None:
+            return
+        payload = dict(payload)
+        try:
+            requested_rate = int(payload.get('rate'))
+        except (TypeError, ValueError):
+            requested_rate = int(getattr(self, 'flashback_rate', None).value()) if hasattr(self, 'flashback_rate') else 20
+        requested_rate = max(20, min(120, requested_rate))
+        payload['rate'] = requested_rate
+        if hasattr(self, 'flashback_rate'):
+            blocker = QSignalBlocker(self.flashback_rate)
+            self.flashback_rate.setValue(requested_rate)
+            del blocker
+            self._flashback_rate_dirty = True
+        self._flashback_busy = True
+        self._flashback_set_status('正在保存录制设置…')
+        if not self._flashback_request('config', **payload):
+            self._flashback_busy = False
+            self._quick_start_failed(self._flashback_bridge_error or '无法连接内置录制引擎。')
+
+    def _quick_start_find_directory(self):
+        dialog = getattr(self, '_quick_start_dialog', None)
+        if dialog is None:
+            return
+        if self._quick_start_search is not None and self._quick_start_search.isRunning():
+            return
+        worker = DirectorySearch(self._find_flashback_game_directory, self, cancellable=True)
+        self._quick_start_search = worker
+        worker.finished.connect(lambda: self._directory_search_completed(
+            '_quick_start_search', worker,
+            lambda result, error: dialog.directory_found(result, error)
+            if self._quick_start_dialog is dialog else None))
+        worker.start()
+
+    def _cancel_directory_search(self, attribute):
+        worker = getattr(self, attribute, None)
+        setattr(self, attribute, None)
+        if worker is not None:
+            worker.requestInterruption()
+            worker.deleteLater()
+
+    def _directory_search_completed(self, attribute, worker, callback):
+        if getattr(self, attribute, None) is not worker:
+            worker.deleteLater()
+            return
+        setattr(self, attribute, None)
+        try:
+            if not self._closing and not worker.isInterruptionRequested():
+                callback(worker.result, worker.error)
+        finally:
+            worker.deleteLater()
+
     def _flashback_bridge_state_changed(self, state):
         """Flush the first queued command after QProcess leaves Starting."""
         if state == QProcess.ProcessState.Running:
@@ -5557,11 +5738,13 @@ class LargeApp(App):
         detail = process.errorString() if process is not None else str(error)
         self._flashback_bridge_error = detail or '内置 Flashback 引擎连接失败。'
         self._flashback_set_status(self._flashback_bridge_error, error=True)
+        self._quick_start_failed(self._flashback_bridge_error)
 
     def _flashback_bridge_finished(self, _code, _status):
         if self._flashback_bridge_inflight is not None:
             self._flashback_bridge_inflight = None
         self._flashback_busy = False
+        self._quick_start_failed('录制引擎已退出，请重新连接后再保存设置。')
         if self._close_waiting_for_bridge:
             self._close_waiting_for_bridge = False
             if self._close_bridge_timer is not None:
@@ -5604,6 +5787,10 @@ class LargeApp(App):
         # bounded fallback below.
         self._close_bridge_timer.start(90_000)
         self._flashback_set_status('正在安全收尾录制，请稍候…')
+        # This one-way control signal bypasses a pending export request. The
+        # engine keeps reading stdio and cancels only its own export helper.
+        bridge.write(b'{"command":"cancel_export"}\n')
+        self._flashback_bridge_queue.clear()
         self._flashback_request('shutdown')
         if bridge.state() == QProcess.ProcessState.NotRunning:
             self._close_waiting_for_bridge = False
@@ -5648,15 +5835,18 @@ class LargeApp(App):
             if (self._flashback_bridge_inflight or
                     any(item.get('command') in {'status', 'refresh'}
                         for item in self._flashback_bridge_queue)):
-                return
+                return True
         request = {'command': command}
         request.update(payload)
         self._flashback_bridge_queue.append(request)
         if self._flashback_start_bridge():
             self._flashback_flush_request_queue()
+            return True
         else:
             self._flashback_bridge_queue.clear()
             self._flashback_set_status(self._flashback_bridge_error or '内置引擎不可用。', error=True)
+            self._quick_start_failed(self._flashback_bridge_error or '内置引擎不可用。')
+            return False
 
     def _flashback_flush_request_queue(self):
         process = self._flashback_bridge
@@ -5675,6 +5865,7 @@ class LargeApp(App):
             self._flashback_bridge_inflight = None
             self._flashback_bridge_error = '无法向内置 Flashback 引擎发送命令。'
             self._flashback_set_status(self._flashback_bridge_error, error=True)
+            self._quick_start_failed(self._flashback_bridge_error)
             return
         if written < len(payload):
             # QProcess normally accepts the complete small command into its
@@ -5689,22 +5880,46 @@ class LargeApp(App):
                 self._flashback_bridge_inflight = None
                 self._flashback_bridge_error = '内置 Flashback 引擎写入不完整。'
                 self._flashback_set_status(self._flashback_bridge_error, error=True)
+                self._quick_start_failed(self._flashback_bridge_error)
                 self._flashback_flush_request_queue()
 
     def _flashback_handle_response(self, response):
+        request = self._flashback_bridge_inflight
         self._flashback_bridge_inflight = None
         self._flashback_busy = False
         if not isinstance(response, dict):
             self._flashback_set_status('录制引擎返回了无效状态。', error=True)
+            self._quick_start_failed('录制引擎返回了无效状态。')
         elif not response.get('ok', False):
-            self._flashback_pending_start_rate = None
-            self._flashback_set_status(str(response.get('error') or '录制引擎操作失败。'), error=True)
-            self._flashback_append_log(str(response.get('error') or '录制引擎操作失败。'))
+            if (isinstance(request, dict) and request.get('command') == 'import'
+                    and request.get('uiImportGeneration') == getattr(self, '_flashback_import_generation', 0)):
+                self._flashback_pending_open_path = None
+            error = str(response.get('error') or '录制引擎操作失败。')
+            self._flashback_set_status(error, error=True)
+            self._flashback_append_log(error)
+            self._quick_start_failed(error)
         else:
             self._flashback_apply_snapshot(response)
+            self._flashback_open_import_result(request, response)
             message = response.get('message') or response.get('stateText')
             if message:
                 self._flashback_append_log(str(message))
+                if isinstance(request, dict) and request.get('command') == 'config':
+                    self._flashback_set_status(str(message))
+            if (isinstance(request, dict) and request.get('command') == 'config'
+                    and response.get('command') == 'config'):
+                if 'output' in request:
+                    self._flashback_output_dirty = False
+                if 'target' in request or 'flashbackDirectory' in request:
+                    self._flashback_target_dirty = False
+                if 'rate' in request or 'readRate' in request:
+                    self._flashback_rate_dirty = False
+                dialog = getattr(self, '_quick_start_dialog', None)
+                if dialog is not None:
+                    dialog.saved(response.get('settings') or {})
+            if (isinstance(request, dict) and request.get('command') == 'start'
+                    and response.get('command') == 'start'):
+                self._flashback_rate_dirty = False
         self._flashback_flush_request_queue()
 
     def _flashback_append_log(self, text):
@@ -5724,9 +5939,16 @@ class LargeApp(App):
         self._flashback_log_order.append(key)
         while len(self._flashback_log_order) > 256:
             self._flashback_log_keys.discard(self._flashback_log_order.popleft())
+        _write_app_log('Flashback 引擎：' + text)
         stamp = datetime.now().strftime('%H:%M:%S')
+        scrollbar = widget.verticalScrollBar()
+        position = scrollbar.value()
         widget.appendPlainText(f'[{stamp}] {text[:800]}')
-        widget.ensureCursorVisible()
+        if self._ui_preferences['flashback/followLog']:
+            widget.ensureCursorVisible()
+            scrollbar.setValue(scrollbar.maximum())
+        else:
+            scrollbar.setValue(position)
 
     def _flashback_set_status(self, text, error=False):
         if hasattr(self, 'flashback_status'):
@@ -5746,26 +5968,61 @@ class LargeApp(App):
         self._flashback_selected_identity = str(selected.get('identity') or '')
         self._flashback_state_dir = snapshot.get('sessionDir')
         self._flashback_status = snapshot.get('status') or {}
+        previous_replay_path = self._flashback_replay_path
+        previous_exported_path = self._flashback_exported_replay_path
         self._flashback_replay_path = str(snapshot.get('replay') or '')
         exported_replay = str(snapshot.get('exportedReplay') or '')
+        self._flashback_exported_replay_path = exported_replay
         if exported_replay:
-            self._flashback_exported_replay_path = exported_replay
             self._flashback_replay_path = exported_replay
+        replay_changed = (
+            self._flashback_replay_path != previous_replay_path or
+            self._flashback_exported_replay_path != previous_exported_path)
         settings = snapshot.get('settings') or {}
-        if hasattr(self, 'flashback_output') and settings.get('output'):
+        dialog = getattr(self, '_quick_start_dialog', None)
+        if dialog is not None and dialog._loading:
+            dialog.settings_loaded(settings, snapshot.get('controls') or {})
+        if not self._quick_start_snapshot_seen:
+            self._quick_start_snapshot_seen = True
+            if str(self._settings.value(GUIDE_SEEN_KEY, '') or '') != QUICK_START_VERSION:
+                QTimer.singleShot(220, self.show_quick_start)
+        if hasattr(self, 'flashback_output') and settings.get('output') and not self._flashback_output_dirty:
             output_value = str(settings['output'])
             if output_value.casefold() != str(self._flashback_output_dir).casefold():
                 self._flashback_replay_cache = []
                 self._flashback_replay_cache_at = 0.0
-            self.flashback_output.setText(output_value)
-        if settings.get('output'):
+            self._flashback_syncing_settings = True
+            try:
+                blocker = QSignalBlocker(self.flashback_output)
+                self._set_if_changed(self.flashback_output, output_value)
+                del blocker
+            finally:
+                self._flashback_syncing_settings = False
+        if settings.get('output') and not self._flashback_output_dirty:
             self._flashback_output_dir = Path(str(settings['output']))
-        if hasattr(self, 'flashback_target'):
-            self.flashback_target.setText(str(settings.get('flashbackDirectory') or ''))
+        if hasattr(self, 'flashback_target') and not self._flashback_target_dirty:
+            self._flashback_syncing_settings = True
+            try:
+                blocker = QSignalBlocker(self.flashback_target)
+                self._set_if_changed(
+                    self.flashback_target, str(settings.get('flashbackDirectory') or ''))
+                del blocker
+            finally:
+                self._flashback_syncing_settings = False
         if hasattr(self, 'flashback_auto_zip') and 'autoZip' in settings:
             self.flashback_auto_zip.setChecked(bool(settings.get('autoZip')))
+        if hasattr(self, 'skin_cache_hint'):
+            cache_value = str(settings.get('skinCacheDirectory') or _program_skin_cache_directory())
+            self.skin_cache_hint.setText(cache_value)
         if hasattr(self, 'flashback_rate') and settings.get('readRate'):
-            self.flashback_rate.setValue(int(settings['readRate']))
+            if not self._flashback_rate_dirty:
+                self._flashback_syncing_settings = True
+                try:
+                    blocker = QSignalBlocker(self.flashback_rate)
+                    self.flashback_rate.setValue(int(settings['readRate']))
+                    del blocker
+                finally:
+                    self._flashback_syncing_settings = False
         for item in snapshot.get('logs') or []:
             text = str(item.get('text') or '') if isinstance(item, dict) else ''
             if text:
@@ -5799,35 +6056,47 @@ class LargeApp(App):
                 self._flashback_process_signature = process_signature
         recording = bool(snapshot.get('recording'))
         state = self._flashback_status
+        if hasattr(self, 'flashback_engine_title'):
+            component = str(state.get('agentVersion') or '')
+            suffix = f'录制组件 {component}' if component.isdigit() else '内置录制引擎'
+            self._set_if_changed(self.flashback_engine_title, f'ZJ HUB v{APP_VERSION} · {suffix}')
         state_text = str(snapshot.get('stateText') or '内置引擎已连接')
+        if snapshot.get('javaSearching'):
+            state_text = '正在检测 64 位 Java 17+ JDK…'
+        elif not snapshot.get('javaPath') and not recording:
+            state_text = '未找到 64 位 Java 17+ JDK；录制需要 jdk.attach，安装 JDK 后点击“刷新”。'
         if recording:
-            state_text = '● 录制中 · ' + state.get('samplingRate', '20') + ' tick / 秒'
+            state_text = ('正在切换服务器，录制保持中…' if state.get('worldTransition') else
+                          '● 录制中 · ' + str(state.get('samplingRate', '20')) + ' tick / 秒')
         self._flashback_set_status(state_text, error=state.get('state') in {'error', 'record-error', 'native-finish-error'})
         if hasattr(self, 'flashback_pid_value'):
-            self.flashback_pid_value.setText(str(state.get('pid') or self._flashback_selected_pid or '-'))
-            self.flashback_samples_value.setText(str(state.get('samples', '0')))
-            self.flashback_packets_value.setText(str(state.get('packets', '0')))
-            self.flashback_recording_value.setText('录制中' if recording else '未录制')
+            self._set_if_changed(
+                self.flashback_pid_value,
+                str(state.get('pid') or self._flashback_selected_pid or '-'))
+            self._set_if_changed(
+                self.flashback_samples_value, str(state.get('samples', '0')))
+            self._set_if_changed(
+                self.flashback_packets_value, str(state.get('packets', '0')))
+            self._set_if_changed(
+                self.flashback_recording_value, '录制中' if recording else '未录制')
+        controls = snapshot.get('controls') if isinstance(snapshot.get('controls'), dict) else {}
+        agent = snapshot.get('agent') if isinstance(snapshot.get('agent'), dict) else {}
         if hasattr(self, 'flashback_start_button'):
-            # ``busy`` also includes the engine's 600 ms status poll.  Using
-            # it here made the visible button blink disabled after injection.
-            # The local command guard is stable; a start pressed during the
-            # initial snapshot is queued below and sent once the state is ready.
+            # Use the engine's actual readiness instead of enabling Start for
+            # every session directory, including retired or outdated agents.
             self.flashback_start_button.setEnabled(
-                not recording and bool(self._flashback_state_dir) and not self._flashback_busy)
+                bool(controls.get('start')) and not recording and not self._flashback_busy)
             self.flashback_stop_button.setEnabled(recording and not self._flashback_busy)
             self.flashback_inject_button.setEnabled(
-                bool(selected.get('supported')) and not self._flashback_state_dir and not self._flashback_busy)
-        controls = snapshot.get('controls') if isinstance(snapshot.get('controls'), dict) else {}
+                bool(controls.get('inject')) and not self._flashback_busy)
+            self.flashback_inject_button.setText(
+                '更新录制组件' if agent.get('reloadAvailable') else '注入选中游戏')
         self._flashback_last_controls = controls
-        if (self._flashback_pending_start_rate is not None and
-                controls.get('start') and not recording and not self._flashback_busy):
-            pending_rate = self._flashback_pending_start_rate
-            self._flashback_pending_start_rate = None
-            self._flashback_busy = True
-            self._flashback_set_status(f'正在开始录制 · {pending_rate} tick / 秒…')
-            QTimer.singleShot(0, lambda rate=pending_rate: self._flashback_request('start', rate=rate))
-        if self._flashback_replay_path:
+        if hasattr(self, 'flashback_rate'):
+            self.flashback_rate.setEnabled(
+                bool(controls.get('rate', True)) and not recording and not self._flashback_busy)
+        if replay_changed and self._flashback_replay_path:
+            self._flashback_replay_cache_at = 0.0
             self._flashback_refresh_replay_list()
 
     def _flashback_process_changed(self, index):
@@ -5840,13 +6109,21 @@ class LargeApp(App):
 
     def _flashback_refresh(self):
         self._flashback_request('refresh')
+        # Pin the cache to the real ZJ HUB folder as soon as the headless
+        # engine starts. This also migrates an older engine's default cache
+        # before the first export/import operation.
+        self._flashback_request(
+            'config',
+            skinCache=str(_program_skin_cache_directory()),
+            autoZip=bool(self.flashback_auto_zip.isChecked()) if hasattr(self, 'flashback_auto_zip') else True,
+        )
         self._flashback_replay_cache_at = 0.0
         self._flashback_refresh_replay_list()
 
     def _flashback_inject(self):
         item = self.flashback_process_combo.currentData()
         if not isinstance(item, dict):
-            self._flashback_set_status('请先选择 Minecraft 1.20.1 进程。', error=True)
+            self._flashback_set_status('请先选择 Minecraft 1.20.1 或 1.21.10 进程。', error=True)
             return
         self._flashback_busy = True
         self._flashback_set_status('正在把录制组件注入选中的 Minecraft…')
@@ -5859,11 +6136,7 @@ class LargeApp(App):
             return
         controls = getattr(self, '_flashback_last_controls', {})
         if not controls.get('start', True):
-            # The first world snapshot normally takes a short time.  Keep the
-            # action clickable and start automatically at the first ready poll
-            # instead of dropping the user's click on the floor.
-            self._flashback_pending_start_rate = rate
-            self._flashback_set_status('已记录开始操作，录制组件就绪后会自动开始。')
+            self._flashback_set_status('录制组件尚未就绪，请根据当前状态完成连接或更新后重试。', error=True)
             return
         self._flashback_busy = True
         self._flashback_set_status(f'正在开始录制 · {rate} tick / 秒…')
@@ -5876,26 +6149,198 @@ class LargeApp(App):
 
     def _flashback_choose_output(self):
         current = self.flashback_output.text().strip() if hasattr(self, 'flashback_output') else ''
-        directory = QFileDialog.getExistingDirectory(self, '选择录制保存目录', current or str(self._flashback_output_dir))
+        # QFileDialog can open without a usable location when the remembered
+        # path was deleted or the packaged app is running on a fresh account.
+        # Always give it an existing directory and fall back to the user's
+        # home folder; selecting a folder must never depend on pre-creating it.
+        initial = Path(current).expanduser() if current else Path(self._flashback_output_dir)
+        try:
+            if not initial.is_dir():
+                initial = initial.parent if initial.parent.is_dir() else Path.home()
+        except (OSError, RuntimeError, ValueError):
+            initial = Path.home()
+        directory = QFileDialog.getExistingDirectory(self, '选择录制保存目录', str(initial))
         if directory:
-            self.flashback_output.setText(directory)
+            selected = Path(directory).expanduser().resolve()
+            self.flashback_output.setText(str(selected))
+            self._flashback_output_dirty = True
+            self._flashback_output_dir = selected
+            self._flashback_replay_signature = None
+            self._flashback_replay_cache = []
+            self._flashback_replay_cache_at = 0.0
+            self._flashback_refresh_replay_list()
+            self._flashback_set_status(f'已选择录制保存目录：{selected}')
+            self._flashback_append_log(f'选择录制保存目录：{selected}')
+            # Folder selection is an explicit user action. Persist it now so
+            # the next status poll or a restart cannot silently restore the
+            # previous directory; the full Save button remains available for
+            # manual edits to the other fields.
+            self._flashback_save_config(include_target=False, include_rate=False)
+
+    def _flashback_output_edited(self, _text=''):
+        if not self._flashback_syncing_settings:
+            self._flashback_output_dirty = True
+            try:
+                if str(_text).strip():
+                    # Keystrokes must not resolve network paths or wake a
+                    # disk. The catalog worker resolves the actual root.
+                    self._flashback_output_dir = Path(os.path.abspath(Path(_text).expanduser()))
+            except (OSError, RuntimeError, ValueError):
+                pass
+
+    def _flashback_target_edited(self, _text=''):
+        if not self._flashback_syncing_settings:
+            self._flashback_target_dirty = True
+
+    def _flashback_rate_edited(self, _value=20):
+        if not self._flashback_syncing_settings:
+            self._flashback_rate_dirty = True
+
+    @staticmethod
+    def _is_flashback_game_directory(path):
+        """Return true only for a Minecraft directory containing Flashback."""
+        if not path:
+            return False
+        try:
+            root = Path(path).expanduser().resolve()
+            mods = root / 'mods'
+            return mods.is_dir() and any(
+                item.is_file() and item.suffix.casefold() == '.jar' and
+                'flashback' in item.name.casefold()
+                for item in mods.iterdir())
+        except (OSError, RuntimeError, ValueError):
+            return False
+
+    @classmethod
+    def _find_flashback_game_directory(cls, cancelled=None):
+        """Find common launcher instance folders for the target selector."""
+        roots = []
+        bases = [Path.home(), Path(sys.executable).resolve().parent, Path(__file__).resolve().parent]
+        bases.extend(Path(value) for name in ('APPDATA', 'LOCALAPPDATA')
+                     if (value := os.environ.get(name)))
+        for base in bases:
+            roots.extend((base / '.minecraft', base / '.minecraft' / 'versions',
+                          base / 'PCL' / '.minecraft', base / 'PCL' / '.minecraft' / 'versions'))
+        seen = set()
+        matches = set()
+
+        def consider(path):
+            if cancelled and cancelled():
+                return
+            if not cls._is_flashback_game_directory(path):
+                return
+            try:
+                matches.add(str(Path(path).expanduser().resolve()))
+            except (OSError, RuntimeError, ValueError):
+                return
+
+        for root in roots:
+            if cancelled and cancelled():
+                return None
+            key = str(root).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            consider(root)
+            try:
+                if not root.is_dir():
+                    continue
+                for child in root.iterdir():
+                    if cancelled and cancelled():
+                        return None
+                    if child.is_symlink() or not child.is_dir():
+                        continue
+                    consider(child)
+                    # Covers launchers that add one named instance level.
+                    try:
+                        for version in child.iterdir():
+                            if cancelled and cancelled():
+                                return None
+                            if not version.is_symlink() and version.is_dir():
+                                consider(version)
+                    except OSError:
+                        continue
+            except (OSError, RuntimeError, ValueError):
+                continue
+        # A wrong instance is indistinguishable from a missing skin after the
+        # import, so never choose arbitrarily when multiple launcher instances
+        # contain Flashback. The user can select the actual instance manually.
+        return Path(next(iter(matches))) if len(matches) == 1 else None
 
     def _flashback_choose_target(self):
+        self._cancel_directory_search('_flashback_directory_search')
         current = self.flashback_target.text().strip() if hasattr(self, 'flashback_target') else ''
-        directory = QFileDialog.getExistingDirectory(self, '选择 Flashback 游戏目录', current or str(Path.home()))
+        # The picker itself can navigate and validate the user's path; do not
+        # scan every launcher instance before the dialog can even appear.
+        directory = QFileDialog.getExistingDirectory(self, '选择 Flashback 游戏目录', str(current or Path.home()))
         if directory:
-            self.flashback_target.setText(directory)
+            if not self._is_flashback_game_directory(directory):
+                self._flashback_set_status('所选目录没有找到 Flashback 模组，请选择包含 mods 文件夹的游戏目录。', error=True)
+                return
+            self.flashback_target.setText(str(Path(directory).resolve()))
+            self._flashback_target_dirty = True
+            # Do not let an empty output field reject a valid target change.
+            self._flashback_save_config(include_output=False, include_rate=False)
 
-    def _flashback_save_config(self):
+    def _flashback_find_target(self):
+        """Fill the target field from known launcher instance locations."""
+        worker = getattr(self, '_flashback_directory_search', None)
+        if worker is not None and worker.isRunning():
+            return
+        original_target = self.flashback_target.text()
+        self._flashback_set_status('正在查找常见启动器的 Flashback 实例…')
+        worker = DirectorySearch(self._find_flashback_game_directory, self, cancellable=True)
+        self._flashback_directory_search = worker
+        worker.finished.connect(lambda: self._directory_search_completed(
+            '_flashback_directory_search', worker,
+            lambda result, error: self._flashback_directory_found(original_target, result, error)))
+        worker.start()
+
+    def _flashback_directory_found(self, original_target, detected, error=''):
+        if self.flashback_target.text() != original_target:
+            self._flashback_set_status('游戏目录已被修改，已保留当前选择。')
+            return
+        if error:
+            self._flashback_set_status('自动查找失败，请点击“选择”指定游戏目录。', error=True)
+            self._flashback_append_log(f'自动查找 Flashback 目录失败：{error}')
+            return
+        if detected is None:
+            self._flashback_set_status('未找到 Flashback 游戏目录，请先安装模组或点击“选择”手动指定。', error=True)
+            return
+        self.flashback_target.setText(str(detected))
+        self._flashback_target_dirty = True
+        self._flashback_set_status(f'已找到 Flashback 游戏目录：{detected}')
+        self._flashback_append_log(f'自动找到 Flashback 游戏目录：{detected}')
+        self._flashback_save_config()
+
+    def _flashback_save_config(self, include_target=True, include_output=True, include_rate=True):
         payload = {
-            'output': self.flashback_output.text().strip(),
-            'target': self.flashback_target.text().strip(),
-            'rate': int(self.flashback_rate.value()),
             'autoZip': bool(self.flashback_auto_zip.isChecked()),
+            # The engine copies installed skins into this stable folder. It is
+            # sent on every save so an upgraded engine cannot revert to a
+            # temporary PyInstaller extraction directory.
+            'skinCache': str(_program_skin_cache_directory()),
         }
+        if include_rate:
+            payload['rate'] = int(self.flashback_rate.value())
+        if include_output:
+            payload['output'] = self.flashback_output.text().strip()
+        if include_target:
+            payload['target'] = self.flashback_target.text().strip()
+        if payload.get('output'):
+            try:
+                self._flashback_output_dir = Path(os.path.abspath(Path(payload['output']).expanduser()))
+                self._flashback_replay_signature = None
+                self._flashback_replay_cache = []
+                self._flashback_replay_cache_at = 0.0
+                self._flashback_refresh_replay_list()
+            except (OSError, RuntimeError, ValueError):
+                pass
         self._flashback_busy = True
         self._flashback_set_status('正在保存录制设置…')
-        self._flashback_request('config', **payload)
+        if not self._flashback_request('config', **payload):
+            self._flashback_busy = False
+            self._flashback_set_status(self._flashback_bridge_error or '无法连接内置录制引擎。', error=True)
 
     def _flashback_export(self):
         self._flashback_busy = True
@@ -5906,13 +6351,79 @@ class LargeApp(App):
         path, _ = QFileDialog.getOpenFileName(self, '选择 Flashback 回放', str(self._flashback_output_dir), 'Flashback 回放 (*.flashback.zip *.zip)')
         if not path:
             return
-        target = self.flashback_target.text().strip()
-        if not target:
-            self._flashback_set_status('请先在录制配置中填写 Flashback 游戏目录。', error=True)
+        self._begin_flashback_import(path, open_after=False)
+
+    def _begin_flashback_import(self, path, *, open_after):
+        if self._closing:
             return
+        self._cancel_directory_search('_flashback_directory_search')
+        generation = getattr(self, '_flashback_import_generation', 0) + 1
+        self._flashback_import_generation = generation
+        self._flashback_pending_open_path = None
+        source = str(path)
+        original_target = self.flashback_target.text()
+        target = original_target.strip()
+        validate = self._is_flashback_game_directory
+        find = self._find_flashback_game_directory
+
+        def resolve_target(cancelled):
+            # This closure captures only plain paths and filesystem helpers,
+            # never the window or a Qt field. All validation stays off Qt.
+            if not Path(source).is_file():
+                raise FileNotFoundError('所选回放文件不存在。')
+            if cancelled():
+                return None
+            if validate(target):
+                return target
+            return None if cancelled() else find(cancelled)
+
+        self._flashback_set_status('正在检查回放与播放目录…')
+        worker = DirectorySearch(resolve_target, self, cancellable=True)
+        self._flashback_directory_search = worker
+        worker.finished.connect(lambda: self._directory_search_completed(
+            '_flashback_directory_search', worker,
+            lambda result, error: self._flashback_import_directory_found(
+                generation, source, original_target, open_after, result, error)))
+        worker.start()
+
+    def _flashback_import_directory_found(self, generation, source, original_target,
+                                         open_after, target, error):
+        if generation != getattr(self, '_flashback_import_generation', 0):
+            return
+        if self.flashback_target.text() != original_target:
+            self._flashback_set_status('游戏目录已被修改，请确认当前目录后重新安装回放。')
+            return
+        if error:
+            self._flashback_set_status(f'无法安装回放：{error}', error=True)
+            return
+        if not target:
+            self._flashback_set_status('请先选择包含 Flashback 模组的游戏目录。', error=True)
+            return
+        self.flashback_target.setText(str(target))
+        self._flashback_pending_open_path = source if open_after else None
         self._flashback_busy = True
-        self._flashback_set_status('正在安装回放与录制皮肤…')
-        self._flashback_request('import', path=path, target=target)
+        self._flashback_set_status('正在安装回放与录制皮肤，然后打开…' if open_after else
+                                  '正在安装回放与录制皮肤…')
+        if not self._flashback_request('import', path=source, target=str(target),
+                                       uiImportGeneration=generation, openAfterImport=open_after):
+            self._flashback_pending_open_path = None
+            self._flashback_busy = False
+
+    def _flashback_open_import_result(self, request, response):
+        # Status snapshots retain the last imported path. Open only the
+        # successful response belonging to this exact install-and-open intent.
+        if (not isinstance(request, dict) or request.get('command') != 'import'
+                or response.get('command') != 'import' or not request.get('openAfterImport')
+                or request.get('uiImportGeneration') != getattr(self, '_flashback_import_generation', 0)
+                or request.get('path') != self._flashback_pending_open_path):
+            return
+        imported = str(response.get('importedReplay') or '')
+        if not imported:
+            return
+        generation = request['uiImportGeneration']
+        self._flashback_pending_open_path = None
+        QTimer.singleShot(120, lambda: self._open_flashback_replay(imported)
+                          if not self._closing and generation == self._flashback_import_generation else None)
 
     def _flashback_mark(self):
         text = self.flashback_marker.text().strip() if hasattr(self, 'flashback_marker') else ''
@@ -5928,31 +6439,73 @@ class LargeApp(App):
             return
         if self._flashback_bridge and self._flashback_bridge.state() == QProcess.ProcessState.Running:
             self._flashback_request('status')
-        self._flashback_refresh_replay_list()
+        # Replay discovery is triggered by an explicit refresh and by the
+        # recorder's stop/export response.  Walking a user-selected output
+        # directory from this periodic status timer can block the GUI when it
+        # lives on a slow disk or network share.
 
-    def _flashback_refresh_replay_list(self):
+    def _flashback_refresh_replay_list(self, force=False):
+        """Schedule disk work; construct rows only from already captured data."""
+        if self._closing or not hasattr(self, 'flashback_replay_layout'):
+            return
+        directories = tuple(self._flashback_replay_dirs())
+        same_directories = directory_key(directories) == directory_key(self._flashback_replay_cache_dirs)
+        if (not force and same_directories and self._flashback_replay_cache_at > 0 and
+                time.monotonic() - self._flashback_replay_cache_at < 2.0):
+            self._flashback_render_replay_list(self._flashback_replay_entries)
+            return
+        self._flashback_replay_catalog.request(
+            directories, force=force or self._flashback_replay_cache_at <= 0)
+        if self._flashback_replay_catalog.busy:
+            self._flashback_replay_scan_timer.start()
+        if same_directories and self._flashback_replay_entries:
+            self._flashback_render_replay_list(self._flashback_replay_entries)
+        else:
+            self._flashback_render_replay_list((), loading=True)
+
+    def _flashback_poll_replay_catalog(self):
+        result = self._flashback_replay_catalog.poll()
+        if self._closing:
+            self._flashback_replay_scan_timer.stop()
+            return
+        if result is not None:
+            directories = tuple(self._flashback_replay_dirs())
+            if directory_key(result.directories) != directory_key(directories):
+                # Editing the directory while a slow scan runs must not put
+                # the previous folder's recordings back into the current UI.
+                self._flashback_replay_catalog.request(directories, force=True)
+            else:
+                self._flashback_replay_entries = result.entries
+                self._flashback_replay_cache = [entry.path for entry in result.entries]
+                self._flashback_replay_cache_dirs = directories
+                self._flashback_replay_cache_at = time.monotonic()
+                self._flashback_render_replay_list(result.entries)
+        information = self._flashback_replay_info_reader.poll()
+        if information is not None and information.entries:
+            self.flashback_replay_info.setPlainText(information.entries[0])
+            self.flashback_replay_info.verticalScrollBar().setValue(0)
+        if not (self._flashback_replay_catalog.busy or self._flashback_replay_info_reader.busy):
+            self._flashback_replay_scan_timer.stop()
+
+    def _flashback_render_replay_list(self, entries, loading=False):
         layout = getattr(self, 'flashback_replay_layout', None)
         if layout is None:
             return
-        replays = self._flashback_replays()
-        signature_items = []
-        for path in replays:
-            try:
-                stat_result = path.stat()
-                signature_items.append((str(path.resolve()), stat_result.st_mtime_ns, stat_result.st_size))
-            except OSError:
-                continue
-        signature = tuple(signature_items)
+        replays = entries[:self._ui_preferences['flashback/replayLimit']]
+        signature = (loading, tuple((entry.identity, entry.mtime_ns, entry.size) for entry in replays))
         if signature == self._flashback_replay_signature:
             return
         self._flashback_replay_signature = signature
         self._clear_layout(layout)
-        if not replays:
+        if loading:
+            layout.addWidget(label('正在读取回放文件…', 'cardHint'))
+        elif not replays:
             output_hint = str(getattr(self, '_flashback_output_dir', Path.home() / 'Videos')).strip()
             layout.addWidget(label(f'还没有回放文件。停止录制后会从“{output_hint}”读取。', 'cardHint'))
         else:
-            for path in replays:
-                row = GlassFrame()
+            for entry in replays:
+                path = entry.path
+                row = QFrame()
                 row.setObjectName('flashbackReplayRow')
                 row_layout = QHBoxLayout(row)
                 row_layout.setContentsMargins(10, 7, 10, 7)
@@ -5961,10 +6514,9 @@ class LargeApp(App):
                 title = path.name.removesuffix('.flashback.zip')
                 copy.addWidget(label(title, 'cardTitle'))
                 try:
-                    stat_result = path.stat()
-                    modified = datetime.fromtimestamp(stat_result.st_mtime).strftime('%Y-%m-%d %H:%M')
-                    detail = f'{stat_result.st_size / (1024 * 1024):.1f} MB · {modified}'
-                except OSError:
+                    modified = datetime.fromtimestamp(entry.mtime_ns / 1_000_000_000).strftime('%Y-%m-%d %H:%M')
+                    detail = f'{entry.size / (1024 * 1024):.1f} MB · {modified}'
+                except (OSError, OverflowError, ValueError):
                     detail = '文件信息暂不可用'
                 hint = label(detail, 'cardHint')
                 hint.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -5977,53 +6529,21 @@ class LargeApp(App):
                 inspect = self.button('查看信息', lambda checked=False, p=path: self._flashback_show_replay_info(p))
                 row_layout.addWidget(inspect)
                 open_file = self.button(
-                    '打开文件',
-                    lambda checked=False, p=path: QDesktopServices.openUrl(
-                        QUrl.fromLocalFile(str(p))))
+                    '安装并打开',
+                    lambda checked=False, p=path: self._install_and_open_flashback_replay(p))
                 row_layout.addWidget(open_file)
                 row.mouseDoubleClickEvent = lambda event, p=path: self._flashback_show_replay_info(p)
                 layout.addWidget(row)
         layout.addStretch(1)
 
     def _flashback_show_replay_info(self, path):
+        if self._closing:
+            return
         path = Path(path)
-        try:
-            import zipfile
-            with zipfile.ZipFile(path) as archive:
-                names = archive.namelist()
-                metadata = {}
-                if 'metadata.json' in names:
-                    metadata = json.loads(archive.read('metadata.json').decode('utf-8', errors='replace'))
-            stat_result = path.stat()
-            summary_lines = [
-                f'回放：{path.name}',
-                f'位置：{path.parent}',
-                f'大小：{stat_result.st_size / (1024 * 1024):.1f} MB',
-                f'文件：{len(names)} 项',
-            ]
-            labels = {
-                'name': '名称', 'version_string': '版本', 'total_ticks': '总 tick',
-                'data_version': '数据版本', 'protocol_version': '协议版本',
-                'world_name': '世界',
-            }
-            for key, title in labels.items():
-                if key in metadata:
-                    summary_lines.append(f'{title}：{metadata[key]}')
-            recorder = metadata.get('flashback_recorder')
-            if isinstance(recorder, dict):
-                source = recorder.get('source_file')
-                if source:
-                    summary_lines.append(f'录制源：{source}')
-            summary_lines.append('')
-            summary_lines.append('压缩包内容：')
-            summary_lines.extend(f'· {name}' for name in names[:40])
-            if len(names) > 40:
-                summary_lines.append(f'· …还有 {len(names) - 40} 项')
-            summary = '\n'.join(summary_lines)
-            self.flashback_replay_info.setPlainText(summary)
-            self.flashback_replay_info.verticalScrollBar().setValue(0)
-        except Exception as error:
-            self.flashback_replay_info.setPlainText(f'无法读取回放信息：{error}')
+        self.flashback_replay_info.setPlainText(
+            f'回放：{path.name}\n位置：{path.parent}\n\n正在读取回放信息…')
+        self._flashback_replay_info_reader.request((path,), force=True)
+        self._flashback_replay_scan_timer.start()
 
     def _build_flashback_native_page(self):
         page = QWidget()
@@ -6066,33 +6586,35 @@ class LargeApp(App):
         heading.addWidget(label('录制、标记、查看回放状态都在 ZJ HUB 内完成。不会再弹出第二个录制器窗口。', 'pageHint'))
         layout.addLayout(heading)
 
-        hero = GlassFrame(); hero.setObjectName('flashbackHero')
+        hero = QFrame(); hero.setObjectName('flashbackHero')
         hero_layout = QVBoxLayout(hero); hero_layout.setContentsMargins(16, 13, 16, 13); hero_layout.setSpacing(9)
         top = QHBoxLayout(); top.setSpacing(9)
         top.addWidget(icon_tile('blocks', 'sectionIcon', '#bfe1ff', 16, 30))
         copy = QVBoxLayout(); copy.setSpacing(2)
-        copy.addWidget(label('ZJ HUB 内置录制引擎', 'cardTitle'))
+        self.flashback_engine_title = label(f'ZJ HUB v{APP_VERSION} · 内置录制引擎', 'cardTitle')
+        copy.addWidget(self.flashback_engine_title)
         self.flashback_status = label('正在连接内置引擎…', 'cardHint'); self.flashback_status.setObjectName('flashbackStatus')
         copy.addWidget(self.flashback_status); top.addLayout(copy, 1)
         refresh = self.button('刷新进程', self._flashback_refresh, True); refresh.setProperty('themeIconName', 'refresh'); top.addWidget(refresh)
         hero_layout.addLayout(top)
         self.flashback_process_combo = ThemedComboBox(); self.flashback_process_combo.setObjectName('flashbackProcessCombo'); self.flashback_process_combo.currentIndexChanged.connect(self._flashback_process_changed)
         self.flashback_process_combo.setMinimumHeight(38); hero_layout.addWidget(self.flashback_process_combo)
-        self.flashback_process_hint = label('只注入 Minecraft 1.20.1；网易客户端需要允许 Java Attach。', 'cardHint'); hero_layout.addWidget(self.flashback_process_hint)
+        self.flashback_process_hint = label('支持 Minecraft 1.20.1 / 1.21.10；网易客户端需要允许 Java Attach。', 'cardHint'); hero_layout.addWidget(self.flashback_process_hint)
         layout.addWidget(hero)
 
-        tutorial = GlassFrame(); tutorial.setObjectName('flashbackTutorial')
+        tutorial = QFrame(); tutorial.setObjectName('flashbackTutorial')
         tutorial_layout = QVBoxLayout(tutorial); tutorial_layout.setContentsMargins(14, 10, 14, 10); tutorial_layout.setSpacing(4)
         tutorial_layout.addWidget(label('快速开始', 'section'))
         tutorial_layout.addWidget(label(
-            '① 进入 1.20.1 世界并选择进程　② 点击注入录制组件　③ 组件就绪后点击开始录制　④ 停止后等待回放自动生成',
+            '① 进入 1.20.1 / 1.21.10 世界并选择进程　② 点击注入录制组件　③ 组件就绪后点击开始录制　④ 停止后等待回放自动生成',
             'cardHint'))
         tutorial_layout.addWidget(label(
             '注入后的初始世界快照可能需要几秒；提前点击开始会自动排队，不会丢失操作。',
             'cardHint'))
+        tutorial_layout.addWidget(self.button('打开完整使用引导', lambda: self.show_quick_start(force=True)))
         layout.addWidget(tutorial)
 
-        session = GlassFrame(); session.setObjectName('flashbackSessionCard')
+        session = QFrame(); session.setObjectName('flashbackSessionCard')
         session_layout = QVBoxLayout(session); session_layout.setContentsMargins(16, 13, 16, 13); session_layout.setSpacing(9)
         session_header = self._section_header_layout('录制控制', 'command')
         self.flashback_pack_button = self.button(
@@ -6109,7 +6631,7 @@ class LargeApp(App):
         metrics = QGridLayout(); metrics.setHorizontalSpacing(8); metrics.setVerticalSpacing(8)
         self.flashback_pid_value = label('-', 'metricSmallCompact'); self.flashback_samples_value = label('0', 'metricSmallCompact'); self.flashback_packets_value = label('0', 'metricSmallCompact'); self.flashback_recording_value = label('未录制', 'metricSmallCompact')
         for col, title, widget in ((0, 'PID', self.flashback_pid_value), (1, '样本', self.flashback_samples_value), (2, '数据包', self.flashback_packets_value), (3, '状态', self.flashback_recording_value)):
-            card = GlassFrame(); card.setObjectName('metricCard'); cl = QVBoxLayout(card); cl.setContentsMargins(10, 8, 10, 8); cl.addWidget(label(title, 'cardHint')); cl.addWidget(widget); metrics.addWidget(card, 0, col)
+            card = QFrame(); card.setObjectName('metricCard'); cl = QVBoxLayout(card); cl.setContentsMargins(10, 8, 10, 8); cl.addWidget(label(title, 'cardHint')); cl.addWidget(widget); metrics.addWidget(card, 0, col)
         session_layout.addLayout(metrics)
         action_row = QHBoxLayout(); action_row.setSpacing(8)
         self.flashback_inject_button = self.button('注入录制组件', self._flashback_inject, True); self.flashback_inject_button.setProperty('themeIconName', 'target')
@@ -6120,16 +6642,17 @@ class LargeApp(App):
         mark_row = QHBoxLayout(); mark_row.setSpacing(8)
         self.flashback_marker = QLineEdit(); self.flashback_marker.setObjectName('themedInput'); self.flashback_marker.setPlaceholderText('时间线标记，例如：进入矿洞 / 发生团战'); mark_row.addWidget(self.flashback_marker, 1)
         mark_row.addWidget(self.button('添加标记', self._flashback_mark))
-        self.flashback_rate = QSpinBox(); self.flashback_rate.setObjectName('flashbackRate'); self.flashback_rate.setRange(20, 120); self.flashback_rate.setSingleStep(10); self.flashback_rate.setValue(20); self.flashback_rate.setSuffix(' tick/s'); self.flashback_rate.setToolTip('录制采样频率，不会改变游戏速度。'); mark_row.addWidget(self.flashback_rate)
+        mark_row.addWidget(label('读取频率', 'cardHint'))
+        self.flashback_rate = NumberField(); self.flashback_rate.setObjectName('flashbackRate'); self.flashback_rate.setRange(20, 120); self.flashback_rate.setSingleStep(10); self.flashback_rate.setValue(20); self.flashback_rate.setSuffix(' tick/s'); self.flashback_rate.setToolTip('录制采样频率：20～120 tick/s。只能在开始录制前修改，开始后本段固定。'); self.flashback_rate.valueChanged.connect(self._flashback_rate_edited); mark_row.addWidget(self.flashback_rate)
         session_layout.addLayout(mark_row)
-        config = GlassFrame(); config.setObjectName('flashbackConfigCard')
+        config = QFrame(); config.setObjectName('flashbackConfigCard')
         config_layout = QGridLayout(config); config_layout.setContentsMargins(10, 9, 10, 9); config_layout.setHorizontalSpacing(8); config_layout.setVerticalSpacing(7)
         config_layout.addWidget(label('录制配置', 'section'), 0, 0, 1, 4)
-        self.flashback_output = QLineEdit(); self.flashback_output.setObjectName('themedInput'); self.flashback_output.setPlaceholderText('录制保存目录')
-        self.flashback_target = QLineEdit(); self.flashback_target.setObjectName('themedInput'); self.flashback_target.setPlaceholderText('可选：完整版 Flashback 游戏目录')
-        output_button = self.button('选择', self._flashback_choose_output); target_button = self.button('选择', self._flashback_choose_target)
+        self.flashback_output = QLineEdit(); self.flashback_output.setObjectName('themedInput'); self.flashback_output.setPlaceholderText('录制保存目录'); self.flashback_output.textChanged.connect(self._flashback_output_edited)
+        self.flashback_target = QLineEdit(); self.flashback_target.setObjectName('themedInput'); self.flashback_target.setPlaceholderText('可选：完整版 Flashback 游戏目录'); self.flashback_target.textChanged.connect(self._flashback_target_edited)
+        output_button = self.button('选择', self._flashback_choose_output); target_button = self.button('选择', self._flashback_choose_target); find_target_button = self.button('自动查找', self._flashback_find_target)
         config_layout.addWidget(label('保存目录', 'cardHint'), 1, 0); config_layout.addWidget(self.flashback_output, 1, 1); config_layout.addWidget(output_button, 1, 2)
-        config_layout.addWidget(label('回放目录', 'cardHint'), 2, 0); config_layout.addWidget(self.flashback_target, 2, 1); config_layout.addWidget(target_button, 2, 2)
+        config_layout.addWidget(label('回放目录', 'cardHint'), 2, 0); config_layout.addWidget(self.flashback_target, 2, 1); config_layout.addWidget(target_button, 2, 2); config_layout.addWidget(find_target_button, 2, 3)
         self.flashback_auto_zip = QCheckBox('停止后自动生成回放 ZIP'); self.flashback_auto_zip.setObjectName('flashbackAutoZip'); self.flashback_auto_zip.setChecked(True); config_layout.addWidget(self.flashback_auto_zip, 3, 0, 1, 2)
         save_config = self.button('保存设置', self._flashback_save_config, True); config_layout.addWidget(save_config, 3, 2)
         export_button = self.button('导出最近录制', self._flashback_export); import_button = self.button('安装已有回放', self._flashback_import)
@@ -6137,8 +6660,11 @@ class LargeApp(App):
         session_layout.addWidget(config)
         layout.addWidget(session)
 
+        log_card = QFrame(); log_card.setObjectName('flashbackLogCard'); log_layout = QVBoxLayout(log_card); log_layout.setContentsMargins(14, 10, 14, 10); log_layout.addLayout(self._section_header_layout('内置引擎日志', 'command'))
+        self.flashback_log = QPlainTextEdit(); self.flashback_log.setObjectName('flashbackLog'); self.flashback_log.setReadOnly(True); self.flashback_log.setMaximumBlockCount(120); self.flashback_log.setMinimumHeight(70); log_layout.addWidget(self.flashback_log); layout.addWidget(log_card)
+
         lower = QHBoxLayout(); lower.setSpacing(12)
-        replay_card = GlassFrame(); replay_card.setObjectName('flashbackReplayCard'); replay_layout = QVBoxLayout(replay_card); replay_layout.setContentsMargins(14, 12, 14, 12); replay_layout.setSpacing(8)
+        replay_card = QFrame(); replay_card.setObjectName('flashbackReplayCard'); replay_layout = QVBoxLayout(replay_card); replay_layout.setContentsMargins(14, 12, 14, 12); replay_layout.setSpacing(8)
         self._section_header(replay_layout, '最近回放', 'layers')
         self.flashback_replay_scroll = QScrollArea(); self.flashback_replay_scroll.setObjectName('flashbackReplayScroll'); self.flashback_replay_scroll.setWidgetResizable(True); self.flashback_replay_scroll.setMinimumHeight(190); self.flashback_replay_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.flashback_replay_scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -6150,15 +6676,20 @@ class LargeApp(App):
         replay_palette.setColor(QPalette.ColorRole.Window, Qt.GlobalColor.transparent)
         replay_viewport.setPalette(replay_palette)
         self.flashback_replay_host = QWidget(); self.flashback_replay_host.setObjectName('flashbackReplayHost'); self.flashback_replay_host.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True); self.flashback_replay_layout = QVBoxLayout(self.flashback_replay_host); self.flashback_replay_layout.setContentsMargins(1, 1, 3, 1); self.flashback_replay_layout.setSpacing(7); self.flashback_replay_scroll.setWidget(self.flashback_replay_host); replay_layout.addWidget(self.flashback_replay_scroll, 1); lower.addWidget(replay_card, 1)
-        info_card = GlassFrame(); info_card.setObjectName('flashbackInfoCard'); info_layout = QVBoxLayout(info_card); info_layout.setContentsMargins(14, 12, 14, 12); info_layout.addLayout(self._section_header_layout('回放信息', 'chart'))
+        info_card = QFrame(); info_card.setObjectName('flashbackInfoCard'); info_layout = QVBoxLayout(info_card); info_layout.setContentsMargins(14, 12, 14, 12); info_layout.addLayout(self._section_header_layout('回放信息', 'chart'))
         self.flashback_replay_info = QPlainTextEdit(); self.flashback_replay_info.setObjectName('flashbackInfo'); self.flashback_replay_info.setReadOnly(True); self.flashback_replay_info.setMinimumHeight(190); self.flashback_replay_info.setPlaceholderText('选择一条回放查看版本、时长、录制源和压缩包内容。'); info_layout.addWidget(self.flashback_replay_info, 1); lower.addWidget(info_card, 1)
         layout.addLayout(lower, 1)
 
-        log_card = GlassFrame(); log_card.setObjectName('flashbackLogCard'); log_layout = QVBoxLayout(log_card); log_layout.setContentsMargins(14, 10, 14, 10); log_layout.addLayout(self._section_header_layout('内置引擎日志', 'command'))
-        self.flashback_log = QPlainTextEdit(); self.flashback_log.setObjectName('flashbackLog'); self.flashback_log.setReadOnly(True); self.flashback_log.setMaximumBlockCount(120); self.flashback_log.setMinimumHeight(70); log_layout.addWidget(self.flashback_log); layout.addWidget(log_card)
-
         self._flashback_replay_layout = self.flashback_replay_layout
-        self._flashback_status_timer = QTimer(self); self._flashback_status_timer.setInterval(1000); self._flashback_status_timer.timeout.connect(self._flashback_status_tick)
+        self._flashback_replay_scan_timer = QTimer(self)
+        self._flashback_replay_scan_timer.setInterval(35)
+        self._flashback_replay_scan_timer.timeout.connect(self._flashback_poll_replay_catalog)
+        self._flashback_status_timer = QTimer(self)
+        # Process enumeration and replay discovery are intentionally periodic,
+        # not animation work.  A 1.5 s cadence leaves the GUI more headroom
+        # while keeping recording state changes visible quickly.
+        self._flashback_status_timer.setInterval(self._ui_preferences['flashback/statusInterval'])
+        self._flashback_status_timer.timeout.connect(self._flashback_status_tick)
         # Preserve the form's natural height inside the outer scroll area.
         # Without an explicit minimum, ``widgetResizable`` allows the content
         # widget to shrink back to the viewport and the lower cards squeeze
@@ -6170,117 +6701,7 @@ class LargeApp(App):
     def _section_header_layout(self, title, icon_name='command'):
         holder = QHBoxLayout(); holder.setSpacing(8); holder.addWidget(icon_tile(icon_name, 'sectionIcon', '#bfe1ff', 15, 28)); holder.addWidget(label(title, 'section')); holder.addStretch(1); return holder
 
-    def _build_flashback_page(self):
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(4, 0, 4, 0)
-        layout.setSpacing(14)
 
-        heading = QVBoxLayout()
-        heading.setSpacing(4)
-        heading.addWidget(label('REPLAY TOOLS / FLASHBACK', 'eyebrow'))
-        heading.addWidget(label('Flashback 录制', 'pageTitle'))
-        heading.addWidget(label('录制 Minecraft 1.20.1 游戏过程，并整理为可回放的 Flashback 文件。', 'pageHint'))
-        layout.addLayout(heading)
-
-        hero = GlassFrame()
-        hero.setObjectName('flashbackHero')
-        hero_layout = QVBoxLayout(hero)
-        hero_layout.setContentsMargins(18, 15, 18, 15)
-        hero_layout.setSpacing(10)
-        hero_header = QHBoxLayout()
-        hero_header.setSpacing(9)
-        hero_header.addWidget(icon_tile('blocks', 'sectionIcon', '#bfe1ff', 16, 30))
-        copy = QVBoxLayout()
-        copy.setSpacing(3)
-        copy.addWidget(label('Flashback Recorder', 'cardTitle'))
-        self.flashback_status = label('正在检查录制器…', 'cardHint')
-        self.flashback_status.setObjectName('flashbackStatus')
-        copy.addWidget(self.flashback_status)
-        hero_header.addLayout(copy, 1)
-        self.flashback_launch_button = self.button('启动录制器', self._launch_flashback_recorder, True)
-        self.flashback_launch_button.setObjectName('flashbackLaunchButton')
-        self.flashback_launch_button.setProperty('themeIconName', 'command')
-        hero_header.addWidget(self.flashback_launch_button)
-        hero_layout.addLayout(hero_header)
-        self.flashback_path_hint = label('', 'cardHint')
-        self.flashback_path_hint.setObjectName('flashbackPathHint')
-        self.flashback_path_hint.setWordWrap(True)
-        hero_layout.addWidget(self.flashback_path_hint)
-        actions = QHBoxLayout()
-        actions.setSpacing(8)
-        actions.addWidget(self.button('打开回放目录', self._open_flashback_replay_folder))
-        actions.addWidget(self.button('打开交付目录', self._open_flashback_package))
-        actions.addStretch(1)
-        actions.addWidget(self.button('刷新列表', self._refresh_flashback_page))
-        hero_layout.addLayout(actions)
-        layout.addWidget(hero)
-
-        guide = GlassFrame()
-        guide.setObjectName('flashbackGuideCard')
-        guide_layout = QHBoxLayout(guide)
-        guide_layout.setContentsMargins(16, 13, 16, 13)
-        guide_layout.setSpacing(10)
-        for title, detail, icon in (
-            ('选择进程', '进入世界后手动选择网易 Minecraft 1.20.1', 'target'),
-            ('开始录制', '注入后选择 20～120 tick 读取频率', 'chart'),
-            ('生成回放', '停止录制后导出 .mc1.21.11.flashback.zip', 'layers'),
-        ):
-            item = QVBoxLayout()
-            item.setSpacing(3)
-            item.addWidget(icon_tile(icon, 'sectionIcon', '#bfe1ff', 13, 24))
-            item.addWidget(label(title, 'cardTitle'))
-            note = label(detail, 'cardHint')
-            note.setWordWrap(True)
-            item.addWidget(note)
-            guide_layout.addLayout(item, 1)
-        layout.addWidget(guide)
-
-        replay_card = GlassFrame()
-        replay_card.setObjectName('flashbackReplayCard')
-        replay_layout = QVBoxLayout(replay_card)
-        replay_layout.setContentsMargins(16, 14, 16, 14)
-        replay_layout.setSpacing(9)
-        replay_header = QHBoxLayout()
-        replay_header.addWidget(label('最近回放', 'section'))
-        replay_header.addStretch(1)
-        replay_header.addWidget(label('双击文件可直接打开', 'cardHint'))
-        replay_layout.addLayout(replay_header)
-        self.flashback_replay_scroll = QScrollArea()
-        self.flashback_replay_scroll.setObjectName('flashbackReplayScroll')
-        self.flashback_replay_scroll.setWidgetResizable(True)
-        self.flashback_replay_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.flashback_replay_host = QWidget()
-        self.flashback_replay_layout = QVBoxLayout(self.flashback_replay_host)
-        self.flashback_replay_layout.setContentsMargins(2, 2, 5, 2)
-        self.flashback_replay_layout.setSpacing(7)
-        self.flashback_replay_scroll.setWidget(self.flashback_replay_host)
-        replay_layout.addWidget(self.flashback_replay_scroll, 1)
-        layout.addWidget(replay_card, 1)
-
-        self._refresh_flashback_page()
-        return page
-
-    def _launch_flashback_recorder(self):
-        executable = self._find_flashback_executable()
-        if executable is None:
-            self.flashback_status.setText('未找到录制器，请把 FlashbackRecorder-Compat-Warning.exe 放到 ZJ HUB/plugins/FlashbackRecorder。')
-            self.flashback_path_hint.setText('也可以点击“打开交付目录”，从完整交付包中直接启动。')
-            return
-        process = self._flashback_process
-        if process is not None and process.poll() is None:
-            self.flashback_status.setText('录制器已经在运行。请在录制器中选择 Minecraft 进程。')
-            return
-        try:
-            self._flashback_process = subprocess.Popen(
-                [str(executable), '--theme', str(getattr(self, 'current_theme', 'light'))],
-                cwd=str(executable.parent),
-                creationflags=getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0))
-        except OSError as error:
-            self.flashback_status.setText(f'录制器启动失败：{error}')
-            return
-        self.flashback_status.setText('录制器已启动 · 请进入世界后手动选择进程并注入。')
-        self.flashback_path_hint.setText(str(executable))
 
     def _stop_flashback_recorder_process(self):
         """Stop the legacy external recorder without leaving a child behind."""
@@ -6326,6 +6747,10 @@ class LargeApp(App):
         if path.is_file():
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
+    def _install_and_open_flashback_replay(self, path):
+        """Install sidecar skins before opening a replay ZIP."""
+        self._begin_flashback_import(path, open_after=True)
+
     def _clear_layout(self, layout):
         while layout.count():
             item = layout.takeAt(0)
@@ -6336,64 +6761,14 @@ class LargeApp(App):
             elif child is not None:
                 self._clear_layout(child)
 
-    def _refresh_flashback_page(self):
-        if not hasattr(self, 'flashback_replay_layout'):
-            return
-        executable = self._find_flashback_executable()
-        if executable is None:
-            self.flashback_status.setText('未找到录制器 · 可从完整交付目录启动')
-            self.flashback_launch_button.setEnabled(False)
-            self.flashback_path_hint.setText('插件目录：ZJ HUB/plugins/FlashbackRecorder/')
-        else:
-            self.flashback_launch_button.setEnabled(True)
-            self.flashback_path_hint.setText(str(executable))
-            process = self._flashback_process
-            if process is None or process.poll() is not None:
-                self.flashback_status.setText('录制器已就绪 · 需要 Java 17/21 和 Minecraft 1.20.1')
-            else:
-                self.flashback_status.setText('录制器正在运行 · 请在录制器中选择进程')
 
-        self._clear_layout(self.flashback_replay_layout)
-        replays = self._flashback_replays()
-        if not replays:
-            output_hint = str(getattr(self, '_flashback_output_dir', Path.home() / 'Videos')).strip()
-            empty = label(f'还没有找到回放文件。停止录制后会从“{output_hint}”读取。', 'cardHint')
-            empty.setWordWrap(True)
-            self.flashback_replay_layout.addWidget(empty)
-        else:
-            for path in replays:
-                row = GlassFrame()
-                row.setObjectName('flashbackReplayRow')
-                row_layout = QHBoxLayout(row)
-                row_layout.setContentsMargins(11, 8, 10, 8)
-                row_layout.setSpacing(8)
-                row_layout.addWidget(icon_tile('layers', 'sectionIcon', '#bfe1ff', 13, 25))
-                copy = QVBoxLayout()
-                copy.setSpacing(2)
-                title = label(path.stem, 'cardTitle')
-                title.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-                copy.addWidget(title)
-                try:
-                    size_mb = path.stat().st_size / (1024 * 1024)
-                    detail = f'{size_mb:.1f} MB · {path.parent}'
-                except OSError:
-                    detail = str(path.parent)
-                hint = label(detail, 'cardHint')
-                hint.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-                copy.addWidget(hint)
-                row_layout.addLayout(copy, 1)
-                open_button = self.button('打开', lambda checked=False, p=path: self._open_flashback_replay(p))
-                row_layout.addWidget(open_button)
-                row.mouseDoubleClickEvent = lambda event, p=path: self._open_flashback_replay(p)
-                self.flashback_replay_layout.addWidget(row)
-        self.flashback_replay_layout.addStretch(1)
 
     def _ensure_chat_emoji_panel(self):
         """Create the small built-in emoji picker once, without dependencies."""
         popup = getattr(self, 'chat_emoji_popup', None)
         if popup is not None:
             return popup
-        popup = GlassFrame(self, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        popup = QFrame(self, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
         popup.setObjectName('chatEmojiPopup')
         popup.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         popup.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
@@ -6491,10 +6866,17 @@ class LargeApp(App):
         self.chat_sound_enabled = bool(enabled)
         self._settings.setValue(CHAT_SOUND_ENABLED_KEY, self.chat_sound_enabled)
         self._settings.sync()
-        if hasattr(self, 'chat_sound_hint'):
-            self.chat_sound_hint.setText(
-                '已开启，新消息会播放提示音。' if self.chat_sound_enabled
-                else '已关闭，不会播放大厅消息提示音。')
+        hint_text = (
+            '已开启，新消息会播放提示音。' if self.chat_sound_enabled
+            else '已关闭，不会播放大厅消息提示音。')
+        for hint_widget in getattr(self, '_chat_sound_hints', ()):
+            if hint_widget is not None:
+                hint_widget.setText(hint_text)
+        for toggle_widget in getattr(self, '_chat_sound_toggles', ()):
+            if toggle_widget is not None and toggle_widget.isChecked() != self.chat_sound_enabled:
+                blocker = QSignalBlocker(toggle_widget)
+                toggle_widget.setChecked(self.chat_sound_enabled)
+                del blocker
 
     def _set_chat_sound_volume(self, value):
         try:
@@ -6502,11 +6884,18 @@ class LargeApp(App):
         except (TypeError, ValueError):
             return
         self._settings.setValue(CHAT_SOUND_VOLUME_KEY, self.chat_sound_volume)
-        self._settings.sync()
+        # QSettings coalesces writes through the event loop. Keep dragging
+        # responsive; closeEvent explicitly flushes the final selected value.
         if self._chat_sound_effect is not None:
             self._chat_sound_effect.setVolume(self.chat_sound_volume / 100.0)
-        if hasattr(self, 'chat_sound_volume_value'):
-            self.chat_sound_volume_value.setText(f'{self.chat_sound_volume}%')
+        for slider_widget in getattr(self, '_chat_sound_sliders', ()):
+            if slider_widget is not None and slider_widget.value() != self.chat_sound_volume:
+                blocker = QSignalBlocker(slider_widget)
+                slider_widget.setValue(self.chat_sound_volume)
+                del blocker
+        for value_widget in getattr(self, '_chat_sound_values', ()):
+            if value_widget is not None:
+                value_widget.setText(f'{self.chat_sound_volume}%')
 
     def _play_chat_sound(self):
         if self._closing or not self.chat_sound_enabled or self.chat_sound_volume <= 0:
@@ -6561,6 +6950,8 @@ class LargeApp(App):
         self._render_lobby_messages(messages)
 
     def _save_chat_session_cache(self):
+        if self._closing:
+            return
         if not self._chat_messages:
             self._settings.remove(CHAT_SESSION_CACHE_KEY)
             return
@@ -6631,7 +7022,7 @@ class LargeApp(App):
             self.chat_emoji_button.setEnabled(configured and not busy)
         connection_state = self.chat_connection_badge.text()
         if configured:
-            self.chat_input.setPlaceholderText(f'以 {player_id} 发言 · 输入大厅消息')
+            self.chat_input.setPlaceholderText(f'以 {player_id} 发言 · /help 查看指令')
             if not preserve_status:
                 self.chat_status.setText(f'当前身份：{player_id} · 公共频道')
             if not preserve_status or connection_state in {'未登录', '准备连接', '已绑定 ID'}:
@@ -6689,8 +7080,11 @@ class LargeApp(App):
     def _send_lobby_chat(self):
         if self._closing:
             return
-        player_id = self._chat_bound_game_id()
         message = self.chat_input.text().strip()
+        if self._run_lobby_command(message):
+            self.chat_input.clear()
+            return
+        player_id = self._chat_bound_game_id()
         if not player_id:
             self.chat_status.setText('请先登录游戏 ID，聊天身份会与查询玩家同步。')
             return
@@ -6717,6 +7111,8 @@ class LargeApp(App):
 
     def _begin_chat_message_send(self, message):
         message = str(message or '').strip()
+        if self._run_lobby_command(message):
+            return False
         if not message or self._chat_sending_message:
             return False
         self._chat_sending_message = message
@@ -6785,7 +7181,87 @@ class LargeApp(App):
 
     def _on_supabase_presence_changed(self, count):
         if hasattr(self, 'chat_online_count'):
-            self.chat_online_count.setText(str(max(0, int(count))))
+            ready = self._chat_client.presence_synced
+            self.chat_online_count.setText(str(max(0, int(count))) if ready else '—')
+            self.chat_online_count.setToolTip('ZJ HUB 大厅在线连接数；同一玩家多个窗口分别计数')
+        if (getattr(self, '_chat_command_kind', '') == 'player' and
+                hasattr(self, 'chat_command_output')):
+            self.chat_command_output.setPlainText(self._chat_player_command_text())
+
+    def _chat_player_command_text(self):
+        scope = ('仅统计 ZJ HUB 公共大厅，不是 Minecraft 服务器的全服玩家名单。\n'
+                 '玩家 ID 来自大厅在线状态，不代表已验证身份。\n\n')
+        if not self._chat_bound_game_id():
+            return scope + '尚未登录游戏 ID。登录并加入大厅后，再查询在线玩家。'
+        if not self._chat_client.joined:
+            return scope + '大厅尚未连接或连接已断开；旧名单已清除。连接恢复后可再次查询。'
+        players = self._chat_client.online_players()
+        if players is None:
+            return scope + '正在等待大厅同步在线名单，请稍候；这不表示当前在线人数为 0。'
+        connections = sum(count for _name, count in players)
+        rows = [scope + f'在线玩家：{len(players)} 人 · 在线连接：{connections} 个',
+                '同一玩家 ID 不区分大小写合并，多个窗口会计为多个连接。', '']
+        rows.extend(f'{index}. {name}' + (f'（{count} 个连接）' if count > 1 else '')
+                    for index, (name, count) in enumerate(players, 1))
+        if not players:
+            rows.append('已同步完成，当前名单为空。')
+        return '\n'.join(rows)
+
+    def _run_lobby_command(self, message):
+        """Consume every slash command locally, before login/send/queue paths."""
+        message = str(message or '').strip()
+        if not message.startswith('/'):
+            return False
+        if self._closing:
+            return True
+        parts = message.split()
+        command = parts[0].casefold()
+        kind = ''
+        if command in {'/help', '/player'} and len(parts) != 1:
+            title, result = '指令用法', f'用法：{command}\n此指令不需要附加参数。输入 /help 查看全部指令。'
+        elif command == '/help':
+            title = '大厅指令大全'
+            result = ('/help — 查看全部大厅本地指令，无需登录。\n\n'
+                      '/player — 查询 ZJ HUB 公共大厅当前在线玩家，按玩家 ID 合并并显示连接数。\n\n'
+                      '这些指令和结果仅在本机显示，不会发到公共频道。\n'
+                      '在线名单不是 Minecraft 服务器的全服玩家名单，也不代表身份验证。\n\n'
+                      '未登录时可使用大厅上方的“指令 /help”按钮；普通聊天仍需登录。')
+        elif command == '/player':
+            title, result, kind = '大厅在线玩家', self._chat_player_command_text(), 'player'
+        else:
+            title, result = '未知指令', f'未知指令：{parts[0][:80]}\n输入 /help 查看全部指令。此内容未发送到公共频道。'
+        self._show_chat_command_result(title, result, kind)
+        return True
+
+    def _show_chat_command_result(self, title, text, kind=''):
+        if not hasattr(self, 'chat_command_dialog'):
+            self.chat_command_dialog = QDialog(self)
+            self.chat_command_dialog.setObjectName('chatCommandDialog')
+            self.chat_command_dialog.setWindowTitle('ZJ HUB · 大厅本地指令')
+            self.chat_command_dialog.resize(560, 410)
+            self.chat_command_dialog.setMinimumSize(340, 260)
+            layout = QVBoxLayout(self.chat_command_dialog)
+            layout.setContentsMargins(20, 18, 20, 18)
+            layout.setSpacing(12)
+            self.chat_command_heading = label('', 'cardTitle')
+            layout.addWidget(self.chat_command_heading)
+            layout.addWidget(label('本地结果 · 不会发送到公共频道 · 可选择复制', 'cardHint'))
+            self.chat_command_output = QPlainTextEdit()
+            self.chat_command_output.setObjectName('chatCommandOutput')
+            self.chat_command_output.setReadOnly(True)
+            layout.addWidget(self.chat_command_output, 1)
+            actions = QHBoxLayout()
+            actions.addWidget(self.button('/help', lambda: self._run_lobby_command('/help')))
+            actions.addWidget(self.button('/player', lambda: self._run_lobby_command('/player')))
+            actions.addStretch(1)
+            actions.addWidget(self.button('关闭', self.chat_command_dialog.close))
+            layout.addLayout(actions)
+        self._chat_command_kind = kind
+        self.chat_command_heading.setText(title)
+        self.chat_command_output.setPlainText(text)
+        self.chat_command_dialog.show()
+        self.chat_command_dialog.raise_()
+        self.chat_command_dialog.activateWindow()
 
     def _on_supabase_chat_message(self, payload):
         if self._closing or not isinstance(payload, dict):
@@ -6817,13 +7293,28 @@ class LargeApp(App):
         self._chat_messages = self._chat_messages[-80:]
         self._chat_message_keys = {
             self._chat_message_key(message) for message in self._chat_messages}
-        self._save_chat_session_cache()
-        self._render_lobby_messages(self._chat_messages)
+        self._schedule_chat_cache_save()
+        self._schedule_chat_render()
         if not own_echo and not is_current_player_message:
             self._play_chat_sound()
         if not is_current_player_message and not self._lobby_chat_is_open():
             self._set_lobby_chat_unread(True)
         self.chat_status.setText('已同步实时消息 · 公共大厅可见')
+
+    def _schedule_chat_render(self):
+        timer = getattr(self, '_chat_render_timer', None)
+        if timer is not None and not self._closing and not timer.isActive():
+            timer.start()
+
+    def _flush_chat_render(self):
+        if self._closing:
+            return
+        self._render_lobby_messages(self._chat_messages)
+
+    def _schedule_chat_cache_save(self):
+        timer = getattr(self, '_chat_cache_save_timer', None)
+        if timer is not None and not self._closing:
+            timer.start()
 
     def _schedule_chat_scroll_to_latest(self):
         timer = getattr(self, '_chat_scroll_timer', None)
@@ -6839,16 +7330,48 @@ class LargeApp(App):
         scrollbar = self.chat_scroll.verticalScrollBar()
         target = scrollbar.maximum()
         animation = getattr(self, '_chat_scroll_animation', None)
-        if animation is None:
+        if animation is None or self._animation_factor() == 0:
+            if animation is not None:
+                animation.stop()
             scrollbar.setValue(target)
             return
         animation.stop()
         current = scrollbar.value()
         if current == target:
             return
+        animation.setDuration(self._animation_duration(150))
         animation.setStartValue(current)
         animation.setEndValue(target)
         animation.start()
+
+    def _create_chat_bubble(self, item):
+        bubble = QFrame()
+        bubble.setObjectName('chatMessageBubble')
+        bubble.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        bubble_layout = QVBoxLayout(bubble)
+        bubble_layout.setContentsMargins(12, 8, 12, 8)
+        bubble_layout.setSpacing(3)
+        meta = QHBoxLayout()
+        meta.setSpacing(7)
+        author = label(item['sender'], 'chatMessageAuthor')
+        author.setTextFormat(Qt.TextFormat.PlainText)
+        author.setObjectName('chatMessageAuthor')
+        meta.addWidget(author)
+        if item['stamp']:
+            stamp = item['stamp']
+            try:
+                stamp = datetime.fromisoformat(stamp.replace('Z', '+00:00')).astimezone().strftime('%H:%M')
+            except (ValueError, TypeError, OverflowError):
+                stamp = stamp[:16]
+            meta.addWidget(label(stamp, 'chatMessageTime'))
+        meta.addStretch(1)
+        bubble_layout.addLayout(meta)
+        body = label(item['text'], 'chatMessageText')
+        body.setTextFormat(Qt.TextFormat.PlainText)
+        body.setWordWrap(True)
+        body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        bubble_layout.addWidget(body)
+        return bubble
 
     def _render_lobby_messages(self, messages):
         if not hasattr(self, 'chat_messages_layout'):
@@ -6864,55 +7387,56 @@ class LargeApp(App):
                 text, sender, stamp, key = str(item).strip(), '未知玩家', '', str(item)
             if text:
                 normalized.append({'text': text, 'sender': sender or '未知玩家', 'stamp': stamp, 'key': key})
-        # The empty-state label is reused; deleting it here makes the next
-        # message fail once Qt processes DeferredDelete after startup.
+        current_player = self._chat_bound_game_id().casefold()
+        render_signature = (current_player, tuple(
+            (item['key'], item['sender'], item['stamp'], item['text'])
+            for item in normalized))
+        if render_signature == self._chat_render_signature:
+            return
+        # Match the full rendered payload, not just a server ID: reconnects
+        # can contain repeated IDs or corrected text. A queue also keeps two
+        # identical messages as two distinct widgets rather than losing one.
+        available = {}
+        for identity, bubble in getattr(self, '_chat_bubble_rows', ()):
+            available.setdefault(identity, deque()).append(bubble)
+        rows = []
         self.chat_messages_host.setUpdatesEnabled(False)
         try:
-            while self.chat_messages_layout.count():
-                item = self.chat_messages_layout.takeAt(0)
-                widget = item.widget()
-                if widget is not None and widget is not self.chat_empty_label:
-                    widget.hide()
-                    widget.deleteLater()
-            self.chat_empty_label.setVisible(not normalized)
-            if not normalized:
-                self.chat_messages_layout.addWidget(self.chat_empty_label)
             for item in normalized:
-                bubble = GlassFrame()
-                bubble.setObjectName('chatMessageBubble')
-                bubble.setProperty(
-                    'mine', 'true' if str(item['sender']).casefold() ==
-                    self._chat_bound_game_id().casefold() else 'false')
-                bubble.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-                bubble_layout = QVBoxLayout(bubble)
-                bubble_layout.setContentsMargins(12, 8, 12, 8)
-                bubble_layout.setSpacing(3)
-                meta = QHBoxLayout()
-                meta.setSpacing(7)
-                author = label(item['sender'], 'chatMessageAuthor')
-                author.setTextFormat(Qt.TextFormat.PlainText)
-                author.setObjectName('chatMessageAuthor')
-                meta.addWidget(author)
-                if item['stamp']:
-                    stamp = item['stamp']
-                    try:
-                        stamp = datetime.fromisoformat(stamp.replace('Z', '+00:00')).astimezone().strftime('%H:%M')
-                    except (ValueError, TypeError, OverflowError):
-                        stamp = stamp[:16]
-                    meta.addWidget(label(stamp, 'chatMessageTime'))
-                meta.addStretch(1)
-                bubble_layout.addLayout(meta)
-                body = label(item['text'], 'chatMessageText')
-                body.setTextFormat(Qt.TextFormat.PlainText)
-                body.setWordWrap(True)
-                body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-                bubble_layout.addWidget(body)
-                self.chat_messages_layout.addWidget(bubble)
-            self.chat_messages_layout.addStretch(1)
+                identity = (item['key'], item['sender'], item['stamp'], item['text'])
+                candidates = available.get(identity)
+                bubble = candidates.popleft() if candidates else self._create_chat_bubble(item)
+                mine = 'true' if item['sender'].casefold() == current_player else 'false'
+                if bubble.property('mine') != mine:
+                    bubble.setProperty('mine', mine)
+                    bubble.style().unpolish(bubble)
+                    bubble.style().polish(bubble)
+                    bubble.update()
+                rows.append((identity, bubble))
+            for candidates in available.values():
+                for bubble in candidates:
+                    self.chat_messages_layout.removeWidget(bubble)
+                    bubble.hide()
+                    bubble.deleteLater()
+            self.chat_empty_label.setVisible(not normalized)
+            if normalized:
+                self.chat_messages_layout.removeWidget(self.chat_empty_label)
+                for index, (_identity, bubble) in enumerate(rows):
+                    existing = self.chat_messages_layout.itemAt(index)
+                    if existing is None or existing.widget() is not bubble:
+                        self.chat_messages_layout.insertWidget(index, bubble)
+                    bubble.show()
+            elif self.chat_messages_layout.indexOf(self.chat_empty_label) < 0:
+                self.chat_messages_layout.insertWidget(0, self.chat_empty_label)
+            last = self.chat_messages_layout.itemAt(self.chat_messages_layout.count() - 1)
+            if last is None or last.spacerItem() is None:
+                self.chat_messages_layout.addStretch(1)
         finally:
             # Keep this paired even when malformed realtime data or a theme
             # callback raises while constructing one of the bubbles.
             self.chat_messages_host.setUpdatesEnabled(True)
+        self._chat_bubble_rows = rows
+        self._chat_render_signature = render_signature
         self._schedule_chat_scroll_to_latest()
 
     def _build_placeholder(self, title, description, icon, bullets):
@@ -6927,7 +7451,7 @@ class LargeApp(App):
         heading.addWidget(label(description, 'pageHint'))
         layout.addLayout(heading)
 
-        card = GlassFrame()
+        card = QFrame()
         card.setObjectName('placeholder')
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(30, 28, 30, 28)
@@ -6959,7 +7483,7 @@ class LargeApp(App):
         heading.addWidget(label('按主任务栏从右往左列出运行中的窗口，双击即可快速切换。', 'pageHint'))
         layout.addLayout(heading)
 
-        info_card = GlassFrame()
+        info_card = QFrame()
         info_card.setObjectName('taskbarInfoCard')
         info_layout = QVBoxLayout(info_card)
         info_layout.setContentsMargins(18, 15, 18, 15)
@@ -6980,7 +7504,7 @@ class LargeApp(App):
         info_layout.addWidget(self.taskbar_hotkey_hint)
         layout.addWidget(info_card)
 
-        list_card = GlassFrame()
+        list_card = QFrame()
         list_card.setObjectName('taskbarListCard')
         list_layout = QVBoxLayout(list_card)
         list_layout.setContentsMargins(18, 15, 18, 15)
@@ -7083,8 +7607,12 @@ class LargeApp(App):
                 self.taskbar_status.setText('读取失败')
             return
         if action == 'refresh':
-            self._taskbar_items = list(payload.get('items') or [])
-            self._populate_taskbar_table()
+            items = list(payload.get('items') or [])
+            # Polling should not rebuild an unchanged table and disturb its
+            # selection. Search and hotkey changes already redraw directly.
+            if items != self._taskbar_items:
+                self._taskbar_items = items
+                self._populate_taskbar_table()
             count = len(self._taskbar_items)
             self.taskbar_status.setText(f'已读取 {count} 个窗口')
             self._set_taskbar_notice(
@@ -7227,7 +7755,7 @@ class LargeApp(App):
         if include_heading:
             heading = QVBoxLayout()
             heading.setSpacing(4)
-            heading.addWidget(label('DEV KING / PREFERENCES', 'eyebrow'))
+            heading.addWidget(label('ZJ HUB / PREFERENCES', 'eyebrow'))
             heading.addWidget(label('设置', 'pageTitle'))
             heading.addWidget(label('调整 ZJ HUB 的主题和后续功能偏好。', 'pageHint'))
             layout.addLayout(heading)
@@ -7236,7 +7764,7 @@ class LargeApp(App):
         body.setSpacing(14)
         layout.addLayout(body, 1)
 
-        category_panel = GlassFrame()
+        category_panel = QFrame()
         category_panel.setObjectName('settingsSidebar')
         category_panel.setMinimumWidth(218)
         category_panel.setMaximumWidth(244)
@@ -7251,9 +7779,12 @@ class LargeApp(App):
             ('theme', '主题', '切换外观主题', 'sparkles'),
             ('general', '常规', '通用行为设置', 'settings'),
             ('performance', '性能', '显示与性能选项', 'chart'),
+            ('match-data', '对局数据', '最近查询和列表偏好', 'layers'),
+            ('flashback', 'Flashback', '日志与回放列表偏好', 'blocks'),
             ('api', 'API 连接', '管理对局数据查询令牌', 'shield'),
             ('chat-account', '大厅身份', '登录 ID 与大厅聊天身份', 'user'),
             ('taskbar-hotkeys', '快捷工具插件', 'TaskbarSwitcher 按键设置', 'command'),
+            ('logs', '日志', '查看 ZJ HUB 与 Flashback 诊断日志', 'command'),
         ]
         for key, title, hint, icon_name in category_specs:
             button = QPushButton(title)
@@ -7269,71 +7800,247 @@ class LargeApp(App):
             category_layout.addWidget(button)
             self.settings_category_buttons[key] = button
         category_layout.addStretch(1)
-        category_layout.addWidget(label('左侧分类可以继续扩展。', 'brandHint'))
-        body.addWidget(category_panel)
+        category_layout.addWidget(label('设置保存在当前账户', 'brandHint'))
+        categories_scroll = QScrollArea()
+        categories_scroll.setObjectName('preferencesScroll')
+        categories_scroll.setWidgetResizable(True)
+        categories_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        categories_scroll.viewport().setAutoFillBackground(False)
+        categories_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        categories_scroll.setMinimumWidth(218)
+        categories_scroll.setMaximumWidth(244)
+        category_panel.setMinimumWidth(0)
+        category_panel.setMaximumWidth(16777215)
+        categories_scroll.setWidget(category_panel)
+        body.addWidget(categories_scroll)
 
         self.settings_stack = QStackedWidget()
         body.addWidget(self.settings_stack, 1)
 
-        theme_page = self._build_theme_settings()
+        theme_page = self._scroll_settings_page(self._build_theme_settings())
         self.settings_category_indices['theme'] = self.settings_stack.addWidget(theme_page)
         self.settings_category_indices['general'] = self.settings_stack.addWidget(
-            self._build_general_settings())
+            self._scroll_settings_page(self._build_general_settings()))
         self.settings_category_indices['performance'] = self.settings_stack.addWidget(
-            self._build_animation_settings())
-        self.settings_category_indices['api'] = self.settings_stack.addWidget(self._build_api_settings())
+            self._scroll_settings_page(self._build_animation_settings()))
+        self.settings_category_indices['match-data'] = self.settings_stack.addWidget(
+            self._build_match_preferences())
+        self.settings_category_indices['flashback'] = self.settings_stack.addWidget(
+            self._build_flashback_preferences())
+        self.settings_category_indices['api'] = self.settings_stack.addWidget(self._scroll_settings_page(self._build_api_settings()))
         self.settings_category_indices['chat-account'] = self.settings_stack.addWidget(
-            self._build_chat_account_settings())
+            self._scroll_settings_page(self._build_chat_account_settings()))
         self.settings_category_indices['taskbar-hotkeys'] = self.settings_stack.addWidget(
-            self._build_taskbar_hotkey_settings())
+            self._scroll_settings_page(self._build_taskbar_hotkey_settings()))
+        self.settings_category_indices['logs'] = self.settings_stack.addWidget(
+            self._scroll_settings_page(self._build_log_settings()))
         self.switch_settings_category('theme')
         return page
+
+    @staticmethod
+    def _scroll_settings_page(content):
+        scroll = QScrollArea()
+        scroll.setObjectName('preferencesScroll')
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.viewport().setAutoFillBackground(False)
+        scroll.setWidget(content)
+        content.setAutoFillBackground(False)
+        return scroll
+
+    def _add_preference_row(self, layout, key, title, hint, suffix='', choices=None):
+        row = SettingsRow()
+        row.setObjectName('preferenceRow')
+        row.setMinimumHeight(80)
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 16, 0, 16)
+        row_layout.setSpacing(16)
+        copy = QVBoxLayout()
+        copy.setSpacing(4)
+        title_label = label(title, 'cardTitle')
+        title_label.setWordWrap(True)
+        copy.addWidget(title_label)
+        description = label(hint, 'cardHint')
+        description.setWordWrap(True)
+        copy.addWidget(description)
+        row_layout.addLayout(copy, 1)
+        value = self._ui_preferences[key]
+        if isinstance(UI_DEFAULTS[key], bool):
+            control = ToggleSwitch()
+            control.setChecked(value)
+            control.toggled.connect(lambda checked: self._set_ui_preference(key, checked))
+        elif choices:
+            control = ThemedComboBox()
+            for title_text, data in choices:
+                control.addItem(title_text, data)
+            control.setCurrentIndex(max(0, control.findData(value)))
+            control.currentIndexChanged.connect(lambda _index: self._set_ui_preference(key, control.currentData()))
+        else:
+            control = NumberField()
+            control.setRange(*UI_LIMITS[key])
+            control.setValue(value)
+            control.setSuffix(suffix)
+            control.setKeyboardTracking(False)
+            control.valueChanged.connect(lambda number: self._set_ui_preference(key, number))
+        control.setObjectName('preferenceControl')
+        control.setAccessibleName(title)
+        if not isinstance(control, QCheckBox):
+            control.setFixedWidth(140)
+        row_layout.addWidget(control, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._preference_controls[key] = control
+        layout.addWidget(row)
+
+    def _build_preference_settings(self, title, description, rows):
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setObjectName('preferencesScroll')
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.viewport().setAutoFillBackground(False)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        card = QFrame()
+        card.setObjectName('settingsCard')
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(0)
+        self._section_header(layout, title, 'settings')
+        layout.addSpacing(8)
+        hint = label(description, 'muted')
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        layout.addSpacing(14)
+        for row in rows:
+            self._add_preference_row(layout, *row)
+        footer = QHBoxLayout()
+        footer.addWidget(label('更改后自动保存', 'cardHint'))
+        footer.addStretch(1)
+        keys = [row[0] for row in rows]
+        reset = self.button('恢复默认', lambda: self._reset_ui_preferences(keys))
+        reset.setObjectName('settingsReset')
+        footer.addWidget(reset)
+        layout.addSpacing(16)
+        layout.addLayout(footer)
+        layout.addStretch(1)
+        scroll.setWidget(card)
+        page_layout.addWidget(scroll)
+        return page
+
+    def _build_match_preferences(self):
+        return self._build_preference_settings('对局数据', '调整查询记录和对局列表的阅读方式。', [
+            ('match/recentLimit', '最近查询数量', '保留最近查询过的玩家，最多显示九个。', ' 个'),
+            ('match/autoLoad', '滚动自动加载', '滚动到底部时加载更多对局；关闭后可点击“加载更多”。'),
+            ('match/cardGap', '对局卡片间距', '调小更紧凑，调大留出更多阅读空间。', ' px'),
+        ])
+
+    def _build_flashback_preferences(self):
+        return self._build_preference_settings('Flashback', '调整日志和最近回放的显示，不改变录像内容。', [
+            ('flashback/logLines', '日志保留行数', '保留最新的日志，较旧内容仍可在诊断日志文件中查看。', ' 行'),
+            ('flashback/logFontSize', '日志字号', '调整内置引擎日志的文字大小。', ' px'),
+            ('flashback/followLog', '自动跟随最新日志', '开启后跟随新日志；关闭后方便停留在较早内容。'),
+            ('flashback/statusInterval', '状态刷新间隔', '只控制界面状态更新，不影响录制采样频率。', '',
+             [('1 秒', 1000), ('1.5 秒', 1500), ('3 秒', 3000), ('5 秒', 5000)]),
+            ('flashback/replayLimit', '最近回放数量', '限制列表显示数量，不删除任何回放文件。', ' 个'),
+        ])
+
+    def _set_ui_preference(self, key, value):
+        self._ui_preferences[key] = save_preference(self._settings, key, value)
+        self._apply_ui_preferences(key)
+
+    def _reset_ui_preferences(self, keys):
+        for key in keys:
+            self._ui_preferences[key] = save_preference(self._settings, key, UI_DEFAULTS[key])
+            control = self._preference_controls.get(key)
+            if control is not None:
+                blocker = QSignalBlocker(control)
+                if isinstance(control, QCheckBox):
+                    control.setChecked(UI_DEFAULTS[key])
+                    control.setText('已开启' if UI_DEFAULTS[key] else '已关闭')
+                elif isinstance(control, QSpinBox):
+                    control.setValue(UI_DEFAULTS[key])
+                else:
+                    control.setCurrentIndex(control.findData(UI_DEFAULTS[key]))
+                del blocker
+        self._apply_ui_preferences()
+        if 'flashback/replayLimit' in keys:
+            self._flashback_replay_signature = None
+            self._flashback_refresh_replay_list()
+
+    def _apply_ui_preferences(self, changed_key=None):
+        preferences = self._ui_preferences
+        if changed_key in (None, 'match/recentLimit') and hasattr(self, 'recent_query_buttons'):
+            self._recent_queries = self._recent_queries[:preferences['match/recentLimit']]
+            self._settings.setValue('matchHistory/recentQueries', self._recent_queries)
+            self._refresh_recent_query_buttons()
+        if hasattr(self, 'match_rows_layout'):
+            if changed_key in (None, 'match/cardGap'):
+                self.match_rows_layout.setSpacing(preferences['match/cardGap'])
+            if changed_key in (None, 'match/autoLoad'):
+                self.match_next_button.setVisible(not preferences['match/autoLoad'])
+        if hasattr(self, 'flashback_log'):
+            if changed_key in (None, 'flashback/logLines'):
+                self.flashback_log.setMaximumBlockCount(preferences['flashback/logLines'])
+            if changed_key in (None, 'flashback/logFontSize'):
+                self._apply_log_surface()
+        if (changed_key in (None, 'flashback/statusInterval') and
+                self._flashback_status_timer is not None):
+            self._flashback_status_timer.setInterval(preferences['flashback/statusInterval'])
+        if changed_key == 'flashback/replayLimit':
+            self._flashback_replay_signature = None
+            self._flashback_refresh_replay_list()
+        if (changed_key in (None, 'ui/parallaxScrolling') and
+                getattr(self, '_scroll_motion', None) is not None and not preferences['ui/parallaxScrolling']):
+            self._scroll_motion.reset()
 
     def _build_general_settings(self):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
-        card = GlassFrame()
+        card = QFrame()
         card.setObjectName('settingsCard')
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(22, 20, 22, 18)
+        card_layout.setContentsMargins(24, 22, 24, 22)
         card_layout.setSpacing(11)
         self._section_header(card_layout, '常规设置', 'settings')
         card_layout.addWidget(label('调整消息反馈和常用行为。', 'muted'))
 
-        sound_row = GlassFrame()
+        sound_row = SettingsRow()
         sound_row.setObjectName('featureRow')
         sound_layout = QHBoxLayout(sound_row)
-        sound_layout.setContentsMargins(14, 11, 14, 11)
+        sound_layout.setContentsMargins(0, 16, 0, 16)
         sound_layout.setSpacing(10)
         sound_copy = QVBoxLayout()
         sound_copy.setSpacing(3)
         sound_copy.addWidget(label('大厅消息提示音', 'cardTitle'))
-        self.chat_sound_hint = label('', 'cardHint')
-        sound_copy.addWidget(self.chat_sound_hint)
+        general_sound_hint = label('', 'cardHint')
+        self.chat_sound_hint = general_sound_hint
+        self._chat_sound_hints.append(general_sound_hint)
+        sound_copy.addWidget(general_sound_hint)
         sound_layout.addLayout(sound_copy, 1)
-        from PySide6.QtWidgets import QCheckBox
-        toggle = QCheckBox('开启')
+        toggle = ToggleSwitch('大厅消息提示音')
         toggle.setObjectName('chatSoundEnabled')
         toggle.setCursor(Qt.CursorShape.PointingHandCursor)
         toggle.setChecked(self.chat_sound_enabled)
         toggle.toggled.connect(self._set_chat_sound_enabled)
         self.chat_sound_toggle = toggle
+        self._chat_sound_toggles.append(toggle)
         sound_layout.addWidget(toggle)
         card_layout.addWidget(sound_row)
 
-        volume_row = GlassFrame()
+        volume_row = SettingsRow()
         volume_row.setObjectName('featureRow')
         volume_layout = QHBoxLayout(volume_row)
-        volume_layout.setContentsMargins(14, 11, 14, 11)
+        volume_layout.setContentsMargins(0, 16, 0, 16)
         volume_layout.setSpacing(10)
         volume_copy = QVBoxLayout()
         volume_copy.setSpacing(3)
         volume_copy.addWidget(label('提示音音量', 'cardTitle'))
-        volume_copy.addWidget(label('使用 Codex 任务完成提示音风格的短促提示。', 'cardHint'))
+        volume_copy.addWidget(label('调节大厅新消息的提示音量。', 'cardHint'))
         volume_layout.addLayout(volume_copy, 1)
-        slider = QSlider(Qt.Orientation.Horizontal)
+        slider = VolumeSlider(Qt.Orientation.Horizontal)
         slider.setObjectName('chatSoundVolume')
         slider.setRange(0, 100)
         slider.setSingleStep(5)
@@ -7343,8 +8050,11 @@ class LargeApp(App):
         slider.setCursor(Qt.CursorShape.PointingHandCursor)
         slider.valueChanged.connect(self._set_chat_sound_volume)
         self.chat_sound_volume_slider = slider
+        self._chat_sound_sliders.append(slider)
         volume_layout.addWidget(slider)
-        self.chat_sound_volume_value = label(f'{self.chat_sound_volume}%', 'cardTitle')
+        general_volume_value = label(f'{self.chat_sound_volume}%', 'cardTitle')
+        self.chat_sound_volume_value = general_volume_value
+        self._chat_sound_values.append(general_volume_value)
         self.chat_sound_volume_value.setMinimumWidth(42)
         self.chat_sound_volume_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         volume_layout.addWidget(self.chat_sound_volume_value)
@@ -7352,6 +8062,122 @@ class LargeApp(App):
         self._set_chat_sound_enabled(self.chat_sound_enabled)
         self._set_chat_sound_volume(self.chat_sound_volume)
         card_layout.addWidget(label('关闭提示音不会影响大厅消息接收。', 'muted'))
+        guide_row = QHBoxLayout()
+        guide_copy = QVBoxLayout()
+        guide_copy.addWidget(label('Flashback 使用引导', 'cardTitle'))
+        guide_copy.addWidget(label('重新查看目录、录制、导出和跨电脑安装步骤。', 'cardHint'))
+        guide_row.addLayout(guide_copy, 1)
+        guide_row.addWidget(self.button('打开引导', lambda: self.show_quick_start(force=True)))
+        card_layout.addLayout(guide_row)
+        card_layout.addStretch(1)
+        layout.addWidget(card, 1)
+        return page
+
+    def _open_diagnostics_directory(self, directory, label_text):
+        directory = Path(directory).expanduser()
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory))):
+                raise OSError('Windows 未能打开文件夹。')
+            self.log(f'已打开{label_text}：{directory}')
+        except (OSError, RuntimeError, ValueError) as error:
+            self.log(f'打开{label_text}失败：{error}')
+
+    def _copy_diagnostics_paths(self):
+        engine_root = Path(os.environ.get('LOCALAPPDATA') or (Path.home() / 'AppData' / 'Local')) / 'FlashbackRecorder' / 'logs'
+        paths = f'ZJ HUB：{APP_LOG_ROOT}\nFlashback 引擎：{engine_root}\n皮肤缓存：{_program_skin_cache_directory()}'
+        clipboard = QApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(paths)
+        self.log('已复制诊断日志路径。')
+
+    def _open_skin_cache(self):
+        directory = _program_skin_cache_directory()
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory))):
+                raise OSError('Windows 未能打开皮肤缓存文件夹。')
+            self.log(f'已打开皮肤缓存：{directory}')
+        except (OSError, RuntimeError, ValueError) as error:
+            self.log(f'打开皮肤缓存失败：{error}')
+
+    def _clear_skin_cache(self):
+        directory = _program_skin_cache_directory()
+        removed = 0
+        errors = []
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            for item in directory.iterdir():
+                if item.is_file() and (
+                        item.name.casefold() in {'recorded-skins.json', 'recorded-skins-diagnostics.json'}
+                        or item.suffix.casefold() == '.png'):
+                    try:
+                        item.unlink()
+                        removed += 1
+                    except OSError as error:
+                        errors.append(str(error))
+            if errors:
+                self.log(f'皮肤缓存清理不完整：已清理 {removed} 个文件；{errors[0]}')
+            else:
+                self.log(f'已清理皮肤缓存：{removed} 个文件。')
+            if hasattr(self, 'skin_cache_hint'):
+                self.skin_cache_hint.setText(f'{directory} · 已清理 {removed} 个文件')
+        except (OSError, RuntimeError, ValueError) as error:
+            self.log(f'清理皮肤缓存失败：{error}')
+
+    def _build_log_settings(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        card = QFrame()
+        card.setObjectName('settingsCard')
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(22, 20, 22, 18)
+        card_layout.setSpacing(11)
+        self._section_header(card_layout, '诊断日志', 'command')
+        card_layout.addWidget(label('遇到录制、皮肤或转服问题时，可从这里打开日志目录并把路径发给我。', 'muted'))
+
+        def path_row(title, detail, directory, button_text='打开文件夹'):
+            row = QFrame()
+            row.setObjectName('featureRow')
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(14, 11, 14, 11)
+            copy = QVBoxLayout()
+            copy.setSpacing(3)
+            copy.addWidget(label(title, 'cardTitle'))
+            value = label(detail, 'cardHint')
+            value.setWordWrap(True)
+            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            value.setToolTip(str(directory))
+            copy.addWidget(value)
+            row_layout.addLayout(copy, 1)
+            row_layout.addWidget(self.button(button_text, lambda: self._open_diagnostics_directory(directory, title)))
+            return row
+
+        engine_root = Path(os.environ.get('LOCALAPPDATA') or (Path.home() / 'AppData' / 'Local')) / 'FlashbackRecorder' / 'logs'
+        card_layout.addWidget(path_row('ZJ HUB 日志', str(_app_log_path()), APP_LOG_ROOT))
+        card_layout.addWidget(path_row('Flashback 引擎日志', str(engine_root), engine_root))
+        skin_row = QFrame()
+        skin_row.setObjectName('featureRow')
+        skin_layout = QHBoxLayout(skin_row)
+        skin_layout.setContentsMargins(14, 11, 14, 11)
+        skin_copy = QVBoxLayout()
+        skin_copy.setSpacing(3)
+        skin_copy.addWidget(label('临时皮肤缓存 · 关闭后清理', 'cardTitle'))
+        self.skin_cache_hint = label(str(_program_skin_cache_directory()), 'cardHint')
+        self.skin_cache_hint.setWordWrap(True)
+        self.skin_cache_hint.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        skin_copy.addWidget(self.skin_cache_hint)
+        skin_layout.addLayout(skin_copy, 1)
+        skin_layout.addWidget(self.button('打开文件夹', self._open_skin_cache))
+        skin_layout.addWidget(self.button('清理缓存', self._clear_skin_cache))
+        card_layout.addWidget(skin_row)
+        actions = QHBoxLayout()
+        actions.addWidget(self.button('复制两个日志路径', self._copy_diagnostics_paths))
+        actions.addStretch(1)
+        card_layout.addLayout(actions)
+        card_layout.addWidget(label('日志按日期保存，单个文件超过 8 MB 会自动轮换；日志中不写入 API 令牌。', 'muted'))
         card_layout.addStretch(1)
         layout.addWidget(card, 1)
         return page
@@ -7361,7 +8187,7 @@ class LargeApp(App):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
-        card = GlassFrame()
+        card = QFrame()
         card.setObjectName('settingsCard')
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(22, 20, 22, 18)
@@ -7370,7 +8196,7 @@ class LargeApp(App):
         hint = label('登录游戏 ID 后，战局查询和大厅聊天会共用这个身份。换绑后下次发送消息立即生效。', 'muted')
         hint.setWordWrap(True)
         card_layout.addWidget(hint)
-        row = GlassFrame()
+        row = QFrame()
         row.setObjectName('featureRow')
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(14, 11, 14, 11)
@@ -7392,7 +8218,7 @@ class LargeApp(App):
         save.setObjectName('chatSaveIdentity')
         row_layout.addWidget(save)
         card_layout.addWidget(row)
-        server_row = GlassFrame()
+        server_row = QFrame()
         server_row.setObjectName('featureRow')
         server_layout = QHBoxLayout(server_row)
         server_layout.setContentsMargins(14, 11, 14, 11)
@@ -7400,7 +8226,7 @@ class LargeApp(App):
         server_copy = QVBoxLayout()
         server_copy.setSpacing(3)
         server_copy.addWidget(label('大厅服务器', 'cardTitle'))
-        server_hint = label('默认使用公共大厅地址，也可填入自托管服务。', 'cardHint')
+        server_hint = label('内置 Supabase Realtime 公共大厅通道；点击右侧按钮可立即重连。', 'cardHint')
         server_hint.setWordWrap(True)
         server_copy.addWidget(server_hint)
         server_layout.addLayout(server_copy, 1)
@@ -7410,14 +8236,14 @@ class LargeApp(App):
         self.chat_server_url_input.setText(SUPABASE_REALTIME_URL)
         self.chat_server_url_input.setReadOnly(True)
         self.chat_server_url_input.setMinimumWidth(300)
-        self.chat_server_url_input.setClearButtonEnabled(True)
+        self.chat_server_url_input.setClearButtonEnabled(False)
         self.chat_server_url_input.returnPressed.connect(self._save_chat_server_url)
         server_layout.addWidget(self.chat_server_url_input)
         server_save = self.button('重新连接', self._save_chat_server_url, True)
         server_save.setObjectName('chatSaveServer')
         server_layout.addWidget(server_save)
         card_layout.addWidget(server_row)
-        sound_row = GlassFrame()
+        sound_row = QFrame()
         sound_row.setObjectName('featureRow')
         sound_layout = QHBoxLayout(sound_row)
         sound_layout.setContentsMargins(14, 10, 14, 10)
@@ -7425,26 +8251,34 @@ class LargeApp(App):
         sound_copy = QVBoxLayout()
         sound_copy.setSpacing(3)
         sound_copy.addWidget(label('大厅消息提示音', 'cardTitle'))
-        self.chat_sound_hint = label('', 'cardHint')
-        self.chat_sound_hint.setWordWrap(True)
-        sound_copy.addWidget(self.chat_sound_hint)
+        chat_sound_hint = label('', 'cardHint')
+        chat_sound_hint.setWordWrap(True)
+        self.chat_sound_hint = chat_sound_hint
+        self._chat_sound_hints.append(chat_sound_hint)
+        sound_copy.addWidget(chat_sound_hint)
         sound_layout.addLayout(sound_copy, 1)
-        self.chat_sound_toggle = QCheckBox('启用')
-        self.chat_sound_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.chat_sound_toggle.setChecked(self.chat_sound_enabled)
-        self.chat_sound_toggle.toggled.connect(self._set_chat_sound_enabled)
-        sound_layout.addWidget(self.chat_sound_toggle)
+        chat_sound_toggle = ToggleSwitch('大厅消息提示音')
+        chat_sound_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        chat_sound_toggle.setChecked(self.chat_sound_enabled)
+        chat_sound_toggle.toggled.connect(self._set_chat_sound_enabled)
+        self.chat_sound_toggle = chat_sound_toggle
+        self._chat_sound_toggles.append(chat_sound_toggle)
+        sound_layout.addWidget(chat_sound_toggle)
         sound_layout.addWidget(label('音量', 'cardHint'))
-        self.chat_sound_volume_slider = QSlider(Qt.Orientation.Horizontal)
-        self.chat_sound_volume_slider.setRange(0, 100)
-        self.chat_sound_volume_slider.setValue(self.chat_sound_volume)
-        self.chat_sound_volume_slider.setSingleStep(5)
-        self.chat_sound_volume_slider.setPageStep(10)
-        self.chat_sound_volume_slider.setFixedWidth(150)
-        self.chat_sound_volume_slider.setToolTip('调整大厅消息提示音音量')
-        self.chat_sound_volume_slider.valueChanged.connect(self._set_chat_sound_volume)
-        sound_layout.addWidget(self.chat_sound_volume_slider)
-        self.chat_sound_volume_value = label(f'{self.chat_sound_volume}%', 'cardHint')
+        chat_sound_slider = VolumeSlider(Qt.Orientation.Horizontal)
+        chat_sound_slider.setRange(0, 100)
+        chat_sound_slider.setValue(self.chat_sound_volume)
+        chat_sound_slider.setSingleStep(5)
+        chat_sound_slider.setPageStep(10)
+        chat_sound_slider.setFixedWidth(150)
+        chat_sound_slider.setToolTip('调整大厅消息提示音音量')
+        chat_sound_slider.valueChanged.connect(self._set_chat_sound_volume)
+        self.chat_sound_volume_slider = chat_sound_slider
+        self._chat_sound_sliders.append(chat_sound_slider)
+        sound_layout.addWidget(chat_sound_slider)
+        chat_sound_value = label(f'{self.chat_sound_volume}%', 'cardHint')
+        self.chat_sound_volume_value = chat_sound_value
+        self._chat_sound_values.append(chat_sound_value)
         self.chat_sound_volume_value.setMinimumWidth(38)
         self.chat_sound_volume_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         sound_layout.addWidget(self.chat_sound_volume_value)
@@ -7476,7 +8310,7 @@ class LargeApp(App):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
-        card = GlassFrame()
+        card = QFrame()
         card.setObjectName('settingsCard')
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(22, 20, 22, 18)
@@ -7494,7 +8328,7 @@ class LargeApp(App):
         bindings_grid.setVerticalSpacing(8)
         self._taskbar_hotkey_edits = {}
         for index in range(10):
-            row = GlassFrame()
+            row = QFrame()
             row.setObjectName('featureRow')
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(11, 7, 11, 7)
@@ -7595,17 +8429,17 @@ class LargeApp(App):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
-        card = GlassFrame()
+        card = QFrame()
         card.setObjectName('settingsCard')
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(24, 22, 24, 22)
         card_layout.setSpacing(12)
         self._section_header(card_layout, '动画与反馈', 'sparkles')
-        card_layout.addWidget(label('控制页面切换、按钮反馈和对局详情展开的过渡速度。', 'muted'))
-        row = GlassFrame()
+        card_layout.addWidget(label('调整界面反馈与滚动表现。', 'muted'))
+        row = SettingsRow()
         row.setObjectName('featureRow')
         row_layout = QHBoxLayout(row)
-        row_layout.setContentsMargins(14, 12, 14, 12)
+        row_layout.setContentsMargins(0, 16, 0, 16)
         copy = QVBoxLayout()
         copy.setSpacing(3)
         copy.addWidget(label('界面动画速度', 'cardTitle'))
@@ -7618,21 +8452,23 @@ class LargeApp(App):
         speed.addItem('快速', 'fast')
         speed.addItem('标准', 'standard')
         speed.addItem('慢速', 'slow')
-        speed.setMinimumWidth(128)
+        speed.setFixedWidth(140)
         speed.setCursor(Qt.CursorShape.PointingHandCursor)
         speed.currentIndexChanged.connect(lambda _index: self._set_animation_speed(speed.currentData()))
         speed.setCurrentIndex(max(0, speed.findData(self.animation_speed)))
         row_layout.addWidget(speed)
         card_layout.addWidget(row)
         self._set_animation_speed(self.animation_speed)
-        card_layout.addWidget(label('推荐使用“标准”。关闭动画只会取消界面过渡，不会影响对局数据查询。', 'muted'))
+        self._add_preference_row(
+            card_layout, 'ui/parallaxScrolling', '滚动视差',
+            '滚轮顺滑滚动，背景光影缓慢移动。关闭界面动画或 Windows 动画时停用。')
         card_layout.addStretch(1)
         layout.addWidget(card, 1)
         return page
 
     def _build_settings_overlay(self, root):
         """创建覆盖整个客户端区域的设置层，背景使用不透明主题色。"""
-        overlay = GlassFrame(root)
+        overlay = QFrame(root)
         overlay.setObjectName('settingsOverlay')
         overlay.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
         overlay.setGeometry(root.rect())
@@ -7644,13 +8480,14 @@ class LargeApp(App):
         header.setContentsMargins(0, 0, 0, 0)
         copy = QVBoxLayout()
         copy.setSpacing(3)
-        copy.addWidget(label('DEV KING / SETTINGS', 'eyebrow'))
+        copy.addWidget(label('ZJ HUB / PREFERENCES', 'eyebrow'))
         copy.addWidget(label('设置', 'pageTitle'))
-        copy.addWidget(label('ZJ HUB · 设置覆盖在主界面之上，背景不透明', 'pageHint'))
+        copy.addWidget(label('管理外观、对局数据、录制与快捷工具偏好。', 'pageHint'))
         header.addLayout(copy)
         header.addStretch()
         back = QPushButton('返回主界面')
         back.setObjectName('settingsBack')
+        back.setProperty('navigationIcon', 'home')
         back.setIcon(line_icon('home', size=17))
         back.setIconSize(QSize(17, 17))
         back.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -7689,19 +8526,17 @@ class LargeApp(App):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
 
-        card = GlassFrame()
+        card = QFrame()
         card.setObjectName('settingsCard')
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(22, 20, 22, 20)
+        card_layout.setContentsMargins(24, 22, 24, 22)
         card_layout.setSpacing(8)
         self._section_header(card_layout, '主题', 'sparkles')
         card_layout.addWidget(label('选择后会立即应用，明亮主题是默认外观。', 'muted'))
-        self.settings_theme_label = label('当前主题：明亮', 'pageTitle')
-        self.settings_theme_label.setStyleSheet('font-size: 17px;')
+        self.settings_theme_label = label('当前主题：明亮', 'cardTitle')
         card_layout.addWidget(self.settings_theme_label)
         self.settings_theme_hint = label(THEME_PALETTES['light']['description'], 'muted')
         card_layout.addWidget(self.settings_theme_hint)
-        card_layout.addWidget(label('设置页覆盖整个 GUI，背景不透明，内容始终显示在最上层。', 'muted'))
         card_layout.addSpacing(8)
 
         choices = QWidget()
@@ -7724,7 +8559,7 @@ class LargeApp(App):
             choices_layout.addWidget(button, index // 2, index % 2)
             self.theme_buttons[key] = button
         card_layout.addWidget(choices)
-        self._feature_row(card_layout, '主题预览', '四种主题共用一致的内容层级，只切换背景、卡片和强调色。', 'sparkles')
+        self._feature_row(card_layout, '主题预览', '明亮、暗色与暖砂共用一致的内容层级，只切换背景、卡片和强调色。', 'sparkles')
         card_layout.addStretch(1)
         layout.addWidget(card, 1)
         return page
@@ -7734,7 +8569,7 @@ class LargeApp(App):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
-        card = GlassFrame()
+        card = QFrame()
         card.setObjectName('settingsCard')
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(24, 22, 24, 22)
@@ -7829,7 +8664,7 @@ class LargeApp(App):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
-        card = GlassFrame()
+        card = QFrame()
         card.setObjectName('settingsCard')
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(26, 24, 26, 24)
@@ -7851,26 +8686,62 @@ class LargeApp(App):
         if index is None:
             return
         self.settings_stack.setCurrentIndex(index)
-        self._animate_widget(self.settings_stack.currentWidget(), 180)
+        # Settings pages contain logs and scroll areas; avoid a full-page
+        # opacity effect and the associated per-frame composition cost.
+        self.settings_stack.currentWidget().setGraphicsEffect(None)
         for name, button in self.settings_category_buttons.items():
             button.setChecked(name == key)
 
     def apply_theme(self, key):
         if key not in THEME_PALETTES:
             key = 'light'
+        app = QApplication.instance()
+        if (getattr(self, '_applied_theme', None) == key and
+                app is not None and app.property('_themeKey') == key):
+            # A checkable option toggles before clicked() reaches this method.
+            # Restore its selection without reapplying the global stylesheet.
+            for name, button in getattr(self, 'theme_buttons', {}).items():
+                button.setChecked(name == key)
+            return
         self.current_theme = key
         if hasattr(self, 'backdrop'):
             self.backdrop.set_theme(key)
         app = QApplication.instance()
         if app is not None:
+            if not hasattr(app, '_original_theme_palette'):
+                app._original_theme_palette = QPalette(app.palette())
+            palette = QPalette(app._original_theme_palette)
+            if key in REDESIGNED_THEMES:
+                colors = surface_for(key)
+                for role, value in (
+                    (QPalette.ColorRole.Window, colors['page']),
+                    (QPalette.ColorRole.Base, colors['fill']),
+                    (QPalette.ColorRole.AlternateBase, colors['card']),
+                    (QPalette.ColorRole.Button, colors['fill']),
+                    (QPalette.ColorRole.WindowText, colors['text']),
+                    (QPalette.ColorRole.Text, colors['text']),
+                    (QPalette.ColorRole.ButtonText, colors['text']),
+                    (QPalette.ColorRole.PlaceholderText, colors['muted']),
+                    (QPalette.ColorRole.Highlight, colors['selection']),
+                    (QPalette.ColorRole.HighlightedText, colors['text']),
+                    (QPalette.ColorRole.Link, colors['focus']),
+                    (QPalette.ColorRole.LinkVisited, colors['muted']),
+                ):
+                    palette.setColor(role, QColor(value))
+            app.setPalette(palette)
             # Private combo popup containers are top-level widgets; expose the
             # active theme so ThemedComboBox can repaint them directly when a
             # selector is not propagated by the platform style backend.
             app.setProperty('_themeKey', key)
             app.setStyleSheet(build_style(key))
         self._apply_opaque_input_surfaces()
+        for field in self.findChildren(NumberField):
+            field.refresh_theme()
         self._apply_log_surface()
         self._refresh_theme_icons()
+        guide = getattr(self, '_quick_start_dialog', None)
+        if guide is not None:
+            guide._apply_style(key)
         if hasattr(self, 'theme_buttons'):
             for name, button in self.theme_buttons.items():
                 button.setChecked(name == key)
@@ -7878,6 +8749,7 @@ class LargeApp(App):
             config = THEME_PALETTES[key]
             self.settings_theme_label.setText(f"当前主题：{config['name']}")
             self.settings_theme_hint.setText(config['description'])
+        self._applied_theme = key
 
     def _apply_opaque_input_surfaces(self):
         """Keep editable fields opaque through focus, hover and theme changes."""
@@ -7897,7 +8769,7 @@ QLineEdit#themedInput:disabled {{
     background-color: {fill};
     border: 1px solid {border};
     border-radius: 9px;
-    padding: 10px 12px;
+    padding: 8px 12px;
     selection-background-color: {selection};
     selection-color: {text};
 }}
@@ -7931,19 +8803,18 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
             return
         surfaces = {
             'light': ('#ffffff', QColor('#ffffff'), '#536679', '#c4ced8'),
-            # Keep the glass alpha in the style sheet, while using a real
-            # QColor instance for the native viewport palette on Windows.
-            # Keep this surface light and readable. The page backdrop still
-            # supplies the glass material; an opaque log surface prevents
-            # Windows styles from falling back to a black viewport.
-            'glass': ('#252a31', QColor('#252a31'), '#f2f4f7', '#8a99aa'),
             'dark': ('#0d1928', QColor('#0d1928'), '#aabbd0', '#53667e'),
             'blue': ('#082248', QColor('#082248'), '#adc5e0', '#577da8'),
         }
-        fill_css, fill_color, text, border = surfaces.get(self.current_theme, surfaces['light'])
+        if self.current_theme == 'light':
+            fill_css, fill_color, text, border = surfaces['light']
+        else:
+            surface = surface_for(self.current_theme)
+            fill_css, fill_color, text, border = surface['fill'], QColor(surface['fill']), surface['text'], surface['border']
         log.setAutoFillBackground(False)
         log.viewport().setAutoFillBackground(False)
         palette = log.palette()
+        base_palette = QApplication.instance()._original_theme_palette
         for group in (
             QPalette.ColorGroup.Active,
             QPalette.ColorGroup.Inactive,
@@ -7953,6 +8824,12 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
             palette.setColor(group, QPalette.ColorRole.Window, fill_color)
             palette.setColor(group, QPalette.ColorRole.Text, QColor(text))
             palette.setColor(group, QPalette.ColorRole.PlaceholderText, QColor(text))
+            palette.setColor(group, QPalette.ColorRole.Highlight,
+                             base_palette.color(group, QPalette.ColorRole.Highlight) if self.current_theme == 'light'
+                             else QColor(surface['selection']))
+            palette.setColor(group, QPalette.ColorRole.HighlightedText,
+                             base_palette.color(group, QPalette.ColorRole.HighlightedText) if self.current_theme == 'light'
+                             else QColor(text))
         log.setPalette(palette)
         log.setStyleSheet(
             'QPlainTextEdit#activityLog {'
@@ -7971,10 +8848,11 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
             editor.viewport().setAutoFillBackground(False)
             editor.setPalette(palette)
             editor.viewport().setPalette(palette)
+            font_size = self._ui_preferences['flashback/logFontSize'] if name == 'flashback_log' else 11
             editor.setStyleSheet(
                 f'QPlainTextEdit#{"flashbackLog" if name == "flashback_log" else "flashbackInfo"} '
                 f'{{ background-color: {fill_css}; color: {text}; '
-                f'border: 1px solid {border}; border-radius: 10px; padding: 7px; }}'
+                f'border: 1px solid {border}; border-radius: 10px; padding: 7px; font-size: {font_size}px; }}'
             )
 
     def _refresh_theme_icons(self):
@@ -7983,33 +8861,38 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
             return
         if self.current_theme == 'light':
             normal, active, metric = '#536679', '#ffffff', '#3f79b4'
-        elif self.current_theme == 'glass':
-            normal, active, metric = '#c4c6ca', '#f7f7f8', '#d0d2d6'
         else:
-            normal, active, metric = '#b8c8dc', '#eff7ff', '#a9d4ff'
+            colors = surface_for(self.current_theme)
+            normal, active, metric = colors['muted'], colors['text'], colors['on']
         for button in self.nav_buttons.values():
             button.setIcon(line_icon(button.property('iconName'), normal, active, 20, active))
         if hasattr(self, 'settings_button'):
             self.settings_button.setIcon(line_icon('settings', normal, active, 20, active))
         for button in getattr(self, 'settings_category_buttons', {}).values():
             name = button.property('iconName') or 'command'
-            button.setIcon(line_icon(name, normal, active, 19, active))
-        theme_active = (
-            '#ffffff' if self.current_theme == 'light'
-            else '#202124' if self.current_theme == 'glass'
-            else '#102640'
-        )
+            surface = surface_for(self.current_theme)
+            button.setIcon(line_icon(name, surface['muted'], surface['fill'], 19, surface['text']))
+        theme_active = '#ffffff' if self.current_theme == 'light' else surface_for(self.current_theme)['text']
         for key, button in getattr(self, 'theme_buttons', {}).items():
             name = THEME_PALETTES[key]['icon']
             button.setIcon(line_icon(name, normal, theme_active, 20, active))
         for button in getattr(self, 'window_controls', []):
             name = button.property('iconName') or 'command'
-            button.setIcon(line_icon(name, normal, '#ffffff', 18, '#ffffff'))
+            hovered = '#ffffff' if self.current_theme == 'light' else surface_for(self.current_theme)['text']
+            button.setIcon(line_icon(name, normal, hovered, 18, hovered))
         primary_color = primary_icon_color(self.current_theme)
         for button in self.findChildren(QPushButton):
+            # This existing settings action was not part of the nav registry.
+            # Preserve its light-theme icon; refresh it for redesigned themes.
+            if button.property('navigationIcon'):
+                button.setIcon(line_icon('home', size=17) if self.current_theme == 'light'
+                               else line_icon('home', normal, active, 17))
             name = button.property('themeIconName')
             if name:
-                button.setIcon(line_icon(name, primary_color, primary_color, 17))
+                color = primary_color
+                if self.current_theme != 'light' and button.objectName() != 'primary':
+                    color = surface_for(self.current_theme)['text']
+                button.setIcon(line_icon(name, color, color, 17))
         for icon_label in self._metric_icon_labels:
             name = icon_label.property('iconName') or 'command'
             icon_label.setPixmap(_render_svg_icon(name, metric, 20))
@@ -8018,12 +8901,8 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
             tone = str(icon_label.property('metricTone') or 'neutral')
             icon_label.setPixmap(_render_svg_icon(
                 name, self._metric_icon_color(tone), 20, 2.15))
-        tile_color = (
-            '#3f79b4' if self.current_theme == 'light'
-            else '#c9cbd0' if self.current_theme == 'glass'
-            else '#bfe1ff'
-        )
-        status_color = '#287c68' if self.current_theme == 'light' else '#b9f1e4'
+        tile_color = '#3f79b4' if self.current_theme == 'light' else surface_for(self.current_theme)['on']
+        status_color = '#287c68' if self.current_theme == 'light' else MATCH_ROW_PALETTES[self.current_theme]['positive']
         for glyph in self.findChildren(QLabel):
             if not glyph.property('iconTileGlyph'):
                 continue
@@ -8051,20 +8930,15 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
         # The dashboard metrics are hidden on the data, tools and chat pages.
         # Avoid sampling CPU and rebuilding their labels every timer tick; a
         # refresh is triggered when the dashboard becomes active again.
-        if getattr(self, '_active_section', 'overview') not in {'overview', 'optimizer'}:
+        if getattr(self, '_active_section', 'overview') != 'overview':
             return
         super().refresh()
         self._set_if_changed(self.dashboard_memory, self.memory.text())
         self._set_if_changed(self.dashboard_uptime, self.uptime.text())
         cpu_text = f'{optimizer.get_cpu_percent():.0f}%'
         self._set_if_changed(self.dashboard_cpu, cpu_text)
-        if self.scan_ready:
-            junk_text = optimizer.format_bytes(sum(t.scanned for t in self.targets))
-        elif self.busy:
-            junk_text = '扫描中…'
-        else:
-            junk_text = '尚未扫描'
-        self._set_if_changed(self.dashboard_junk, junk_text)
+        player_text = self._game_id or self._player_id or '未绑定'
+        self._set_if_changed(self.dashboard_player, player_text)
         self._set_if_changed(self.dashboard_state, self.status.text())
 
     @staticmethod
@@ -8077,6 +8951,26 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
         if hasattr(self, 'dashboard_state'):
             self._set_if_changed(self.dashboard_state, text)
 
+    def restart_admin(self):
+        if not optimizer.restart_as_admin():
+            self.status.setText('已取消管理员授权，当前仍为普通模式。')
+            if hasattr(self, 'dashboard_state'):
+                self._set_if_changed(self.dashboard_state, '已取消管理员授权，当前仍为普通模式')
+            return
+        # Proactively release global hotkeys before the elevated instance starts
+        # so the new elevated process does not encounter hotkey registration conflicts.
+        if self._taskbar_hotkey_worker is not None and self._taskbar_hotkey_worker.isRunning():
+            self._taskbar_hotkey_worker.stop()
+            self._taskbar_hotkey_worker.wait(500)
+        self.status.setText('已启动管理员窗口，正在关闭当前普通窗口…')
+        self.close()
+
+    def _connect_close_once(self, signal):
+        try:
+            signal.connect(self.close, Qt.ConnectionType.UniqueConnection)
+        except (RuntimeError, TypeError):
+            pass
+
     def closeEvent(self, event):
         # App.closeEvent intentionally rejects shutdown while a cleanup scan
         # is running.  Do not mark this window as closing on that rejected
@@ -8087,7 +8981,7 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
             return
         if self._companion_pack_worker is not None and self._companion_pack_worker.isRunning():
             event.ignore()
-            self._companion_pack_worker.finished.connect(self.close)
+            self._connect_close_once(self._companion_pack_worker.finished)
             return
         # Do not close the bridge by closing stdin and synchronously waiting
         # on the GUI thread.  The child shutdown command can call back into
@@ -8100,6 +8994,19 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
         # the idle shutdown path so a close request can never resurrect the
         # previous room on the next launch.
         self._closing = True
+        self._flashback_replay_catalog.close()
+        self._flashback_replay_info_reader.close()
+        self._cancel_directory_search('_quick_start_search')
+        self._cancel_directory_search('_flashback_directory_search')
+        if self._flashback_replay_scan_timer is not None:
+            self._flashback_replay_scan_timer.stop()
+        # Flush coalesced slider/preference writes only when closing is
+        # accepted, instead of forcing a disk write for every drag movement.
+        self._settings.sync()
+        if hasattr(self, '_scroll_motion'):
+            if self._scroll_motion is not None:
+                self._scroll_motion.shutdown()
+                self._scroll_motion = None
         self._stop_flashback_recorder_process()
         self._clear_chat_session_cache()
         if hasattr(self, '_taskbar_auto_refresh_timer'):
@@ -8118,32 +9025,43 @@ QLineEdit#themedInput:focus {{ border-color: {focus}; }}
             if not self._taskbar_hotkey_worker.wait(1000):
                 self.hide()
                 event.ignore()
-                self._taskbar_hotkey_worker.finished.connect(self.close)
+                self._connect_close_once(self._taskbar_hotkey_worker.finished)
                 return
         if self._api_worker is not None and self._api_worker.isRunning():
             # Do not destroy a QThread during a bounded network request.
             # Hide immediately and finish closing when the request returns.
             self.hide()
             event.ignore()
-            self._api_worker.finished.connect(self.close)
+            self._connect_close_once(self._api_worker.finished)
             return
         if self._update_worker is not None and self._update_worker.isRunning():
             self.hide()
             event.ignore()
-            self._update_worker.finished.connect(self.close)
+            self._connect_close_once(self._update_worker.finished)
             return
         if self._taskbar_action_worker is not None and self._taskbar_action_worker.isRunning():
             self.hide()
             event.ignore()
-            self._taskbar_action_worker.finished.connect(self.close)
+            self._connect_close_once(self._taskbar_action_worker.finished)
             return
+        try:
+            cleanup_skin_cache()
+        except OSError as error:
+            _write_app_log('临时皮肤缓存清理未完成：' + str(error))
         super().closeEvent(event)
 
 
 if __name__ == '__main__':
+    if '--check-new-pc' in sys.argv:
+        os.environ['QT_QPA_PLATFORM'] = 'offscreen'
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     app.setStyleSheet(build_style('light'))
+    if '--check-new-pc' in sys.argv:
+        from new_pc_check import run_check
+        index = sys.argv.index('--check-new-pc')
+        destination = sys.argv[index + 1] if index + 1 < len(sys.argv) else str(Path.cwd() / 'ZJ-HUB-new-pc-check.json')
+        sys.exit(run_check(app, sys.modules[__name__], destination))
     # First launch is gated by a verified BuGLand game ID.  Keep the dialog
     # ahead of LargeApp construction so the main GUI never flashes before the
     # identity has been accepted.  Existing IDs are loaded directly and can be

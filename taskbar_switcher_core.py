@@ -54,6 +54,25 @@ def window_text(hwnd):
     return buffer.value
 
 
+def _title_matches(actual_title, expected_title):
+    """判断窗口标题与任务栏按钮标题是否对应同一目标窗口（支持子标题/应用后缀匹配）。"""
+    actual = (actual_title or "").strip()
+    expected = (expected_title or "").strip()
+    if not actual or not expected:
+        return False
+    if actual == expected:
+        return True
+    actual_cf = actual.casefold()
+    expected_cf = expected.casefold()
+    if actual_cf == expected_cf:
+        return True
+    if actual_cf.endswith(" - " + expected_cf) or expected_cf.endswith(" - " + actual_cf):
+        return True
+    if expected_cf in actual_cf or actual_cf in expected_cf:
+        return True
+    return False
+
+
 def child_handles(hwnd):
     result = []
 
@@ -146,9 +165,11 @@ def activate_window(hwnd):
 
 
 def activate_item(item):
-    # 等待修饰键释放，避免 Alt+数字被 Windows 当成窗口内的组合操作。
+    # 等待所有修饰键（Shift / Ctrl / Alt / LWin / RWin）释放，避免 Shift+Click
+    # 被任务栏识别为“启动新应用实例”，或被目标窗口当成组合快捷键。
+    modifier_keys = (0x10, 0x11, 0x12, 0x5B, 0x5C)
     for _ in range(100):
-        if not any(u.GetAsyncKeyState(key) & 0x8000 for key in (0x12, 0x11)):
+        if not any(u.GetAsyncKeyState(key) & 0x8000 for key in modifier_keys):
             break
         time.sleep(.01)
 
@@ -158,6 +179,13 @@ def activate_item(item):
             if not activate_window(hwnd):
                 raise RuntimeError("Windows 未允许激活此窗口；目标可能以管理员权限运行。")
             return hwnd
+    if not item["group"]:
+        for hwnd, title in windows:
+            if _title_matches(title, item["title"]):
+                if activate_window(hwnd):
+                    return hwnd
+
+    previous_foreground = u.GetForegroundWindow()
 
     def open_button():
         if item["modern"]:
@@ -187,13 +215,14 @@ def activate_item(item):
                     preview.GetInvokePattern().Invoke()
                     time.sleep(.1)
                     hwnd = u.GetForegroundWindow()
-                    if window_text(hwnd) == title:
+                    if _title_matches(window_text(hwnd), title) or (hwnd and hwnd != previous_foreground):
                         return hwnd
                 raise RuntimeError("找到分组预览，但无法激活分组窗口。")
         raise RuntimeError("未能读取分组窗口预览，请刷新后重试。")
 
     time.sleep(.12)
     hwnd = u.GetForegroundWindow()
-    if window_text(hwnd) != item["title"]:
+    current_title = window_text(hwnd)
+    if not _title_matches(current_title, item["title"]) and (not hwnd or hwnd == previous_foreground):
         raise RuntimeError("任务栏已响应，但未确认目标窗口进入前台。")
     return hwnd

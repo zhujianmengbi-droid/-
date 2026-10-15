@@ -105,6 +105,11 @@ class Backdrop(QWidget):
         if self._background_cache is None or self._cache_key != cache_key:
             self._rebuild_cache()
         painter = QPainter(self)
+        # The cache is already a full-size pixmap, but Qt may request only a
+        # small exposed region after a child update or window uncover. Clip the
+        # blit to that region so the translucent root does not copy the whole
+        # 1180x800 surface for a tiny repaint.
+        painter.setClipRegion(event.region())
         if self._background_cache is not None:
             painter.drawPixmap(0, 0, self._background_cache)
         else:
@@ -161,6 +166,7 @@ class App(QMainWindow):
         self._last_uptime_text = None
         self._glass_ready = False
         self._dragging = False
+        self._native_move_pending = False
         self._drag_updates_suspended = False
         self._drag_offset = None
         self._pending_drag_pos = None
@@ -190,17 +196,22 @@ class App(QMainWindow):
     def native_glass(self):
         hwnd = ctypes.c_void_p(int(self.winId()))
         dwm = ctypes.windll.dwmapi
-        # 关闭系统窗口过渡动画，减少拖动时的额外合成工作；模糊效果仍保持开启。
-        for attribute, value in [(3, 1), (20, 1), (33, 2), (38, 3)]:
+        # 关闭系统窗口过渡动画，减少拖动时的额外合成工作。 之前同时启用
+        # Acrylic backdrop (38=3) 和旧式 Accent blur，导致普通明亮/深色主题
+        # 也要持续经过整窗模糊合成。只有玻璃主题需要桌面模糊；其余主题的
+        # 背景缓存已经足够提供材质感，使用 NONE 可显著降低重绘和窗口移动的
+        # DWM 合成开销。
+        for attribute, value in [(3, 1), (20, 1), (33, 2), (38, 1)]:
             data = ctypes.c_int(value)
             dwm.DwmSetWindowAttribute(hwnd, attribute, ctypes.byref(data), 4)
-        # ACCENT_ENABLE_BLURBEHIND 在 Windows 11 22000 上可用，
-        # 不依赖 22621 才提供的 DWMWA_SYSTEMBACKDROP_TYPE。
+        # ACCENT_ENABLE_BLURBEHIND 在 Windows 11 22000 上可用；只给玻璃主题
+        # 开启，避免把每一次普通页面更新都交给模糊合成器处理。
         self._glass_ready = True
-        self.blur_enabled = self._apply_blur(True)
+        self.blur_enabled = self._apply_blur(
+            getattr(self, 'current_theme', 'light') == 'glass')
 
     def _apply_blur(self, enabled):
-        """设置 DWM 模糊状态；拖动期间始终保持开启。"""
+        """设置 DWM 模糊状态；仅玻璃主题需要持续模糊。"""
         hwnd = ctypes.c_void_p(int(self.winId()))
         accent = _Accent(3 if enabled else 0, 0, 0, 0)
         composition = _Composition(19, ctypes.addressof(accent), ctypes.sizeof(accent))
@@ -228,6 +239,23 @@ class App(QMainWindow):
     def begin_window_drag(self, global_pos=None):
         if self.windowHandle() is None or self._dragging:
             return
+        # The application event filter sees the same press before TitleBar's
+        # mousePressEvent. Guard the second callback when native moving starts.
+        if self._native_move_pending:
+            return
+        # Let Windows own the non-client move loop whenever possible.  The
+        # previous Python-side grab + 16 ms timer added a visible input delay
+        # and forced every translucent frame through the Qt event loop.
+        if sys.platform == 'win32':
+            self._native_move_pending = True
+            QTimer.singleShot(0, lambda: setattr(self, '_native_move_pending', False))
+            try:
+                if self.windowHandle().startSystemMove():
+                    return
+            except (AttributeError, RuntimeError):
+                self._native_move_pending = False
+            else:
+                self._native_move_pending = False
         global_pos = global_pos or QCursor.pos()
         self._drag_offset = global_pos - self.frameGeometry().topLeft()
         self._pending_drag_pos = self.pos()
@@ -295,44 +323,34 @@ class App(QMainWindow):
         return True
 
     def eventFilter(self, watched, event):
-        # Keep button feedback subtle and continuous without changing the
-        # existing stylesheet. LargeApp supplies the animation implementation.
-        if (isinstance(watched, QAbstractButton)
-                and hasattr(self, '_animate_button')):
-            event_type = event.type()
-            if event_type == QEvent.Type.Enter:
-                self._animate_button(watched, 1.0)
-            elif event_type == QEvent.Type.Leave:
-                self._animate_button(watched, 0.92)
-            elif event_type == QEvent.Type.MouseButtonPress:
-                self._animate_button(watched, 0.78)
-            elif event_type == QEvent.Type.MouseButtonRelease:
-                self._animate_button(watched, 1.0)
+        event_type = event.type()
+        if not self._dragging and event_type not in (
+                QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick):
+            return False
         if self._dragging:
-            event_type = event.type()
             if ((event_type == QEvent.Type.ApplicationDeactivate
                  and watched is QApplication.instance())
                     or (event_type in (QEvent.Type.WindowDeactivate, QEvent.Type.UngrabMouse,
                                        QEvent.Type.Hide)
                         and watched is self)):
                 self._finish_window_drag()
-        if (event.type() == QEvent.Type.MouseButtonRelease
+        if (event_type == QEvent.Type.MouseButtonRelease
                 and event.button() == Qt.MouseButton.LeftButton
                 and self._dragging):
             self._finish_window_drag()
             return True
-        if self._dragging and event.type() == QEvent.Type.MouseMove:
+        if self._dragging and event_type == QEvent.Type.MouseMove:
             self._pending_drag_pos = self._event_global_pos(event) - self._drag_offset
             if not self._drag_move_timer.isActive():
                 self._drag_move_timer.start()
             return True
-        if (event.type() in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick)
+        if (event_type in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick)
                 and self._is_drag_source(watched)):
-            if event.type() == QEvent.Type.MouseButtonDblClick and event.button() == Qt.MouseButton.LeftButton:
+            if event_type == QEvent.Type.MouseButtonDblClick and event.button() == Qt.MouseButton.LeftButton:
                 self._finish_window_drag()
                 self.toggle_maximized()
                 return True
-            if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+            if event_type == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
                 self.begin_window_drag(self._event_global_pos(event))
                 return True
         return super().eventFilter(watched, event)
@@ -627,8 +645,11 @@ class App(QMainWindow):
                 self.refresh()
 
     def restart_admin(self):
-        optimizer.restart_as_admin()
-        self.status.setText('已请求管理员启动，请在新窗口打开后关闭此窗口。')
+        if optimizer.restart_as_admin():
+            self.status.setText('已启动管理员窗口，正在关闭当前普通窗口…')
+            self.close()
+        else:
+            self.status.setText('已取消管理员授权，当前仍为普通模式。')
 
     def closeEvent(self, event):
         if self.busy:

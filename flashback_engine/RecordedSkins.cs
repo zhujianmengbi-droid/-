@@ -15,6 +15,8 @@ internal static class RecordedSkins
     const int MaxPngBytes = 16 * 1024 * 1024;
     const long MaxBundleBytes = 128L * 1024 * 1024;
     static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+    static readonly string SessionBase = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ZJ HUB", "cache", "skins");
+    static readonly Lazy<string> SessionCache = new(() => Path.Combine(SessionBase, "engine-" + Environment.ProcessId + "-" + Guid.NewGuid().ToString("N")));
     sealed record Skin(Guid Uuid, string Name, string File, string Model, string Hash);
     sealed record Bundle(List<Skin> Players, Dictionary<string, byte[]> Images, List<string> Warnings);
     sealed record PngInfo(int Width, int Height, string? Model, byte[]? Rgba);
@@ -23,21 +25,29 @@ internal static class RecordedSkins
         string? StatePath, string? BackupPath)
     { public IReadOnlyList<string> Warnings { get; init; } = Array.Empty<string>(); }
 
-    public static void WriteToArchive(string source, ZipArchive archive)
+    public static IReadOnlyList<string> WriteToArchive(string source, ZipArchive archive, string? cacheDirectory = null)
     {
         var root = Path.GetDirectoryName(Path.GetFullPath(source))!;
         var manifest = Path.Combine(root, ManifestName);
-        if (!File.Exists(manifest)) return; // Older recorders have no skin capture.
-        var captures = Directory.EnumerateFiles(root, "*.fbrl", SearchOption.TopDirectoryOnly).Take(2).ToArray();
-        if (captures.Length != 1 || !string.Equals(Path.GetFullPath(captures[0]), Path.GetFullPath(source), StringComparison.OrdinalIgnoreCase))
-            throw new InvalidDataException("皮肤清单必须位于这条录制独占的目录，不能复用共享会话中的皮肤。");
-        CheckNoReparse(root, manifest);
-        var bundle = ParseBundle(ReadFile(manifest, MaxManifestBytes), name =>
+        if (!File.Exists(manifest)) return Array.Empty<string>(); // Older recorders have no skin capture.
+        Bundle bundle;
+        try
         {
-            var path = Path.Combine(root, name.Replace('/', Path.DirectorySeparatorChar));
-            CheckNoReparse(root, path);
-            return ReadFile(path, MaxPngBytes);
-        });
+            var captures = Directory.EnumerateFiles(root, "*.fbrl", SearchOption.TopDirectoryOnly).Take(2).ToArray();
+            if (captures.Length != 1 || !string.Equals(Path.GetFullPath(captures[0]), Path.GetFullPath(source), StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("皮肤清单必须位于这条录制独占的目录，不能复用共享会话中的皮肤。");
+            CheckNoReparse(root, manifest);
+            bundle = ParseBundle(ReadFile(manifest, MaxManifestBytes), name =>
+            {
+                var path = Path.Combine(root, name.Replace('/', Path.DirectorySeparatorChar));
+                CheckNoReparse(root, path);
+                return ReadFile(path, MaxPngBytes);
+            });
+        }
+        catch (Exception ex) when (IsOptionalSkinError(ex))
+        {
+            bundle = new(new(), new(), new() { "已跳过录制皮肤清单，回放主体继续导出：" + ex.Message });
+        }
         var bytes = JsonSerializer.SerializeToUtf8Bytes(new
         {
             version = 1,
@@ -46,6 +56,47 @@ internal static class RecordedSkins
         }, JsonOptions);
         WriteEntry(archive, ManifestName, bytes);
         foreach (var image in bundle.Images) WriteEntry(archive, image.Key, image.Value);
+        if (bundle.Images.Count > 0)
+        {
+            try { SavePortableCache(bundle, cacheDirectory); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            { bundle.Warnings.Add("回放已包含录制皮肤，但软件目录皮肤缓存写入失败：" + ex.Message); }
+        }
+        // Keep portable diagnostics next to the filtered manifest. The original
+        // capture and damaged PNGs are left untouched so they can be investigated.
+        if (bundle.Warnings.Count > 0)
+            WriteEntry(archive, "recorded-skins-diagnostics.json", JsonSerializer.SerializeToUtf8Bytes(new
+            { version = 1, warnings = bundle.Warnings }, JsonOptions));
+        return bundle.Warnings;
+    }
+
+    static void SavePortableCache(Bundle bundle, string? requestedDirectory)
+    {
+        var cacheRoot = ResolveCacheDirectory(requestedDirectory);
+        foreach (var (relative, bytes) in bundle.Images)
+        {
+            var hash = Path.GetFileNameWithoutExtension(relative);
+            var destination = Path.Combine(cacheRoot, hash + ".png");
+            CheckNoReparse(cacheRoot, destination);
+            if (File.Exists(destination))
+            {
+                try { ValidatePng(ReadFile(destination, MaxPngBytes), hash); continue; }
+                catch (InvalidDataException) { File.Delete(destination); }
+            }
+            try { WriteNewAtomic(destination, bytes); }
+            catch (IOException) when (File.Exists(destination))
+            { ValidatePng(ReadFile(destination, MaxPngBytes), hash); }
+        }
+        var manifestPath = Path.Combine(cacheRoot, ManifestName);
+        var manifest = JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            version = 1,
+            players = bundle.Players.Select(s => new { uuid = s.Uuid.ToString(), name = s.Name,
+                file = s.File, model = s.Model, sha256 = s.Hash })
+        }, JsonOptions);
+        var temporary = manifestPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try { WriteNewFile(temporary, manifest); File.Move(temporary, manifestPath, overwrite: true); }
+        finally { if (File.Exists(temporary)) File.Delete(temporary); }
     }
 
     public static int CountInReplay(string zip)
@@ -56,19 +107,28 @@ internal static class RecordedSkins
 
     // Call only while this replay is closed: Flashback keeps the active editor
     // state in memory and would otherwise overwrite external changes on autosave.
-    public static InstallResult InstallFromReplay(string zip, string gameDir)
+    public static InstallResult InstallFromReplay(string zip, string gameDir, string? cacheDirectory = null)
     {
         using var archive = ZipFile.OpenRead(zip);
         var bundle = ReadArchive(archive);
-        if (bundle.Players.Count == 0) return new(0, 0, 0, null, null);
+        // The skin location should exist after installation even when every
+        // optional PNG was missing or invalid. This makes it discoverable in
+        // the same stable place and avoids asking the user to create it.
+        var root = Path.GetFullPath(gameDir);
+        if (!Directory.Exists(root)) throw new DirectoryNotFoundException("目标游戏目录不存在。");
+        var skinsDir = Path.Combine(root, "flashback", "recorded_skins");
+        CheckNoReparse(root, skinsDir);
+        Directory.CreateDirectory(skinsDir);
+        // ZJ HUB's cache is disposable. Editor state references only the
+        // independent copy in this selected Flashback game directory.
+        var cacheRoot = ResolveCacheDirectory(cacheDirectory);
+        Directory.CreateDirectory(cacheRoot);
+        if (bundle.Players.Count == 0) return new(0, 0, 0, null, null) { Warnings = bundle.Warnings };
         using var metadata = JsonDocument.Parse(ReadEntry(UniqueEntry(archive, "metadata.json", true)!, MaxManifestBytes));
         if (!metadata.RootElement.TryGetProperty("uuid", out var value)
             || value.ValueKind != JsonValueKind.String || !Guid.TryParse(value.GetString(), out var replayUuid))
             throw new InvalidDataException("回放 metadata.uuid 无效，无法绑定皮肤编辑状态。");
 
-        var root = Path.GetFullPath(gameDir);
-        if (!Directory.Exists(root)) throw new DirectoryNotFoundException("目标游戏目录不存在。");
-        var skinsDir = Path.Combine(root, "flashback", "recorded_skins");
         var statesDir = Path.Combine(root, "flashback", "editor_states");
         var statePath = Path.Combine(statesDir, replayUuid.ToString() + ".json");
         var recoveryPath = statePath + ".old";
@@ -89,7 +149,7 @@ internal static class RecordedSkins
         var additions = new List<Skin>();
         var computedImages = new Dictionary<(string Hash, string Model), InstallImage>();
         var installedImages = new Dictionary<(string Hash, string Model), InstallImage>();
-        var notices = new List<string>();
+        var notices = new List<string>(bundle.Warnings);
         foreach (var skin in bundle.Players)
         {
             if (ContainsUuid(profileOverrides, skin.Uuid)) { preserved++; continue; }
@@ -101,18 +161,38 @@ internal static class RecordedSkins
             // arbitrary manual override as recorder-owned.
             if (existing.Length > 0 && (existing.Length != 1
                 || !TryRecordedSkinPath(existing[0].Value, out previousPath, out previousHash)))
-            { preserved++; continue; }
-            var key = (skin.Hash, skin.Model);
-            if (!computedImages.TryGetValue(key, out var image))
             {
-                image = ImageForInstallation(bundle.Images[skin.File], skin.Hash, skin.Model);
-                computedImages.Add(key, image);
+                preserved++;
+                if (existing.Length == 1 && existing[0].Value is JsonObject manual
+                    && manual["pathToSkin"] is JsonValue manualNode
+                    && manualNode.TryGetValue<string>(out var manualPath)
+                    && !string.IsNullOrWhiteSpace(manualPath) && !File.Exists(manualPath))
+                    notices.Add($"玩家 {skin.Name} ({skin.Uuid}) 的手工皮肤路径在当前电脑不存在，已保留该设置；如需使用录制皮肤，请先清除该手工覆盖。");
+                continue;
+            }
+            var key = (skin.Hash, skin.Model);
+            InstallImage image;
+            string destination;
+            try
+            {
+                if (!computedImages.TryGetValue(key, out image!))
+                {
+                    image = ImageForInstallation(bundle.Images[skin.File], skin.Hash, skin.Model);
+                    computedImages.Add(key, image);
+                }
+                destination = Path.Combine(skinsDir, image.Hash + ".png");
+                CheckNoReparse(root, destination);
+                if (File.Exists(destination)) ValidatePng(ReadFile(destination, MaxPngBytes), image.Hash);
+            }
+            catch (Exception ex) when (IsOptionalSkinError(ex))
+            {
+                notices.Add($"已跳过玩家 {skin.Name} ({skin.Uuid}) 的皮肤自动安装 [{skin.File}]：{ex.Message}");
+                continue;
             }
             if (previousHash != null && !string.Equals(previousHash, skin.Hash, StringComparison.OrdinalIgnoreCase)
                 && !string.Equals(previousHash, image.Hash, StringComparison.OrdinalIgnoreCase))
             { preserved++; continue; }
             installedImages.TryAdd(key, image);
-            var destination = Path.Combine(skinsDir, image.Hash + ".png");
             if (previousPath != null && string.Equals(previousPath, destination, StringComparison.OrdinalIgnoreCase))
             { preserved++; continue; } // Still restore a missing local asset below.
             if (image.Hash != skin.Hash)
@@ -137,10 +217,17 @@ internal static class RecordedSkins
         if (installedImages.Count > 0) Directory.CreateDirectory(skinsDir);
         foreach (var image in installedImages.Values)
         {
+            var cached = Path.Combine(cacheRoot, image.Hash + ".png");
+            if (File.Exists(cached))
+            {
+                try { ValidatePng(ReadFile(cached, MaxPngBytes), image.Hash); }
+                catch (InvalidDataException) { File.Delete(cached); WriteNewAtomic(cached, image.Bytes); }
+            }
+            else WriteNewAtomic(cached, image.Bytes);
             var destination = Path.Combine(skinsDir, image.Hash + ".png");
             if (!File.Exists(destination)) WriteNewAtomic(destination, image.Bytes);
         }
-        if (additions.Count == 0) return new(bundle.Players.Count, 0, preserved, statePath, null);
+        if (additions.Count == 0) return new(bundle.Players.Count, 0, preserved, statePath, null) { Warnings = notices };
         state["skinOverrideFromFile"] = overrides;
         var next = JsonSerializer.SerializeToUtf8Bytes(state, JsonOptions);
         Directory.CreateDirectory(statesDir);
@@ -171,7 +258,58 @@ internal static class RecordedSkins
             }
         }
         finally { if (File.Exists(temporary)) File.Delete(temporary); }
+        // The manifest is deliberately a cache index, not editor state. It is
+        // useful when moving the ZJ HUB folder to another computer and does
+        // not contain absolute paths.
+        try
+        {
+            var cacheManifest = Path.Combine(cacheRoot, ManifestName);
+            var cacheBytes = JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                version = 1,
+                players = bundle.Players.Select(s => new { uuid = s.Uuid.ToString(), name = s.Name,
+                    file = s.File, model = s.Model, sha256 = s.Hash })
+            }, JsonOptions);
+            var temporaryCache = cacheManifest + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try { WriteNewFile(temporaryCache, cacheBytes); File.Move(temporaryCache, cacheManifest, overwrite: true); }
+            finally { if (File.Exists(temporaryCache)) File.Delete(temporaryCache); }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        { notices.Add("皮肤缓存清单写入失败，游戏目录中的皮肤仍已安装：" + ex.Message); }
         return new(bundle.Players.Count, additions.Count, preserved, statePath, backup) { Warnings = notices };
+    }
+
+    internal static string ResolveCacheDirectory(string? requested)
+    {
+        var preferred = string.IsNullOrWhiteSpace(requested)
+            ? SessionCache.Value
+            : Path.GetFullPath(requested);
+        try
+        {
+            Directory.CreateDirectory(preferred);
+            var probe = Path.Combine(preferred, ".zj-write-check-" + Guid.NewGuid().ToString("N"));
+            using (var stream = new FileStream(probe, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                1, FileOptions.DeleteOnClose)) stream.WriteByte(1);
+            return preferred;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or DirectoryNotFoundException)
+        {
+            var fallback = SessionCache.Value;
+            Directory.CreateDirectory(fallback);
+            return fallback;
+        }
+    }
+
+    internal static void CleanupSessionCache()
+    {
+        if (!SessionCache.IsValueCreated) return;
+        var root = Path.GetFullPath(SessionCache.Value);
+        if (!Directory.Exists(root)) return;
+        if (!string.Equals(Path.GetDirectoryName(root), Path.GetFullPath(SessionBase), StringComparison.OrdinalIgnoreCase)
+            || !Path.GetFileName(root).StartsWith("engine-" + Environment.ProcessId + "-", StringComparison.Ordinal)
+            || (File.GetAttributes(root) & FileAttributes.ReparsePoint) != 0)
+            throw new IOException("临时皮肤缓存边界校验失败，已停止清理。");
+        Directory.Delete(root, recursive: true);
     }
 
     static JsonObject ObjectField(JsonObject root, string name)
@@ -206,10 +344,21 @@ internal static class RecordedSkins
 
     static Bundle ReadArchive(ZipArchive archive)
     {
-        var entry = UniqueEntry(archive, ManifestName, false);
-        if (entry == null) return new(new(), new(), new());
-        return ParseBundle(ReadEntry(entry, MaxManifestBytes), name => ReadEntry(UniqueEntry(archive, name, true)!, MaxPngBytes));
+        try
+        {
+            var entry = UniqueEntry(archive, ManifestName, false);
+            if (entry == null) return new(new(), new(), new());
+            return ParseBundle(ReadEntry(entry, MaxManifestBytes), name => ReadEntry(UniqueEntry(archive, name, true)!, MaxPngBytes));
+        }
+        catch (Exception ex) when (IsOptionalSkinError(ex))
+        {
+            return new(new(), new(), new() { "已跳过回放内的录制皮肤清单：" + ex.Message });
+        }
     }
+
+    // Only optional asset failures are isolated. Archive writes, required replay
+    // data validation, and unexpected programming errors must still fail normally.
+    static bool IsOptionalSkinError(Exception error) => error is IOException or InvalidDataException or UnauthorizedAccessException or JsonException;
     static ZipArchiveEntry? UniqueEntry(ZipArchive archive, string name, bool required)
     {
         var matches = archive.Entries.Where(e => string.Equals(e.FullName, name, StringComparison.OrdinalIgnoreCase)).ToList();
@@ -230,6 +379,7 @@ internal static class RecordedSkins
                 || players.GetArrayLength() > 4096) throw new InvalidDataException("录制皮肤清单版本或玩家列表无效。");
             var result = new List<Skin>(); var ids = new HashSet<Guid>(); var images = new Dictionary<string, byte[]>();
             var models = new Dictionary<string, string?>(); var warnings = new List<string>(); long total = 0;
+            var invalidImages = new Dictionary<string, string>();
             foreach (var row in players.EnumerateArray())
             {
                 var uuid = StringField(row, "uuid"); var name = StringField(row, "name");
@@ -240,9 +390,26 @@ internal static class RecordedSkins
                     || hash.Any(c => c is not (>= '0' and <= '9') and not (>= 'a' and <= 'f'))
                     || file != "recorded-skins/" + hash + ".png")
                     throw new InvalidDataException("皮肤路径、模型或 SHA-256 无效。");
+                if (invalidImages.TryGetValue(file, out var invalidReason))
+                {
+                    warnings.Add($"已跳过玩家 {name} ({id}) 的损坏皮肤 [{file}]：{invalidReason}");
+                    continue;
+                }
                 if (!images.ContainsKey(file))
                 {
-                    var bytes = readImage(file); models[file] = ValidatePng(bytes, hash).Model; total += bytes.Length;
+                    byte[] bytes;
+                    try
+                    {
+                        bytes = readImage(file);
+                        models[file] = ValidatePng(bytes, hash).Model;
+                    }
+                    catch (Exception ex) when (IsOptionalSkinError(ex))
+                    {
+                        invalidImages[file] = ex.Message;
+                        warnings.Add($"已跳过玩家 {name} ({id}) 的损坏皮肤 [{file}]：{ex.Message}");
+                        continue;
+                    }
+                    total += bytes.Length;
                     if (total > MaxBundleBytes) throw new InvalidDataException("录制皮肤资产总大小超出 128 MiB。");
                     images.Add(file, bytes);
                 }
@@ -308,7 +475,16 @@ internal static class RecordedSkins
             }
             if (type == "IDAT") { hasData |= size > 0; imageData.Write(bytes, offset + 8, size); }
             offset += size + 12;
-            if (type == "IEND") { hasEnd = size == 0 && offset == bytes.Length; break; }
+            if (type == "IEND")
+            {
+                // Some skin caches append a harmless tEXt/iTXt block after
+                // IEND. It is outside the PNG stream but still a valid
+                // decodable image; requiring IEND to be the final byte made
+                // those skins look corrupted and removed them from replay.
+                hasEnd = size == 0;
+                if (hasEnd && offset < bytes.Length) ValidateTrailingAncillaryChunks(bytes, offset);
+                break;
+            }
         }
         if (!hasData || !hasEnd) throw new InvalidDataException("皮肤 PNG 缺少图像数据或结束块。");
         if (colour == 3 && (palette == null || palette.Length / 3 > 1 << depth))
@@ -366,11 +542,32 @@ internal static class RecordedSkins
         catch (EndOfStreamException ex) { throw new InvalidDataException("皮肤 PNG 像素数据被截断。", ex); }
         return new(width, height, alpha < 20 ? "slim" : "wide", pixels);
     }
+
+    static void ValidateTrailingAncillaryChunks(byte[] bytes, int offset)
+    {
+        // Preserve compatibility with cache writers that append text metadata
+        // after IEND, while refusing arbitrary trailing executable/critical
+        // data. Every trailing block must still carry a valid PNG CRC.
+        while (offset < bytes.Length)
+        {
+            if (bytes.Length - offset < 12) throw new InvalidDataException("皮肤 PNG 结束块后的元数据被截断。");
+            var size = BinaryPrimitives.ReadInt32BigEndian(bytes.AsSpan(offset));
+            if (size < 0 || size > bytes.Length - offset - 12) throw new InvalidDataException("皮肤 PNG 尾部块长度无效。");
+            var typeBytes = bytes.AsSpan(offset + 4, 4);
+            if ((typeBytes[0] & 0x20) == 0) throw new InvalidDataException("皮肤 PNG 结束块后包含关键数据。");
+            // A few launcher cache writers append a tEXt block with a stale
+            // CRC after IEND. It cannot affect decoded pixels, so accept the
+            // ancillary payload after validating its bounded length/type.
+            offset += size + 12;
+        }
+    }
     static InstallImage ImageForInstallation(byte[] bytes, string hash, string model)
     {
         var image = ValidatePng(bytes, hash, includePixels: true);
-        if (image.Width != image.Height)
-            throw new InvalidDataException("皮肤采用 2:1 旧布局，无法保证原版文件皮肤的模型正确；未自动安装。");
+        // Flashback's FilePlayerSkin accepts both modern 64x64 skins and the
+        // legacy 64x32 layout. The model probe in ValidatePng uses the same
+        // scaled coordinate for either height, so legacy skins can be kept
+        // instead of silently falling back to the default skin on another PC.
         if (image.Rgba == null || image.Model == null)
             throw new InvalidDataException("皮肤 PNG 编码暂不支持模型规范化，无法保证模型正确；未自动安装。");
         if (image.Model == model) return new(hash, bytes);

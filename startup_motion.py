@@ -9,6 +9,12 @@ from PySide6.QtCore import (
 from PySide6.QtWidgets import QApplication, QWidget
 
 
+_ENTRANCE_EVENTS = frozenset((
+    QEvent.Type.MouseButtonPress, QEvent.Type.KeyPress,
+    QEvent.Type.Close, QEvent.Type.Hide,
+))
+
+
 def system_motion_enabled():
     if sys.platform != 'win32':
         return True
@@ -70,11 +76,14 @@ class WindowEntrance(QObject):
 
     def eventFilter(self, watched, event):
         kind = event.type()
-        if (isinstance(watched, QWidget) and watched.window() is self.window
-                and kind in (QEvent.Type.MouseButtonPress, QEvent.Type.KeyPress,
-                             QEvent.Type.Close)):
-            self.finish()
-        elif watched is self.window and kind == QEvent.Type.Hide:
+        # Showing the window sends many child layout/paint/style events. Only
+        # user input and closing/hiding can interrupt the entrance.
+        if kind not in _ENTRANCE_EVENTS:
+            return False
+        if kind == QEvent.Type.Hide:
+            if watched is self.window:
+                self.finish()
+        elif isinstance(watched, QWidget) and watched.window() is self.window:
             self.finish()
         return False
 

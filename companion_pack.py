@@ -7,7 +7,7 @@ import tempfile
 
 
 PACK_FILENAME = 'ZJ-HUB-modpack.zip'
-PACK_SHA256 = 'b2b5054e6656da423abd8a67ef66875f821e4534d66c48239d84764f8a12dd25'
+PACK_SHA256 = '77b50e64af8693be31716e1a9a52bea5ee5f5e0aefb2397a2793c9b5a5fa05d6'
 
 
 def bundled_pack_path():

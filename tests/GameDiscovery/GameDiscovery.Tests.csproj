@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="System.Management" Version="8.0.0" />
+    <Compile Include="../../flashback_engine/RuntimeSupport.cs" Link="RuntimeSupport.cs" />
+    <Compile Include="../../flashback_engine/NativeProcessModules.cs" Link="NativeProcessModules.cs" />
+    <Compile Include="../../flashback_engine/ChildProcess.cs" Link="ChildProcess.cs" />
+    <Compile Include="../../flashback_engine/JavaRuntimeProbe.cs" Link="JavaRuntimeProbe.cs" />
+  </ItemGroup>
+</Project>

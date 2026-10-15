@@ -16,8 +16,10 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>
   <ItemGroup>
+    <PackageReference Include="System.Management" Version="8.0.0" />
     <EmbeddedResource Include="runtime\runtime-recorder-cli.jar" LogicalName="RuntimeAssets/runtime-recorder-cli.jar" />
-    <EmbeddedResource Include="runtime\runtime-recorder-agent-v12.jar" LogicalName="RuntimeAssets/runtime-recorder-agent-v12.jar" />
-    <EmbeddedResource Include="runtime\flashback-protocol-adapter-v5.jar" LogicalName="RuntimeAssets/flashback-protocol-adapter-v5.jar" />
+    <EmbeddedResource Include="runtime\runtime-recorder-agent-v13.jar" LogicalName="RuntimeAssets/runtime-recorder-agent-v13.jar" />
+    <EmbeddedResource Include="runtime\runtime-recorder-agent-1.21.10-v2.jar" LogicalName="RuntimeAssets/runtime-recorder-agent-1.21.10-v2.jar" />
+    <EmbeddedResource Include="runtime\flashback-protocol-adapter-v6.jar" LogicalName="RuntimeAssets/flashback-protocol-adapter-v6.jar" />
   </ItemGroup>
 </Project>

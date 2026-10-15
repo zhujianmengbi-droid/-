@@ -5,6 +5,8 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Threading.Channels;
+using Microsoft.Win32;
 
 namespace FlashbackRecorder;
 
@@ -26,20 +28,32 @@ internal sealed class GameProcess
 internal static class RuntimeAssets
 {
     public static string Root { get; } = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FlashbackRecorder", "runtime-recorder");
-    public static string Cli => Path.Combine(Root, "runtime-recorder-cli.jar");
+    static string? activeCli;
+    static string? activeAgent;
+    static string? activeModernAgent;
+    static string? activeProtocolAdapter;
+    public static string Cli => activeCli ?? Path.Combine(Root, "runtime-recorder-cli.jar");
     // Versioned names avoid Windows keeping an older Agent JAR open inside a
     // JVM.  A running game can therefore keep its old session while the next
     // launch extracts the repaired Agent and adapter side by side.
-    public const int RequiredAgentVersion = 12;
-    public static string Agent => Path.Combine(Root, "runtime-recorder-agent-v12.jar");
-    public static string ProtocolAdapter => Path.Combine(Root, "flashback-protocol-adapter-v5.jar");
+    public const int RequiredAgentVersion = 13;
+    public static int RequiredAgentVersionFor(string? version) => version == "1.21.10" ? 17 : RequiredAgentVersion;
+    public static string Agent => activeAgent ?? Path.Combine(Root, "runtime-recorder-agent-v13.jar");
+    public static string ModernAgent => activeModernAgent ?? Path.Combine(Root, "runtime-recorder-agent-1.21.10-v2.jar");
+    public static string AgentForVersion(string version) => version == "1.21.10" ? ModernAgent : Agent;
+    public static string ProtocolAdapter => activeProtocolAdapter ?? Path.Combine(Root, "flashback-protocol-adapter-v6.jar");
 
     public static void Ensure()
     {
         Directory.CreateDirectory(Root);
-        foreach (var file in new[] { ("runtime-recorder-cli.jar", Cli), ("runtime-recorder-agent-v12.jar", Agent), ("flashback-protocol-adapter-v5.jar", ProtocolAdapter) })
+        foreach (var asset in new[] { "runtime-recorder-cli.jar", "runtime-recorder-agent-v13.jar", "runtime-recorder-agent-1.21.10-v2.jar", "flashback-protocol-adapter-v6.jar" })
         {
-            if (IsCurrent(file.Item2, file.Item1)) continue;
+            var file = (asset, Path.Combine(Root, asset));
+            if (IsCurrent(file.Item2, file.Item1))
+            {
+                SetActivePath(file.Item1, file.Item2);
+                continue;
+            }
             var name = Assembly.GetExecutingAssembly().GetManifestResourceNames().FirstOrDefault(n => n.EndsWith(file.Item1, StringComparison.OrdinalIgnoreCase));
             if (name is null) throw new FileNotFoundException("EXE 内未找到运行时组件", file.Item1);
             using var input = Assembly.GetExecutingAssembly().GetManifestResourceStream(name)!;
@@ -52,18 +66,75 @@ internal static class RuntimeAssets
             {
                 input.CopyTo(output);
             }
+            var activePath = file.Item2;
+            bool targetIsReparse;
             try
             {
-                if (File.Exists(file.Item2)
-                    && (File.GetAttributes(file.Item2) & FileAttributes.ReparsePoint) != 0)
-                    throw new IOException("运行时组件路径不允许符号链接或目录联接。");
+                targetIsReparse = File.Exists(file.Item2)
+                    && (File.GetAttributes(file.Item2) & FileAttributes.ReparsePoint) != 0;
+            }
+            catch
+            {
+                if (File.Exists(temporary)) File.Delete(temporary);
+                throw;
+            }
+            if (targetIsReparse)
+            {
+                File.Delete(temporary);
+                throw new IOException("运行时组件路径不允许符号链接或目录联接。");
+            }
+            try
+            {
                 File.Move(temporary, file.Item2, overwrite: true);
+            }
+            catch (IOException) when (File.Exists(temporary) && !targetIsReparse)
+            {
+                // A running JVM or antivirus scanner can keep the previous
+                // versioned JAR open. Do not fail startup or reuse that old
+                // component; keep this process on a fresh immutable copy.
+                activePath = Path.Combine(Root,
+                    Path.GetFileNameWithoutExtension(file.Item1) + "-" + Guid.NewGuid().ToString("N") + ".jar");
+                File.Move(temporary, activePath, overwrite: false);
+            }
+            catch (UnauthorizedAccessException) when (File.Exists(temporary) && !targetIsReparse)
+            {
+                activePath = Path.Combine(Root,
+                    Path.GetFileNameWithoutExtension(file.Item1) + "-" + Guid.NewGuid().ToString("N") + ".jar");
+                File.Move(temporary, activePath, overwrite: false);
             }
             finally
             {
                 if (File.Exists(temporary)) File.Delete(temporary);
             }
+            SetActivePath(file.Item1, activePath);
+            CleanupStaleFallbackJars(Path.GetFileNameWithoutExtension(file.Item1), file.Item2, activePath);
         }
+    }
+
+    static void CleanupStaleFallbackJars(string prefix, string canonicalPath, string activePath)
+    {
+        try
+        {
+            foreach (var candidate in Directory.EnumerateFiles(Root, prefix + "-*.jar", SearchOption.TopDirectoryOnly))
+            {
+                if (string.Equals(candidate, canonicalPath, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(candidate, activePath, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                try { File.Delete(candidate); }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
+    static void SetActivePath(string resourceSuffix, string path)
+    {
+        if (resourceSuffix.Equals("runtime-recorder-cli.jar", StringComparison.OrdinalIgnoreCase)) activeCli = path;
+        else if (resourceSuffix.Equals("runtime-recorder-agent-v13.jar", StringComparison.OrdinalIgnoreCase)) activeAgent = path;
+        else if (resourceSuffix.Equals("runtime-recorder-agent-1.21.10-v2.jar", StringComparison.OrdinalIgnoreCase)) activeModernAgent = path;
+        else if (resourceSuffix.Equals("flashback-protocol-adapter-v6.jar", StringComparison.OrdinalIgnoreCase)) activeProtocolAdapter = path;
     }
 
     /// <summary>True when the extracted jar matches the jar embedded in this EXE,
@@ -73,6 +144,7 @@ internal static class RuntimeAssets
         try
         {
             if (!File.Exists(path)) return false;
+            if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0) return false;
             var length = new FileInfo(path).Length;
             if (length <= 100 || length > 512L * 1024 * 1024) return false;
             var name = Assembly.GetExecutingAssembly().GetManifestResourceNames()
@@ -80,7 +152,8 @@ internal static class RuntimeAssets
             if (name is null) return false;
             using var embedded = Assembly.GetExecutingAssembly().GetManifestResourceStream(name)!;
             var embeddedHash = System.Security.Cryptography.SHA256.HashData(embedded);
-            var localHash = System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(path));
+            using var local = File.OpenRead(path);
+            var localHash = System.Security.Cryptography.SHA256.HashData(local);
             return embeddedHash.AsSpan().SequenceEqual(localHash);
         }
         catch { return false; }
@@ -89,6 +162,15 @@ internal static class RuntimeAssets
 
 internal sealed class RecorderForm : Form
 {
+    Task? activeExportWork;
+    CancellationTokenSource? exportCancellation;
+    volatile bool bridgeClosingRequested;
+
+    void CancelActiveExport()
+    {
+        try { Volatile.Read(ref exportCancellation)?.Cancel(); }
+        catch (ObjectDisposedException) { }
+    }
     readonly ListBox processes = new() { Dock = DockStyle.Fill, IntegralHeight = false, BackColor = Color.FromArgb(25, 29, 35), ForeColor = Color.FromArgb(176, 184, 196), BorderStyle = BorderStyle.FixedSingle };
     readonly Label notice = new() { AutoSize = false, Dock = DockStyle.Top, Height = 54, Padding = new Padding(10), TextAlign = ContentAlignment.MiddleLeft };
     readonly Label state = new() { Text = "等待手动注入", AutoSize = false, Height = 32, Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft };
@@ -98,6 +180,7 @@ internal sealed class RecorderForm : Form
     readonly Label replay = new() { Text = "录制尚未开始", AutoSize = false, Dock = DockStyle.Fill, AutoEllipsis = true };
     readonly TextBox output = new() { Dock = DockStyle.Fill };
     readonly TextBox flashbackDirectory = new() { Dock = DockStyle.Fill, PlaceholderText = "完整版 Flashback 所在的游戏目录" };
+    string skinCacheDirectory = RecordedSkins.ResolveCacheDirectory(null);
     readonly NumericUpDown readRate = new() { Minimum = 20, Maximum = 120, Value = 20, Increment = 10, Dock = DockStyle.Fill };
     readonly ToolTip hints = new();
     readonly TextBox marker = new() { Dock = DockStyle.Fill, PlaceholderText = "时间线标记，例如：进入矿洞" };
@@ -116,7 +199,10 @@ internal sealed class RecorderForm : Form
     readonly System.Windows.Forms.Timer processTimer = new() { Interval = 4000 };
     readonly System.Windows.Forms.Timer statusTimer = new() { Interval = 900 };
     readonly string settingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FlashbackRecorder", "settings.json");
-    readonly string javaPath;
+    string javaPath = "";
+    bool javaSearching = true;
+    readonly Label javaState = new() { Text = "正在检测 64 位 Java…", TextAlign = ContentAlignment.MiddleRight,
+        Dock = DockStyle.Fill, ForeColor = Color.FromArgb(150, 164, 183) };
     readonly CancellationTokenSource lifetime = new();
     readonly HashSet<string> attemptedExports = new(StringComparer.OrdinalIgnoreCase);
     readonly bool diagnosticsOnly;
@@ -132,8 +218,10 @@ internal sealed class RecorderForm : Form
     GameProcess? selected;
     string? stateDir;
     string? attachedProcessKey;
+    string? attachedGameVersion;
     string? replayPath;
     string? exportedReplayPath;
+    string? importedReplayPath;
     bool busy;
     bool warnedOldAgent;
     string? failedExport;
@@ -142,8 +230,12 @@ internal sealed class RecorderForm : Form
     readonly List<(long Sequence, string Time, string Text)> bridgeLogs = new();
     long bridgeLogSequence;
     long bridgeLastLogSent;
-    long bridgeErrorSequence;
+    // Only failures of the command currently being executed participate in
+    // BridgeOperationAsync. Capture-quality warnings stay visible in logs
+    // without making a later stop command fail.
+    long bridgeCommandErrorSequence;
     string bridgeLastError = "";
+    CaptureQualityReport? lastCaptureQuality;
     bool bridgeExitRequested;
     bool bridgeShutdownPrepared;
     bool bridgeShuttingDown;
@@ -168,7 +260,6 @@ internal sealed class RecorderForm : Form
         StartPosition = FormStartPosition.CenterScreen;
         BackColor = Color.FromArgb(22, 25, 31); ForeColor = Color.FromArgb(177, 184, 194);
         Font = new Font("Microsoft YaHei UI", 9f);
-        javaPath = FindJava();
         BuildUi(); LoadSettings(); ApplyControls(); ApplyThemePalette();
         processTimer.Tick += async (_, _) => await DetectProcessesAsync();
         statusTimer.Tick += async (_, _) => await ReadStatusAsync();
@@ -182,26 +273,56 @@ internal sealed class RecorderForm : Form
                 WindowState = FormWindowState.Minimized;
                 Hide();
             }
+            if (bridgeStdio) _ = Task.Run(BridgeStdioLoopAsync);
             if (diagnosticsOnly)
             {
+                javaSearching = false;
                 Log("诊断模式：仅检测进程和检查界面，不附加游戏、不发送录制命令。");
                 processTimer.Start();
                 await DetectProcessesAsync();
-                if (bridgeStdio) _ = Task.Run(BridgeStdioLoopAsync);
                 return;
             }
-            try { await Task.Run(RuntimeAssets.Ensure, lifetime.Token); assetsReady = true; }
-            catch (Exception ex) { ReportError("运行时组件提取失败", ex); }
+            try
+            {
+                // JDK discovery may probe launcher runtimes or unavailable
+                // paths on a migrated PC. Keep construction and the UI responsive.
+                javaPath = await Task.Run(() => FindJava(lifetime.Token), lifetime.Token);
+                await Task.Run(RuntimeAssets.Ensure, lifetime.Token); assetsReady = true;
+            }
+            catch (OperationCanceledException) when (closing) { return; }
+            catch (Exception ex) { ReportError("初始化录制环境失败", ex); }
+            finally
+            {
+                javaSearching = false;
+                if (!closing) javaState.Text = javaPath.Length > 0 ? "手动注入 · Java 已就绪" : "未找到 64 位 Java 17+ JDK";
+            }
             if (closing) return;
             processTimer.Start(); statusTimer.Start();
             await DetectProcessesAsync();
-            if (bridgeStdio) _ = Task.Run(BridgeStdioLoopAsync);
         };
-        FormClosing += (_, e) =>
+        FormClosing += async (_, e) =>
         {
-            if (exporting || busy) { e.Cancel = true; Log("正在执行操作，请完成后再关闭。导出在后台进行，界面仍可操作。"); return; }
+            if (closing) return;
+            if (exporting)
+            {
+                e.Cancel = true;
+                closing = true; processTimer.Stop(); statusTimer.Stop(); lifetime.Cancel();
+                try { if (activeExportWork != null) await activeExportWork; }
+                catch (OperationCanceledException) { }
+                catch (Exception error) { Diagnostics.Write("关闭时结束导出任务。", error); }
+                Diagnostics.Write("已取消导出并关闭录制器窗口。");
+                if (!IsDisposed) BeginInvoke((Action)Close);
+                return;
+            }
+            if (busy) { e.Cancel = true; Log("正在执行操作，请完成后再关闭。"); return; }
             closing = true; processTimer.Stop(); statusTimer.Stop(); lifetime.Cancel();
             Diagnostics.Write("正常关闭录制器窗口。");
+        };
+        FormClosed += (_, _) =>
+        {
+            try { RecordedSkins.CleanupSessionCache(); }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            { Diagnostics.Write("临时皮肤缓存清理未完成。", error); }
         };
     }
 
@@ -236,6 +357,18 @@ internal sealed class RecorderForm : Form
             WriteBridgeResponse(response);
         }
 
+        // Read control input while a serialized command is awaiting a worker.
+        // Closing ZJ HUB can then cancel a long export before its response arrives.
+        var commands = Channel.CreateUnbounded<string>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
+        using var bridgeInput = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+        var processing = Task.Run(async () =>
+        {
+            await foreach (var line in commands.Reader.ReadAllAsync())
+            {
+                await ProcessBridgeLineAsync(line);
+                if (bridgeExitRequested) { bridgeInput.Cancel(); break; }
+            }
+        });
         try
         {
             // Console.ReadLineAsync is unreliable with Windows anonymous
@@ -248,7 +381,7 @@ internal sealed class RecorderForm : Form
             var pending = new StringBuilder();
             while (!bridgeExitRequested)
             {
-                var count = await input.ReadAsync(buffer, 0, buffer.Length, lifetime.Token);
+                var count = await input.ReadAsync(buffer, 0, buffer.Length, bridgeInput.Token).WaitAsync(bridgeInput.Token);
                 if (count <= 0) break;
                 // Preserve incomplete multi-byte sequences between pipe reads;
                 // markers and paths may contain Chinese text and a 4 KiB read
@@ -267,13 +400,32 @@ internal sealed class RecorderForm : Form
                     var newline = text.IndexOf('\n');
                     if (newline < 0) break;
                     pending.Remove(0, newline + 1);
-                    await ProcessBridgeLineAsync(text[..newline].TrimEnd('\r'));
+                    var line = text[..newline].TrimEnd('\r');
+                    try
+                    {
+                        using var control = JsonDocument.Parse(line);
+                        if (control.RootElement.ValueKind == JsonValueKind.Object
+                            && control.RootElement.TryGetProperty("command", out var command)
+                            && command.ValueKind == JsonValueKind.String && command.GetString() == "cancel_export")
+                        {
+                            bridgeClosingRequested = true;
+                            CancelActiveExport();
+                            continue; // one-way close signal, no command response to reorder
+                        }
+                    }
+                    catch (JsonException) { /* normal command validation reports malformed input */ }
+                    commands.Writer.TryWrite(line);
                 }
             }
         }
+        catch (OperationCanceledException) when (bridgeInput.IsCancellationRequested) { }
         catch (Exception error) { WriteBridgeResponse(BridgeError("标准输入桥接失败：" + error.Message)); }
         finally
         {
+            CancelActiveExport();
+            commands.Writer.TryComplete();
+            try { await processing; }
+            catch (Exception error) { Diagnostics.Write("桥接命令处理结束。", error); }
             try
             {
                 await InvokeOnUiAsync(async () =>
@@ -342,20 +494,38 @@ internal sealed class RecorderForm : Form
         {
             ["ok"] = error is null, ["error"] = error, ["command"] = command, ["message"] = message,
             ["stateText"] = state.Text, ["notice"] = notice.Text, ["javaPath"] = javaPath,
+            ["javaSearching"] = javaSearching,
             ["recording"] = latestStatus.GetValueOrDefault("recording") == "true",
             ["status"] = new Dictionary<string, string>(latestStatus),
-            ["agent"] = new { requiredVersion = RuntimeAssets.RequiredAgentVersion,
-                version = latestStatus.GetValueOrDefault("agentVersion"), outdated = warnedOldAgent },
+            ["agent"] = new { requiredVersion = RuntimeAssets.RequiredAgentVersionFor(attachedGameVersion ?? selected?.Version),
+                version = latestStatus.GetValueOrDefault("agentVersion"), outdated = warnedOldAgent,
+                reloadAvailable = CanReloadSelectedAgent() },
             ["settings"] = new { output = output.Text, flashbackDirectory = flashbackDirectory.Text,
-                readRate = (int)readRate.Value, autoZip = autoZip.Checked },
+                skinCacheDirectory, readRate = (int)readRate.Value, autoZip = autoZip.Checked },
             ["controls"] = new { inject = inject.Enabled, start = start.Enabled, stop = stop.Enabled,
                 mark = mark.Enabled, refresh = refresh.Enabled, export = export.Enabled,
-                importReplay = importReplay.Enabled, output = browse.Enabled && stateDir is null,
+                importReplay = importReplay.Enabled, output = browse.Enabled && output.Enabled,
                 target = browseFlashback.Enabled, rate = readRate.Enabled, autoZip = autoZip.Enabled },
             ["selected"] = selected is null ? null : ProcessRow(selected),
             ["processes"] = processes.Items.OfType<GameProcess>().Select(ProcessRow).ToArray(),
             ["sessionDir"] = stateDir, ["replay"] = replayPath,
             ["exportedReplay"] = exportedReplayPath,
+            ["importedReplay"] = importedReplayPath,
+            ["captureQuality"] = lastCaptureQuality is null ? null : new
+            {
+                available = lastCaptureQuality.Available,
+                status = lastCaptureQuality.Status,
+                complete = lastCaptureQuality.IsComplete,
+                hasDataLoss = lastCaptureQuality.HasDataLoss,
+                hasCompatibilityLimitations = lastCaptureQuality.HasCompatibilityLimitations,
+                packetErrors = lastCaptureQuality.PacketErrors,
+                packetDrops = lastCaptureQuality.PacketDrops,
+                packetSkippedCustomPayload = lastCaptureQuality.PacketSkippedCustomPayload,
+                attributeEntriesSkipped = lastCaptureQuality.AttributeEntriesSkipped,
+                incompleteWorldTransitions = lastCaptureQuality.IncompleteWorldTransitions,
+                skippedUnsampledWorldTransitions = lastCaptureQuality.SkippedUnsampledWorldTransitions,
+                summary = lastCaptureQuality.Summary,
+            },
             ["assetsReady"] = assetsReady, ["busy"] = busy || exporting || scanning || polling,
             ["logs"] = rows, ["logSequence"] = bridgeLogSequence,
             ["shutdown"] = bridgeShutdownPrepared,
@@ -407,9 +577,9 @@ internal sealed class RecorderForm : Form
 
     async Task BridgeOperationAsync(Func<Task> action)
     {
-        var errorsBefore = bridgeErrorSequence;
+        var errorsBefore = bridgeCommandErrorSequence;
         await action();
-        if (bridgeErrorSequence != errorsBefore)
+        if (bridgeCommandErrorSequence != errorsBefore)
             throw new IOException(bridgeLastError);
     }
 
@@ -425,7 +595,7 @@ internal sealed class RecorderForm : Form
                 return BridgeSnapshot(command);
             case "refresh":
                 RequireBridgeControl(refresh.Enabled, "正在执行其他操作，请稍后刷新。");
-                await BridgeOperationAsync(DetectProcessesAsync);
+                await BridgeOperationAsync(() => DetectProcessesAsync(refreshJava: true));
                 return BridgeSnapshot(command);
             case "select":
             {
@@ -448,14 +618,15 @@ internal sealed class RecorderForm : Form
                 RequireBridgeControl(inject.Enabled,
                     stateDir is not null ? "已有活动会话，请直接录制。" :
                     !assetsReady ? "录制组件未准备好。" : "当前进程不可注入，或正在执行其他操作。");
-                if (javaPath.Length == 0) throw new InvalidOperationException("未找到 Java 17/21。");
+                if (javaPath.Length == 0) throw new InvalidOperationException("未找到可用 Java 17+ JDK（需要 jdk.attach 模块）。");
                 await BridgeOperationAsync(() => InstallAsync(process));
                 if (stateDir is null) throw new IOException("注入未建立会话，请刷新游戏进程后重试。");
                 return BridgeSnapshot(command, "Attach 请求已完成，正在等录制组件就绪。");
             }
             case "start":
             {
-                RequireBridgeControl(start.Enabled, warnedOldAgent ? "游戏内为旧录制组件，请重启游戏后重新注入。" :
+                RequireBridgeControl(start.Enabled, warnedOldAgent ? (CanReloadSelectedAgent()
+                    ? "游戏内为旧录制组件，请点击注入更新组件后开始录制。" : "游戏内为旧录制组件，请停止录制后更新组件；不支持重载的版本需重启游戏。") :
                     "当前未就绪或正在录制，不能开始。");
                 var rate = BridgeRate(request);
                 if (rate.HasValue) { readRate.Value = rate.Value; SaveSettings(); }
@@ -469,7 +640,7 @@ internal sealed class RecorderForm : Form
             case "mark":
             {
                 RequireBridgeControl(mark.Enabled, "仅录制中可以添加时间标记。");
-                var text = BridgeString(request, "text") ?? BridgeString(request, "name");
+                var text = SanitizeMarkerText(BridgeString(request, "text") ?? BridgeString(request, "name"));
                 if (string.IsNullOrWhiteSpace(text)) throw new InvalidDataException("mark 命令缺少 text。");
                 if (text.Length > 2048) throw new InvalidDataException("时间标记最多 2048 字。");
                 await BridgeOperationAsync(() => CommandAsync("mark:" + text));
@@ -490,8 +661,13 @@ internal sealed class RecorderForm : Form
                     && !source.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
                     throw new InvalidDataException("只支持 .fbrl 或 Flashback .zip 文件。");
                 await BridgeOperationAsync(() => ExportAsync(source, false));
+                if (bridgeClosingRequested) return BridgeSnapshot(command, "导出已取消，原始录制已保留。");
                 if (failedExport == source) throw new IOException("导出失败，请查看日志。");
-                return BridgeSnapshot(command, "导出完成。");
+                var exportMessage = lastCaptureQuality?.HasDataLoss == true ? "已导出，但采集不完整。"
+                    : lastCaptureQuality is { Available: false } ? "已导出，但采集完整性未知。"
+                    : lastCaptureQuality?.HasCompatibilityLimitations == true ? "已导出（有跨版本兼容限制）。"
+                    : "导出完成。";
+                return BridgeSnapshot(command, exportMessage);
             }
             case "import":
             {
@@ -500,14 +676,16 @@ internal sealed class RecorderForm : Form
                 var target = BridgeString(request, "target") ?? flashbackDirectory.Text.Trim();
                 if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
                     throw new InvalidDataException("请选择存在的回放 ZIP 文件。");
+                if (!IsFlashbackGameDirectory(target)) target = FindFlashbackGameDirectory(target) ?? "";
                 if (string.IsNullOrWhiteSpace(target)) throw new InvalidDataException("请先选择回放游戏目录。");
                 busy = true; ApplyControls();
                 try
                 {
-                    var result = await Task.Run(() => ImportWithSkins(path, target), lifetime.Token);
-                    Log($"已导入：{result.Path}；保存皮肤 {result.Skins.PlayerCount} 人，保留已有皮肤设置 {result.Skins.PreservedOverrides} 人。");
+                    var result = await Task.Run(() => ImportWithSkins(path, target, skinCacheDirectory), lifetime.Token);
+                    Log($"已导入：{result.Path}；保存皮肤 {result.Skins.PlayerCount} 人，缓存目录：{skinCacheDirectory}，保留已有皮肤设置 {result.Skins.PreservedOverrides} 人。");
                     foreach (var warning in result.Skins.Warnings) Log("皮肤提示：" + warning);
                     flashbackDirectory.Text = target;
+                    importedReplayPath = result.Path;
                     await BridgeOperationAsync(() => { SaveSettings(); return Task.CompletedTask; });
                 }
                 finally { busy = false; ApplyControls(); }
@@ -530,6 +708,7 @@ internal sealed class RecorderForm : Form
         var newOutput = BridgeString(request, "output");
         var targetProvided = request.TryGetProperty("target", out _) || request.TryGetProperty("flashbackDirectory", out _);
         var newTarget = BridgeString(request, "target") ?? BridgeString(request, "flashbackDirectory");
+        var newSkinCache = BridgeString(request, "skinCache") ?? BridgeString(request, "skinCacheDirectory");
         var rate = BridgeRate(request);
         bool? newAutoZip = null;
         if (request.TryGetProperty("autoZip", out var autoValue))
@@ -540,10 +719,21 @@ internal sealed class RecorderForm : Form
         }
         if (request.TryGetProperty("output", out _) && string.IsNullOrWhiteSpace(newOutput))
             throw new InvalidDataException("保存目录不能为空。");
+        if (request.TryGetProperty("skinCache", out _) || request.TryGetProperty("skinCacheDirectory", out _))
+        {
+            if (string.IsNullOrWhiteSpace(newSkinCache)) throw new InvalidDataException("皮肤缓存目录不能为空。");
+            newSkinCache = Path.GetFullPath(newSkinCache);
+            Directory.CreateDirectory(newSkinCache);
+        }
         if (newOutput is not null)
         {
             newOutput = Path.GetFullPath(newOutput);
-            if (stateDir is not null && !string.Equals(newOutput, Path.GetFullPath(output.Text), StringComparison.OrdinalIgnoreCase))
+            // A recovered/injected session can remain attached after a recording
+            // has stopped.  It is safe to choose the destination for the next
+            // session in that state; only an active capture (or the initial
+            // world snapshot) must keep its original state directory.
+            if (stateDir is not null && recording
+                && !string.Equals(newOutput, Path.GetFullPath(output.Text), StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("活动会话期间不能修改保存目录；请先结束会话后重启录制服务。");
             if (!Directory.Exists(newOutput)) Directory.CreateDirectory(newOutput);
         }
@@ -558,14 +748,18 @@ internal sealed class RecorderForm : Form
                 .Any(path => Path.GetFileName(path).Contains("flashback", StringComparison.OrdinalIgnoreCase)))
                 throw new InvalidDataException("回放游戏目录须包含 Flashback 模组。");
         }
-        var errorsBefore = bridgeErrorSequence;
+        var errorsBefore = bridgeCommandErrorSequence;
         if (newOutput is not null) output.Text = newOutput;
         if (newTarget is not null) flashbackDirectory.Text = newTarget;
+        if (newSkinCache is not null) skinCacheDirectory = RecordedSkins.ResolveCacheDirectory(newSkinCache);
         if (rate.HasValue) readRate.Value = rate.Value;
         if (newAutoZip.HasValue) autoZip.Checked = newAutoZip.Value;
         SaveSettings();
-        if (bridgeErrorSequence != errorsBefore) throw new IOException(bridgeLastError);
-        return BridgeSnapshot("config", "录制设置已保存。");
+        if (bridgeCommandErrorSequence != errorsBefore) throw new IOException(bridgeLastError);
+        var message = stateDir is not null && newOutput is not null && !recording
+            ? "录制设置已保存；当前会话仍使用原目录，请重启 Minecraft 并重新注入后新目录生效。"
+            : "录制设置已保存。";
+        return BridgeSnapshot("config", message);
     }
 
     async Task PrepareBridgeShutdownAsync()
@@ -695,7 +889,7 @@ internal sealed class RecorderForm : Form
         var header = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Padding = new Padding(20, 10, 20, 8) };
         header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 75)); header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
         var title = new Label { Text = "Flashback Recorder", Font = new Font("Segoe UI", 16, FontStyle.Regular), Dock = DockStyle.Fill, ForeColor = Color.FromArgb(184, 191, 202), TextAlign = ContentAlignment.MiddleLeft };
-        var java = new Label { Text = javaPath.Length > 0 ? "手动注入 · Java 已就绪" : "未找到 Java 17+", TextAlign = ContentAlignment.MiddleRight, Dock = DockStyle.Fill, ForeColor = Color.FromArgb(150, 164, 183) };
+        var java = javaState;
         header.Controls.Add(title, 0, 0); header.Controls.Add(java, 1, 0);
         notice.Text = "正在检测游戏…"; notice.BackColor = Color.FromArgb(31, 38, 49); notice.ForeColor = Color.FromArgb(175, 188, 206); notice.Margin = new Padding(20, 4, 20, 10); notice.Dock = DockStyle.Fill;
         var split = new SplitContainer { Dock = DockStyle.Fill, Padding = new Padding(24, 0, 24, 18), BackColor = BackColor, FixedPanel = FixedPanel.None };
@@ -722,11 +916,11 @@ internal sealed class RecorderForm : Form
         root.Controls.Add(header, 0, 0); root.Controls.Add(notice, 0, 1); root.Controls.Add(split, 0, 2);
         Controls.Add(root);
         processes.SelectedIndexChanged += (_, _) => { selected = processes.SelectedItem as GameProcess; ApplyControls(); };
-        refresh.Click += async (_, _) => await DetectProcessesAsync();
+        refresh.Click += async (_, _) => await DetectProcessesAsync(refreshJava: true);
         inject.Click += async (_, _) => await InstallAsync();
         start.Click += async (_, _) => await CommandAsync("start");
         stop.Click += async (_, _) => await CommandAsync("stop");
-        mark.Click += async (_, _) => { if (!string.IsNullOrWhiteSpace(marker.Text)) { await CommandAsync("mark:" + marker.Text.Trim()); marker.Clear(); } };
+        mark.Click += async (_, _) => { var cleanMark = SanitizeMarkerText(marker.Text); if (!string.IsNullOrWhiteSpace(cleanMark)) { await CommandAsync("mark:" + cleanMark); marker.Clear(); } };
         export.Click += async (_, _) => { if (!string.IsNullOrEmpty(replayPath)) await ExportAsync(replayPath, false); };
         browse.Click += (_, _) => { try { using var dialog = new FolderBrowserDialog { SelectedPath = output.Text }; if (dialog.ShowDialog(this) == DialogResult.OK) { output.Text = dialog.SelectedPath; SaveSettings(); } } catch (Exception ex) { ReportError("保存目录设置失败", ex); } };
         browseFlashback.Click += (_, _) => { try { using var dialog = new FolderBrowserDialog { SelectedPath = flashbackDirectory.Text, Description = "选择装有完整版 Flashback 的游戏目录（内含 mods 文件夹）" }; if (dialog.ShowDialog(this) == DialogResult.OK) { flashbackDirectory.Text = dialog.SelectedPath; SaveSettings(); } } catch (Exception ex) { ReportError("回放目录设置失败", ex); } };
@@ -783,24 +977,219 @@ internal sealed class RecorderForm : Form
         var status = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 5, Padding = new Padding(10) }; status.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 72)); status.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); status.Controls.Add(new Label { Text = "状态", Dock = DockStyle.Fill }, 0, 0); status.Controls.Add(state, 1, 0); status.Controls.Add(new Label { Text = "PID", Dock = DockStyle.Fill }, 0, 1); status.Controls.Add(pidLabel, 1, 1); status.Controls.Add(new Label { Text = "样本", Dock = DockStyle.Fill }, 0, 2); status.Controls.Add(samples, 1, 2); status.Controls.Add(new Label { Text = "数据包", Dock = DockStyle.Fill }, 0, 3); status.Controls.Add(packets, 1, 3); status.Controls.Add(new Label { Text = "录制文件", Dock = DockStyle.Fill }, 0, 4); status.Controls.Add(replay, 1, 4); panel.Controls.Add(Group("当前会话", status, null, null), 0, 0); panel.Controls.Add(Group("运行日志", log, null, null), 0, 1); return panel;
     }
 
-    static string FindJava()
+    static string FindJava(CancellationToken cancellation)
     {
-        var candidates = new List<string>(); var javaHome = Environment.GetEnvironmentVariable("JAVA_HOME"); if (!string.IsNullOrWhiteSpace(javaHome)) candidates.Add(Path.Combine(javaHome, "bin", "java.exe")); candidates.AddRange(new[] { @"C:\Program Files\Java\jdk-21.0.10\bin\java.exe", @"C:\Program Files\Java\jdk-21\bin\java.exe", @"C:\Program Files\Java\jdk-17\bin\java.exe" });
-        foreach (var c in candidates) if (File.Exists(c)) return c;
-        foreach (var directory in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator))
+        var candidates = new List<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        void AddCandidate(string? value)
         {
-            try { var candidate = Path.Combine(directory.Trim('"'), "java.exe"); if (File.Exists(candidate)) return candidate; }
+            if (string.IsNullOrWhiteSpace(value)) return;
+            try
+            {
+                var path = Environment.ExpandEnvironmentVariables(value.Trim().Trim('"'));
+                if (Directory.Exists(path)) path = Path.Combine(path, "bin", "java.exe");
+                if (Path.GetFileName(path).Equals("javaw.exe", StringComparison.OrdinalIgnoreCase))
+                    path = Path.Combine(Path.GetDirectoryName(path) ?? "", "java.exe");
+                path = Path.GetFullPath(path);
+                if (File.Exists(path) && seen.Add(path)) candidates.Add(path);
+            }
+            catch (ArgumentException) { }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+
+        void AddHome(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return;
+            try
+            {
+                var home = Environment.ExpandEnvironmentVariables(value.Trim().Trim('"'));
+                if (Directory.Exists(home) && Path.GetFileName(home).Equals("bin", StringComparison.OrdinalIgnoreCase))
+                    AddCandidate(Path.Combine(home, "java.exe"));
+                else
+                    AddCandidate(home);
+                AddCandidate(Path.Combine(home, "bin", "java.exe"));
+            }
             catch (ArgumentException) { }
         }
+
+        foreach (var variable in new[] { "JAVA_HOME", "JDK_HOME", "JRE_HOME" })
+            AddHome(Environment.GetEnvironmentVariable(variable));
+
+        foreach (var home in RegistryJavaHomes()) AddHome(home);
+
+        // Fixed directory names are not enough: most installers append the
+        // patch/build number (jdk-17.0.12, jdk-21.0.5, ...).
+        var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        var programFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var roamingAppData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var roots = new[]
+        {
+            Path.Combine(programFiles, "Java"),
+            Path.Combine(programFilesX86, "Java"),
+            Path.Combine(programFiles, "Eclipse Adoptium"),
+            Path.Combine(programFiles, "AdoptOpenJDK"),
+            Path.Combine(programFiles, "Microsoft"),
+            Path.Combine(programFiles, "Amazon Corretto"),
+            Path.Combine(programFiles, "Azul Systems"),
+            Path.Combine(programFiles, "Zulu"),
+            Path.Combine(programFiles, "BellSoft"),
+            Path.Combine(localAppData, "Programs", "Eclipse Adoptium"),
+            Path.Combine(localAppData, "Programs", "Microsoft"),
+            Path.Combine(userProfile, ".jdks"),
+            Path.Combine(roamingAppData, ".minecraft", "runtime"),
+            Path.Combine(localAppData, ".minecraft", "runtime"),
+        };
+        foreach (var root in roots)
+        {
+            cancellation.ThrowIfCancellationRequested();
+            AddHome(root);
+            foreach (var directory in EnumerateDirectoriesBounded(root, root.EndsWith("runtime", StringComparison.OrdinalIgnoreCase) ? 4 : 2))
+                AddHome(directory);
+        }
+
+        // A launcher may have started Minecraft with a private JDK that is
+        // not on PATH. MainModule.FileName gives us that exact javaw/java.exe.
+        foreach (var processName in new[] { "java", "javaw" })
+        {
+            foreach (var process in Process.GetProcessesByName(processName))
+            {
+                try { AddCandidate(process.MainModule?.FileName); }
+                catch (InvalidOperationException) { }
+                catch (System.ComponentModel.Win32Exception) { }
+                finally { process.Dispose(); }
+            }
+        }
+
+        foreach (var directory in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator))
+            AddCandidate(Path.Combine(directory.Trim().Trim('"'), "java.exe"));
+
+        // `where` also resolves App Execution Aliases and PATH entries that
+        // contain unusual quoting which the simple split above cannot handle.
+        try
+        {
+            var info = new ProcessStartInfo(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "where.exe"));
+            info.ArgumentList.Add("java.exe");
+            var where = ChildProcess.RunAsync(info, TimeSpan.FromSeconds(2), cancellation).GetAwaiter().GetResult();
+            if (where.ExitCode == 0)
+                foreach (var line in where.Output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)) AddCandidate(line);
+        }
+        catch (Exception error) when (error is InvalidOperationException or System.ComponentModel.Win32Exception or IOException or TimeoutException)
+        {
+            Diagnostics.Write("调用 where.exe 查找 Java 失败", error);
+        }
+
+        foreach (var candidate in candidates)
+        {
+            cancellation.ThrowIfCancellationRequested();
+            if (JavaRuntimeProbe.IsUsableAsync(candidate, cancellation).GetAwaiter().GetResult())
+            {
+                Diagnostics.Write($"已找到可用 Java 17+ JDK：{candidate}");
+                return candidate;
+            }
+        }
+
+        Diagnostics.Write($"未找到可用 Java 17+ JDK；已检查 {candidates.Count} 个候选路径，需要 jdk.attach 模块。请设置 JAVA_HOME 或把 JDK 的 bin 加入 PATH。 ");
         return "";
     }
-    async Task DetectProcessesAsync()
+
+    static List<string> RegistryJavaHomes()
+    {
+        var homes = new List<string>();
+        var paths = new[]
+        {
+            @"SOFTWARE\JavaSoft\JDK",
+            @"SOFTWARE\JavaSoft\Java Development Kit",
+            @"SOFTWARE\JavaSoft\Java Runtime Environment",
+            @"SOFTWARE\Eclipse Adoptium\JDK",
+            @"SOFTWARE\AdoptOpenJDK",
+            @"SOFTWARE\Microsoft\JDK",
+            @"SOFTWARE\Azul Systems\Zulu",
+            @"SOFTWARE\Amazon Corretto",
+            @"SOFTWARE\BellSoft\LibericaJDK",
+        };
+        foreach (var view in new[] { RegistryView.Registry64, RegistryView.Registry32 })
+        {
+            foreach (var hive in new[] { RegistryHive.CurrentUser, RegistryHive.LocalMachine })
+            {
+                try
+                {
+                    using var baseKey = RegistryKey.OpenBaseKey(hive, view);
+                    foreach (var path in paths)
+                    {
+                        using var root = baseKey.OpenSubKey(path);
+                        if (root is null) continue;
+                        AddRegistryValue(root.GetValue("JavaHome") as string, homes);
+                        foreach (var childName in root.GetSubKeyNames())
+                        {
+                            try
+                            {
+                                using var child = root.OpenSubKey(childName);
+                                AddRegistryValue(child?.GetValue("JavaHome") as string, homes);
+                                AddRegistryValue(child?.GetValue("Path") as string, homes);
+                            }
+                            catch (System.Security.SecurityException) { }
+                            catch (IOException) { }
+                        }
+                    }
+                }
+                catch (System.Security.SecurityException) { }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+        }
+        return homes;
+
+        static void AddRegistryValue(string? value, List<string> target)
+        {
+            if (!string.IsNullOrWhiteSpace(value) && !target.Contains(value, StringComparer.OrdinalIgnoreCase))
+                target.Add(value);
+        }
+    }
+
+    static IEnumerable<string> EnumerateDirectoriesBounded(string root, int maxDepth)
+    {
+        if (string.IsNullOrWhiteSpace(root) || maxDepth < 1 || !Directory.Exists(root)) yield break;
+        var pending = new Queue<(string Path, int Depth)>();
+        pending.Enqueue((root, 0));
+        while (pending.Count > 0)
+        {
+            var (directory, depth) = pending.Dequeue();
+            string[] children;
+            try { children = Directory.GetDirectories(directory); }
+            catch (UnauthorizedAccessException) { continue; }
+            catch (IOException) { continue; }
+            foreach (var child in children)
+            {
+                bool isReparsePoint;
+                try { isReparsePoint = (File.GetAttributes(child) & FileAttributes.ReparsePoint) != 0; }
+                catch (UnauthorizedAccessException) { continue; }
+                catch (IOException) { continue; }
+                if (isReparsePoint) continue;
+                yield return child;
+                if (depth + 1 < maxDepth) pending.Enqueue((child, depth + 1));
+            }
+        }
+    }
+
+    async Task DetectProcessesAsync(bool refreshJava = false)
     {
         if (closing || scanning) return;
         scanning = true;
         ApplyControls();
         try
         {
+            if (refreshJava && javaPath.Length == 0 && !javaSearching && !diagnosticsOnly)
+            {
+                javaSearching = true;
+                try { javaPath = await Task.Run(() => FindJava(lifetime.Token), lifetime.Token); }
+                finally { javaSearching = false; }
+                if (closing) return;
+                javaState.Text = javaPath.Length > 0 ? "手动注入 · Java 已就绪" : "未找到 64 位 Java 17+ JDK";
+            }
             var found = await GameDiscovery.FindAsync(lifetime.Token);
             if (closing) return;
             var currentIdentity = selected?.Identity;
@@ -820,10 +1209,10 @@ internal sealed class RecorderForm : Form
             var supportedNetease = found.Where(p => p.Supported && p.IsNetease).ToList();
             notice.Text = diagnosticsOnly
                 ? $"诊断模式 · 检测到 {found.Count} 个游戏进程；不会注入或录制。"
-                : found.Count == 0 ? "未检测到游戏进程。启动网易 1.20.1 后会重新检测。"
-                : supportedNetease.Count == 1 ? $"检测到网易 1.20.1 PID {supportedNetease[0].Pid}；回放客户端 1.21.11 不会被注入。"
-                : supportedNetease.Count > 1 ? "检测到多个网易 1.20.1 进程，请选定目标后点击注入。"
-                : "未检测到受支持的网易 1.20.1 进程。其他版本仅显示，不会自动注入。";
+                : found.Count == 0 ? "未检测到游戏进程。启动 Minecraft 1.20.1 或 1.21.10 后会重新检测。"
+                : supportedNetease.Count == 1 ? $"检测到网易 {supportedNetease[0].Version} PID {supportedNetease[0].Pid}；回放客户端 1.21.11 不会被注入。"
+                : supportedNetease.Count > 1 ? "检测到多个受支持的网易进程，请选定目标后点击注入。"
+                : "支持录制 Minecraft 1.20.1 和 1.21.10，请选定目标后手动注入。";
             // Selection changes do not invalidate the attached JVM identity.
             if (!busy && !exporting && attachedProcessKey is not null &&
                 !found.Any(p => p.Identity == attachedProcessKey) &&
@@ -871,6 +1260,7 @@ internal sealed class RecorderForm : Form
             if (closing || busy || exporting || matching.Count != 1 || stateDir is not null) return false;
             stateDir = matching[0];
             attachedProcessKey = process.Identity;
+            attachedGameVersion = process.Version;
             warnedOldAgent = false;
             pidLabel.Text = process.Pid.ToString();
             Log("已复用身份匹配的活动录制会话：" + stateDir);
@@ -885,15 +1275,16 @@ internal sealed class RecorderForm : Form
     {
         var target = targetOverride ?? selected;
         if (diagnosticsOnly || closing || busy || exporting || scanning || target is null) return;
-        if (!target.Supported) { Log("只支持附加 Minecraft 1.20.1，选中的版本不能注入。"); return; }
-        if (stateDir is not null) { Log("当前已有活动会话，请直接开始或停止录制。"); return; }
+        if (!target.Supported) { Log("支持附加 Minecraft 1.20.1 或 1.21.10，选中的版本不能注入。"); return; }
+        var reloading = stateDir is not null && CanReloadSelectedAgent() && target.Identity == attachedProcessKey;
+        if (stateDir is not null && !reloading) { Log("当前已有活动会话，请直接开始或停止录制。"); return; }
         if (!assetsReady || javaPath.Length == 0) { Log("运行时组件或 Java 尚未准备好，暂时不能注入。"); return; }
         busy = true;
         ApplyControls();
         try
         {
             var live = await GameDiscovery.FindAsync(lifetime.Token);
-            if (closing || stateDir is not null) return;
+            if (closing || (stateDir is not null && !reloading)) return;
             if (!live.Any(p => p.Identity == target.Identity && p.Supported))
                 throw new InvalidOperationException("目标游戏已退出或重启，请重新选择进程。");
             var root = output.Text.Trim();
@@ -904,11 +1295,13 @@ internal sealed class RecorderForm : Form
                 Directory.CreateDirectory(directory);
                 File.WriteAllText(Path.Combine(directory, "process.identity"), target.Identity);
             }, lifetime.Token);
-            Log($"正在附加到 Minecraft 1.20.1 PID {target.Pid}…");
-            var result = await RunJavaAsync("install", target.Pid.ToString(), RuntimeAssets.Agent, directory);
+            Log(reloading ? $"正在更新 Minecraft {target.Version} PID {target.Pid} 的录制组件，已有录制文件保留…"
+                : $"正在附加到 Minecraft {target.Version} PID {target.Pid}…");
+            var result = await RunJavaAsync("install", target.Pid.ToString(), RuntimeAssets.AgentForVersion(target.Version), directory);
             if (!result.Ok) throw new IOException(result.Text);
             stateDir = directory;
             attachedProcessKey = target.Identity;
+            attachedGameVersion = target.Version;
             replayPath = null;
             exportedReplayPath = null;
             latestStatus.Clear();
@@ -930,8 +1323,10 @@ internal sealed class RecorderForm : Form
         Log("原会话的游戏进程已退出；新进程将重新检测，已有录制文件保留。");
         stateDir = null;
         attachedProcessKey = null;
+        attachedGameVersion = null;
         replayPath = null;
         exportedReplayPath = null;
+        lastCaptureQuality = null;
         latestStatus.Clear();
         warnedOldAgent = false;
         failedExport = null;
@@ -955,6 +1350,14 @@ internal sealed class RecorderForm : Form
             var wireCommand = command == "start" ? "start:" + ((int)readRate.Value).ToString(System.Globalization.CultureInfo.InvariantCulture) : command;
             var result = await RunJavaAsync("command", directory, wireCommand);
             if (!result.Ok) throw new IOException(result.Text);
+            if (command == "start")
+            {
+                // A new recording must not keep advertising the previous
+                // exported ZIP; the bridge snapshot is also used by ZJ HUB
+                // to decide when the replay list needs refreshing.
+                exportedReplayPath = null;
+                lastCaptureQuality = null;
+            }
             Log(command == "start" ? $"已发送开始录制命令，读取频率 {readRate.Value} tick / 秒。" : command == "stop" ? "已发送停止录制命令，等待文件写入完成。" : "已写入时间线标记。");
         }
         catch (OperationCanceledException) when (closing) { }
@@ -1002,9 +1405,12 @@ internal sealed class RecorderForm : Form
                 return;
             }
             var recording = props.GetValueOrDefault("recording") == "true";
-            var oldAgent = !int.TryParse(props.GetValueOrDefault("agentVersion"), out var agentVersion) || agentVersion < RuntimeAssets.RequiredAgentVersion;
+            var oldAgent = !int.TryParse(props.GetValueOrDefault("agentVersion"), out var agentVersion)
+                || agentVersion < RuntimeAssets.RequiredAgentVersionFor(attachedGameVersion);
             if (oldAgent && !warnedOldAgent)
-                Log("游戏中仍是旧录制组件。已保存的回放可继续导出；请重启网易游戏一次，再手动注入新版以使用修复后的交互声音与裂纹采集。");
+                Log(attachedGameVersion == "1.21.10"
+                    ? "游戏中仍是旧录制组件。已保存的回放可继续导出；停止录制后点击“注入 / 更新组件”，状态确认新版就绪后即可开始。"
+                    : "游戏中仍是旧录制组件。已保存的回放可继续导出；请重启游戏后手动注入新版。");
             warnedOldAgent = oldAgent;
             var currentReplay = props.GetValueOrDefault("replay", "");
             if (!string.Equals(currentReplay, replayPath, StringComparison.OrdinalIgnoreCase))
@@ -1018,7 +1424,8 @@ internal sealed class RecorderForm : Form
             }
             if (!exporting)
                 state.Text = recording ? $"● 录制中 · 读取 {props.GetValueOrDefault("samplingRate", "20")} tick / 秒" : failedExport == replayPath
-                    ? "导出未完成；可点击“导出 / 重试”" : oldAgent ? "请重启游戏一次，以启用新版功能" : props.GetValueOrDefault("state") switch
+                    ? "导出未完成；可点击“导出 / 重试”" : oldAgent ? (CanReloadSelectedAgent()
+                        ? "旧录制组件已停止；点击注入更新后可继续录制" : "旧录制组件尚未更新；请停止录制后更新组件") : props.GetValueOrDefault("state") switch
                     {
                         "ready" or "attached" => "已注入，等待录制",
                         "record-error" when props.GetValueOrDefault("error", "").Contains("Required world snapshot failed", StringComparison.Ordinal)
@@ -1035,16 +1442,16 @@ internal sealed class RecorderForm : Form
                 ? $" · 皮肤 {props["recordedSkins"]} 人 · 皮肤异常 {props.GetValueOrDefault("skinCaptureErrors", "0")}" : "");
             packets.Text = $"{props.GetValueOrDefault("packets", "0")} · 丢失 {props.GetValueOrDefault("packetDrops", "0")} · 异常 {props.GetValueOrDefault("packetErrors", "0")} · 跳过 {props.GetValueOrDefault("packetSkippedCustomPayload", "0")}";
             replay.Text = string.IsNullOrEmpty(replayPath) ? "录制尚未开始" : replayPath;
-            foreach (var key in new[] { "packetError", "error", "captureError", "chunkSnapshotError", "entitySnapshotError", "entityPacketError", "localStateError", "sampleError", "commandError", "worldSnapshotError", "stopWarning", "skinError" })
-                if (props.TryGetValue(key, out var problem) && !string.IsNullOrWhiteSpace(problem))
+            var statusProblems = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var key in new[] { "packetError", "attributeSanitizerError", "error", "captureError", "chunkSnapshotError", "entitySnapshotError", "entityPacketError", "localStateError", "sampleError", "commandError", "worldSnapshotError", "stopWarning", "skinError" })
+                if (props.TryGetValue(key, out var problem) && !string.IsNullOrWhiteSpace(problem) && statusProblems.Add(problem))
                     ReportError("录制器报告 " + key, new IOException(problem));
             if (props.TryGetValue("localEffectsHook", out var effectsHook) && effectsHook.StartsWith("error:", StringComparison.Ordinal))
                 ReportError("本地交互声音采集未就绪；服务器数据包仍保留", new IOException(effectsHook));
             if (int.TryParse(props.GetValueOrDefault("entitySnapshotErrors"), out var entitySnapshotErrors) && entitySnapshotErrors > 0)
                 ReportError("初始实体采集不完整", new IOException("部分实体状态未能保存，请查看本段录制目录中的 status.properties。"));
             ApplyControls();
-            if (!oldAgent && !recording && !busy && !exporting && autoZip.Checked &&
-                props.GetValueOrDefault("state") == "ready" &&
+            if (!busy && !exporting && autoZip.Checked && RecordingLifecycle.CanExportClosed(props) &&
                 !string.IsNullOrEmpty(replayPath) && File.Exists(replayPath))
                 await ExportAsync(replayPath, true);
         }
@@ -1060,7 +1467,7 @@ internal sealed class RecorderForm : Form
 
     async Task ExportAsync(string source, bool automatic)
     {
-        if (diagnosticsOnly || closing || busy || exporting || latestStatus.GetValueOrDefault("recording") == "true") return;
+        if (diagnosticsOnly || closing || bridgeClosingRequested || busy || exporting || latestStatus.GetValueOrDefault("recording") == "true") return;
         if (automatic && !attemptedExports.Add(source)) return;
         attemptedExports.Add(source);
         if (!File.Exists(source)) { ReportError("导出失败", new FileNotFoundException("录制文件不存在。", source)); return; }
@@ -1073,43 +1480,99 @@ internal sealed class RecorderForm : Form
         if (!source.EndsWith(".fbrl", StringComparison.OrdinalIgnoreCase))
         { Log("此录制文件不支持导出，请查看文件格式：" + source); return; }
         exporting = true;
+        using var exportSource = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+        var exportToken = exportSource.Token;
+        Volatile.Write(ref exportCancellation, exportSource);
         state.Text = "正在后台转换并导出…";
         ApplyControls();
         Log(automatic ? "录制文件已关闭，正在后台导出。" : "开始手动导出 / 重试。");
         try
         {
-            var zip = await Task.Run(() =>
+            var work = Task.Run(async () =>
             {
-                var adapted = FlashbackZip.RunProtocolAdapter(source, javaPath, RuntimeAssets.ProtocolAdapter);
-                if (!adapted.Ok) throw new InvalidDataException("1.20.1 → 1.21.11 协议转换失败：" + adapted.Text);
-                var converted = FlashbackZip.Convert(source);
-                return RenameReplayWithDailyId(converted, source);
-            }, lifetime.Token);
-            if (closing) return;
+                var adapted = await FlashbackZip.RunProtocolAdapterAsync(source, javaPath, RuntimeAssets.ProtocolAdapter, exportToken).ConfigureAwait(false);
+                if (!adapted.Ok) throw new InvalidDataException("转换到 Flashback 1.21.11 失败：" + adapted.Text);
+                exportToken.ThrowIfCancellationRequested();
+                var converted = FlashbackZip.Convert(source, skinCacheDirectory, out var quality);
+                exportToken.ThrowIfCancellationRequested();
+                return (Zip: RenameReplayWithDailyId(converted, source), Quality: quality);
+            }, exportToken);
+            activeExportWork = work;
+            var exportResult = await work;
+            if (closing || bridgeClosingRequested) return;
+            var zip = exportResult.Zip;
+            lastCaptureQuality = exportResult.Quality;
             failedExport = null;
             exportedReplayPath = zip;
-            state.Text = "导出完成";
-            Log("已导出 Flashback 1.21.11 文件：" + zip);
+            if (lastCaptureQuality.HasDataLoss)
+            {
+                state.Text = "已导出，但采集不完整";
+                Log("已导出 Flashback 1.21.11 文件，但采集不完整：" + lastCaptureQuality.Summary);
+            }
+            else if (!lastCaptureQuality.Available)
+            {
+                state.Text = "已导出，采集完整性未知";
+                Log("已导出 Flashback 1.21.11 文件，但未找到采集质量报告：" + zip);
+            }
+            else if (lastCaptureQuality.HasCompatibilityLimitations)
+            {
+                state.Text = "导出完成（有跨版本兼容限制）";
+                Log("已导出 Flashback 1.21.11 文件（有跨版本兼容限制）：" + lastCaptureQuality.Summary);
+            }
+            else
+            {
+                state.Text = "导出完成";
+                Log("已导出 Flashback 1.21.11 文件：" + zip);
+            }
             var targetDirectory = flashbackDirectory.Text.Trim();
-            if (targetDirectory.Length > 0)
+            if (!IsFlashbackGameDirectory(targetDirectory))
+            {
+                var detected = FindFlashbackGameDirectory(targetDirectory);
+                if (detected is not null)
+                {
+                    targetDirectory = detected;
+                    flashbackDirectory.Text = detected;
+                    SaveSettings();
+                    Log("已自动找到唯一 Flashback 游戏目录：" + detected);
+                }
+            }
+            if (targetDirectory.Length > 0 && IsFlashbackGameDirectory(targetDirectory))
             {
                 try
                 {
-                    var imported = await Task.Run(() => ImportWithSkins(zip, targetDirectory), lifetime.Token);
-                    Log($"已导入回放：{imported.Path}；皮肤 {imported.Skins.PlayerCount} 人，保留已有皮肤设置 {imported.Skins.PreservedOverrides} 人。");
+                    var imported = await Task.Run(() => ImportWithSkins(zip, targetDirectory, skinCacheDirectory), lifetime.Token);
+                    Log($"已导入回放：{imported.Path}；皮肤 {imported.Skins.PlayerCount} 人，缓存目录：{skinCacheDirectory}，保留已有皮肤设置 {imported.Skins.PreservedOverrides} 人。");
                     foreach (var warning in imported.Skins.Warnings) Log("皮肤提示：" + warning);
                 }
                 catch (Exception ex) { ReportError("回放已导出，但自动安装未完成；可使用“安装回放到 Flashback”重试", ex); }
             }
+            else
+            {
+                state.Text = "已导出；皮肤尚未安装";
+                Log("回放已导出，但未找到唯一 Flashback 游戏目录；请在 ZJ HUB 设置中选择目录后点击“安装已有回放”。");
+            }
         }
         catch (OperationCanceledException) when (closing) { }
+        catch (OperationCanceledException) when (exportToken.IsCancellationRequested)
+        { state.Text = "导出已取消"; Log("已取消导出；原始录制已保留，可稍后重新导出。"); }
         catch (Exception ex)
         {
             failedExport = source;
             ReportError("导出失败", ex);
             state.Text = "导出未完成；可点击“导出 / 重试”";
         }
-        finally { exporting = false; ApplyControls(); }
+        finally
+        {
+            Interlocked.CompareExchange(ref exportCancellation, null, exportSource);
+            exporting = false; activeExportWork = null;
+            if (!closing) ApplyControls();
+        }
+    }
+
+    static string SanitizeMarkerText(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
+        return raw.Replace('\r', ' ').Replace('\n', ' ').Replace('\\', '/').Replace('"', '\'').Trim();
     }
 
     static string RenameReplayWithDailyId(string source, string recordingSource)
@@ -1120,7 +1583,16 @@ internal sealed class RecorderForm : Form
         var expected = new Regex("^(?<count>[0-9]+)-" + Regex.Escape(date) + "\\.flashback\\.zip$",
             RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
-        var runtimeRoot = file.Directory?.Parent?.Parent;
+        DirectoryInfo? runtimeRoot = null;
+        for (var cursor = file.Directory; cursor is not null; cursor = cursor.Parent)
+        {
+            if (string.Equals(cursor.Name, ".flashback-runtime", StringComparison.OrdinalIgnoreCase))
+            {
+                runtimeRoot = cursor;
+                break;
+            }
+        }
+        runtimeRoot ??= file.Directory;
         var sourceHash = string.Empty;
         try
         {
@@ -1134,8 +1606,19 @@ internal sealed class RecorderForm : Form
             var existing = FindReplayForSource(runtimeRoot, sourceHash, expected);
             if (existing is not null && !string.Equals(existing.FullName, source, StringComparison.OrdinalIgnoreCase))
             {
-                File.Move(source, existing.FullName, overwrite: true);
-                return existing.FullName;
+                try
+                {
+                    // Re-exporting the same recording normally replaces the
+                    // previous deterministic archive.  Flashback or an
+                    // archive preview can keep that file open, though; the
+                    // converted ZIP is already valid and must not be reported
+                    // as a failed export just because this optional de-dupe
+                    // move was denied.
+                    File.Move(source, existing.FullName, overwrite: true);
+                    return existing.FullName;
+                }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
             }
         }
         if (expected.IsMatch(file.Name)) return source;
@@ -1212,6 +1695,9 @@ internal sealed class RecorderForm : Form
     static bool IsReusableSessionState(string? status) => IsStartReadyState(status) || status is
         "recording" or "capturing-snapshot" or "waiting-for-minecraft";
 
+    bool CanReloadSelectedAgent() => stateDir is not null && selected?.Identity == attachedProcessKey
+        && RecordingLifecycle.CanReload(attachedGameVersion, warnedOldAgent, latestStatus);
+
     void ApplyControls()
     {
         if (closing || IsDisposed) return;
@@ -1221,21 +1707,23 @@ internal sealed class RecorderForm : Form
         var sessionReady = stateDir is not null && IsStartReadyState(sessionState);
         var capturingSnapshot = stateDir is not null && sessionState == "capturing-snapshot";
         var waitingForMinecraft = stateDir is not null && sessionState == "waiting-for-minecraft";
-        inject.Enabled = !diagnosticsOnly && assetsReady && !operation && !scanning && stateDir is null && selected?.Supported == true;
-        start.Enabled = !diagnosticsOnly && !operation && !recording && sessionReady && !warnedOldAgent;
+        inject.Enabled = !diagnosticsOnly && assetsReady && javaPath.Length > 0 && !operation && !scanning
+            && (stateDir is null || CanReloadSelectedAgent()) && selected?.Supported == true;
+        start.Enabled = !diagnosticsOnly && javaPath.Length > 0 && !operation && !recording && sessionReady && !warnedOldAgent;
         stop.Enabled = mark.Enabled = !diagnosticsOnly && !operation && recording;
-        export.Enabled = !diagnosticsOnly && assetsReady && !operation && !recording && !string.IsNullOrEmpty(replayPath) && File.Exists(replayPath);
+        export.Enabled = !diagnosticsOnly && assetsReady && javaPath.Length > 0 && !operation && !recording && !string.IsNullOrEmpty(replayPath) && File.Exists(replayPath);
         refresh.Enabled = !scanning && !operation;
         processes.Enabled = !operation;
-        browse.Enabled = output.Enabled = !operation && stateDir is null;
+        browse.Enabled = output.Enabled = !operation &&
+            (stateDir is null || (!recording && !capturingSnapshot));
         browseFlashback.Enabled = flashbackDirectory.Enabled = !operation;
         importReplay.Enabled = !diagnosticsOnly && !operation;
         marker.Enabled = !operation && recording;
         autoZip.Enabled = !operation;
         readRate.Enabled = !operation && !recording && !capturingSnapshot;
         open.Enabled = Directory.Exists(output.Text);
-        inject.Text = stateDir is null ? "注入选中游戏" : "已注入当前游戏";
-        inject.Description = stateDir is null ? "手动加载录制组件" : recording ? "已连接，正在录制" : "无需重复注入";
+        inject.Text = CanReloadSelectedAgent() ? "注入 / 更新组件" : stateDir is null ? "注入选中游戏" : "已注入当前游戏";
+        inject.Description = CanReloadSelectedAgent() ? "更新已停止的旧组件，保留录制文件" : stateDir is null ? "手动加载录制组件" : recording ? "已连接，正在录制" : "无需重复注入";
         start.Description = recording ? "本段录制正在进行" : capturingSnapshot ? "正在保存初始世界，请稍候" : waitingForMinecraft ? "等待客户端就绪后可用" : stateDir is null ? "请先注入选中游戏" : "从现在开始保存游戏";
         stop.Description = recording ? "结束本段并保存文件" : "录制开始后可用";
         export.Description = recording ? "停止录制后可用" : "重新转换最近一次录制";
@@ -1244,14 +1732,16 @@ internal sealed class RecorderForm : Form
             : exporting ? "正在生成回放文件，请等待导出完成。"
             : busy ? "正在执行操作，请稍候…"
             : recording ? $"已注入 PID {pidLabel.Text} · 正在录制，读取 {latestStatus.GetValueOrDefault("samplingRate", "20")} tick / 秒。点击“停止录制”保存本段。"
-            : stateDir is not null && warnedOldAgent ? "当前游戏仍加载旧组件；请重启游戏，再手动点击“注入选中游戏”。"
+            : stateDir is not null && warnedOldAgent ? (CanReloadSelectedAgent()
+                ? "点击“注入 / 更新组件”加载新版，确认就绪后再开始录制；已有文件保留。"
+                : "当前游戏仍加载旧组件；请停止录制后更新组件。不支持重载的版本需重启游戏。")
             : capturingSnapshot ? "正在保存初始世界快照，请等待完成；本段读取频率已固定，无需重复开始或注入。"
             : waitingForMinecraft ? "已注入，正在等待 Minecraft 客户端初始化；就绪后可开始录制，无需重复注入。"
             : sessionReady ? $"已注入 PID {pidLabel.Text} · 点击“开始录制”即可录制，无需重复注入。"
             : stateDir is not null ? "注入请求已发送，正在等待录制组件就绪。"
             : selected?.Supported == true ? $"手动注入模式 · 已选中 PID {selected.Pid}。点击“注入选中游戏”后才能录制。"
-            : processes.Items.Count > 0 ? "手动注入模式 · 请选择 Minecraft 1.20.1；1.21.11 客户端用于播放回放。"
-            : "手动注入模式 · 未检测到游戏。启动 Minecraft 1.20.1 后会自动检测，注入需要手动点击。";
+            : processes.Items.Count > 0 ? "手动注入模式 · 支持 Minecraft 1.20.1 / 1.21.10；1.21.11 客户端用于播放回放。"
+            : "手动注入模式 · 未检测到游戏。启动 Minecraft 1.20.1 / 1.21.10 后会自动检测，注入需要手动点击。";
     }
 
     async Task ImportExistingReplayAsync()
@@ -1260,11 +1750,12 @@ internal sealed class RecorderForm : Form
         using var dialog = new OpenFileDialog { Filter = "Flashback 回放 (*.zip)|*.zip", Title = "选择要安装的回放 ZIP（请先在游戏中退出该回放）" };
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
         var target = flashbackDirectory.Text.Trim();
-        if (target.Length == 0) { Log("请先选择装有完整版 Flashback 的回放游戏目录。"); return; }
+        if (!IsFlashbackGameDirectory(target)) target = FindFlashbackGameDirectory(target) ?? "";
+        if (target.Length == 0) { Log("未找到唯一 Flashback 游戏目录，请先在设置中选择回放目录。"); return; }
         busy = true; ApplyControls();
         try
         {
-            var result = await Task.Run(() => ImportWithSkins(dialog.FileName, target), lifetime.Token);
+            var result = await Task.Run(() => ImportWithSkins(dialog.FileName, target, skinCacheDirectory), lifetime.Token);
             Log($"已导入：{result.Path}；保存皮肤 {result.Skins.PlayerCount} 人，保留已有皮肤设置 {result.Skins.PreservedOverrides} 人。");
             foreach (var warning in result.Skins.Warnings) Log("皮肤提示：" + warning);
             SaveSettings();
@@ -1274,7 +1765,7 @@ internal sealed class RecorderForm : Form
         finally { busy = false; ApplyControls(); }
     }
 
-    internal static (string Path, RecordedSkins.InstallResult Skins) ImportWithSkins(string zip, string gameDir)
+    internal static (string Path, RecordedSkins.InstallResult Skins) ImportWithSkins(string zip, string gameDir, string? cacheDirectory = null)
     {
         gameDir = Path.GetFullPath(gameDir);
         var mods = Path.Combine(gameDir, "mods");
@@ -1297,7 +1788,7 @@ internal sealed class RecorderForm : Form
                 using var original = File.OpenRead(zip);
                 using var existing = File.OpenRead(destination);
                 if (System.Security.Cryptography.SHA256.HashData(original).AsSpan().SequenceEqual(System.Security.Cryptography.SHA256.HashData(existing)))
-                    return (destination, RecordedSkins.InstallFromReplay(zip, gameDir));
+                    return (destination, RecordedSkins.InstallFromReplay(zip, gameDir, cacheDirectory));
                 destination = Path.Combine(destinationDir, Path.GetFileNameWithoutExtension(zip) + "-" + replayId.ToString("N") + ".zip");
             }
             // Never replace a different replay that the editor may have open.
@@ -1315,7 +1806,7 @@ internal sealed class RecorderForm : Form
                 finally { if (File.Exists(temporary)) File.Delete(temporary); }
             }
         }
-        try { return (destination, RecordedSkins.InstallFromReplay(zip, gameDir)); }
+        try { return (destination, RecordedSkins.InstallFromReplay(zip, gameDir, cacheDirectory)); }
         catch (Exception ex) { throw new IOException("回放文件已保留在目标目录，但皮肤安装未完成：" + destination + "。" + ex.Message, ex); }
     }
 
@@ -1339,8 +1830,11 @@ internal sealed class RecorderForm : Form
     {
         if (closing || IsDisposed) { Diagnostics.Write(context, error); return; }
         var key = context + ":" + error.GetType().Name + ":" + error.Message;
-        bridgeErrorSequence++;
-        bridgeLastError = context + "：" + error.Message;
+        if (BridgeErrorClassifier.IsCommandFailure(context))
+        {
+            bridgeCommandErrorSequence++;
+            bridgeLastError = context + "：" + error.Message;
+        }
         if (reportedErrors.Count > 512) reportedErrors.Clear();
         if (!reportedErrors.Add(key)) return;
         Diagnostics.Write(context, error);
@@ -1350,24 +1844,93 @@ internal sealed class RecorderForm : Form
 
     void LoadSettings()
     {
-        output.Text = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyVideos), "FlashbackRecorder");
-        var knownTarget = @"D:\PCL\.minecraft\versions\ZJ HUB";
-        if (Directory.Exists(Path.Combine(knownTarget, "mods"))) flashbackDirectory.Text = knownTarget;
+        var videos = Environment.GetFolderPath(Environment.SpecialFolder.MyVideos, Environment.SpecialFolderOption.DoNotVerify);
+        if (string.IsNullOrWhiteSpace(videos))
+            videos = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Videos");
+        output.Text = Path.GetFullPath(Path.Combine(videos, "FlashbackRecorder"));
+        var hasTargetSetting = false;
+        string? configuredTarget = null;
         try
         {
-            if (!File.Exists(settingsPath)) return;
-            using var json = JsonDocument.Parse(File.ReadAllText(settingsPath));
-            if (json.RootElement.TryGetProperty("output", out var value) && value.ValueKind == JsonValueKind.String)
-                output.Text = value.GetString() ?? output.Text;
-            if (json.RootElement.TryGetProperty("flashbackDirectory", out var target) && target.ValueKind == JsonValueKind.String)
-                flashbackDirectory.Text = target.GetString() ?? "";
-            if (json.RootElement.TryGetProperty("readRate", out var rate) && rate.ValueKind == JsonValueKind.Number && rate.TryGetInt32(out var valueRate))
-                readRate.Value = Math.Clamp(valueRate, 20, 120);
-            if (json.RootElement.TryGetProperty("autoZip", out var zip) &&
-                (zip.ValueKind is JsonValueKind.True or JsonValueKind.False))
-                autoZip.Checked = zip.GetBoolean();
+            if (File.Exists(settingsPath))
+            {
+                using var json = JsonDocument.Parse(File.ReadAllText(settingsPath));
+                if (json.RootElement.TryGetProperty("output", out var value) && value.ValueKind == JsonValueKind.String)
+                    output.Text = value.GetString() ?? output.Text;
+                if (json.RootElement.TryGetProperty("flashbackDirectory", out var target) && target.ValueKind == JsonValueKind.String)
+                {
+                    hasTargetSetting = true;
+                    configuredTarget = target.GetString() ?? "";
+                    flashbackDirectory.Text = configuredTarget;
+                }
+                // Session cache paths are never restored from migrated settings.
+                if (json.RootElement.TryGetProperty("readRate", out var rate) && rate.ValueKind == JsonValueKind.Number && rate.TryGetInt32(out var valueRate))
+                    readRate.Value = Math.Clamp(valueRate, 20, 120);
+                if (json.RootElement.TryGetProperty("autoZip", out var zip) &&
+                    (zip.ValueKind is JsonValueKind.True or JsonValueKind.False))
+                    autoZip.Checked = zip.GetBoolean();
+            }
+            // Settings contain an absolute path.  When the same settings file
+            // is copied to another PC, the old drive or username may no longer
+            // exist.  Prefer a valid local Flashback installation, otherwise
+            // clear the stale path so automatic skin installation does not
+            // silently target the old computer.
+            // An explicitly empty field is the user's opt-out.  Preserve it;
+            // otherwise a restart would silently turn automatic installation
+            // back on.  A non-empty stale path is safe to replace only when
+            // exactly one local Flashback instance can be identified.
+            if (!(hasTargetSetting && string.IsNullOrWhiteSpace(configuredTarget)))
+            {
+                var resolved = FindFlashbackGameDirectory(flashbackDirectory.Text);
+                if (resolved != null) flashbackDirectory.Text = resolved;
+                else if (hasTargetSetting && !string.IsNullOrWhiteSpace(configuredTarget))
+                    flashbackDirectory.Clear();
+            }
         }
         catch (Exception ex) { ReportError("读取设置失败，已使用默认目录", ex); }
+    }
+
+    static bool IsFlashbackGameDirectory(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return false;
+        try
+        {
+            var mods = Path.Combine(Path.GetFullPath(path), "mods");
+            return Directory.Exists(mods) && Directory.EnumerateFiles(mods, "*.jar", SearchOption.TopDirectoryOnly)
+                .Any(file => Path.GetFileName(file).Contains("flashback", StringComparison.OrdinalIgnoreCase));
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException or NotSupportedException)
+        { return false; }
+    }
+
+    static string? FindFlashbackGameDirectory(string? preferred)
+    {
+        if (IsFlashbackGameDirectory(preferred)) return Path.GetFullPath(preferred!);
+        var candidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        void Add(string? path)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return;
+            try { candidates.Add(Path.GetFullPath(path)); }
+            catch (Exception ex) when (ex is ArgumentException or NotSupportedException) { }
+        }
+        var roaming = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        Add(Path.Combine(roaming, ".minecraft"));
+        Add(Path.Combine(profile, ".minecraft"));
+        foreach (var root in candidates.ToArray())
+        {
+            Add(root);
+            var versions = Path.Combine(root, "versions");
+            try
+            {
+                if (Directory.Exists(versions))
+                    foreach (var version in Directory.EnumerateDirectories(versions, "*", SearchOption.TopDirectoryOnly)) Add(version);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+        }
+        var valid = candidates.Where(IsFlashbackGameDirectory)
+            .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        return valid.Length == 1 ? valid[0] : null;
     }
     void SaveSettings()
     {
@@ -1376,7 +1939,8 @@ internal sealed class RecorderForm : Form
             Directory.CreateDirectory(Path.GetDirectoryName(settingsPath)!);
             var temporary = settingsPath + "." + Environment.ProcessId + ".tmp";
             File.WriteAllText(temporary, JsonSerializer.Serialize(new { output = output.Text,
-                flashbackDirectory = flashbackDirectory.Text, readRate = (int)readRate.Value,
+                flashbackDirectory = flashbackDirectory.Text,
+                readRate = (int)readRate.Value,
                 autoZip = autoZip.Checked }));
             File.Move(temporary, settingsPath, overwrite: true);
         }

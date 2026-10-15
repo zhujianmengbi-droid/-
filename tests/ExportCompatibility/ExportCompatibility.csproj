@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>ExportCompatibility</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../flashback_engine/FlashbackZip.cs" Link="FlashbackZip.cs" />
+    <Compile Include="../../flashback_engine/RecordedSkins.cs" Link="RecordedSkins.cs" />
+    <Compile Include="../../flashback_engine/CaptureQuality.cs" Link="CaptureQuality.cs" />
+    <Compile Include="../../flashback_engine/ChildProcess.cs" Link="ChildProcess.cs" />
+  </ItemGroup>
+</Project>

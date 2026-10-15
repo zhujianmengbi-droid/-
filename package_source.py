@@ -8,22 +8,56 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parent
 SOURCE_FILES = (
-    'main_large.py', 'main.py', 'bugland_api.py',
-    'match_data.py', 'optimizer.py', 'startup_motion.py',
-    'taskbar_switcher_core.py', 'lobby_server.py',
+    'main_large.py', 'main.py', 'onboarding.py', 'bugland_api.py',
+    'match_data.py', 'optimizer.py', 'startup_motion.py', 'runtime_paths.py', 'new_pc_check.py',
+    'ui_preferences.py', 'scroll_motion.py', 'ui_controls.py', 'theme_redesign.py',
+    'taskbar_switcher_core.py', 'lobby_server.py', 'replay_catalog.py',
     'companion_pack.py', 'companions/ZJ-HUB-modpack.zip', 'companions/README.md',
-    'build_large.py', 'package_source.py', '电脑优化中心.spec',
+    'build_large.py', 'package_source.py', 'zj_hub.spec',
     'make_icon.py', 'app.ico', 'zj_hub_icon.png',
     'requirements.txt', 'requirements-chat.txt', 'render.yaml',
     'README.md', 'README.txt',
     'flashback_engine/Program.cs', 'flashback_engine/FlashbackZip.cs',
+    'flashback_engine/CaptureQuality.cs',
     'flashback_engine/RecordedSkins.cs', 'flashback_engine/RecorderButton.cs',
-    'flashback_engine/RuntimeSupport.cs', 'flashback_engine/app.manifest',
+    'flashback_engine/RuntimeSupport.cs', 'flashback_engine/ChildProcess.cs',
+    'flashback_engine/NativeProcessModules.cs', 'flashback_engine/app.manifest',
+    'flashback_engine/JavaRuntimeProbe.cs',
     'flashback_engine/FlashbackRecorder.csproj', 'flashback_engine/README.md',
     'flashback_engine/runtime/runtime-recorder-cli.jar',
-    'flashback_engine/runtime/runtime-recorder-agent-v12.jar',
-    'flashback_engine/runtime/flashback-protocol-adapter-v5.jar',
+    'flashback_engine/runtime/runtime-recorder-agent-v13.jar',
+    'flashback_engine/runtime/runtime-recorder-agent-1.21.10-v2.jar',
+    'flashback_engine/runtime/flashback-protocol-adapter-v6.jar',
 )
+
+# Include the new runtime implementations and their focused checks, without
+# compiler output, game files, recordings, or local dependency argument files.
+SOURCE_TREES = (
+    'flashback_engine/java-cli',
+    'flashback_engine/java-modern-agent',
+    'flashback_engine/java-modern-adapter',
+    'tests/GameDiscovery',
+    'tests/ExportCompatibility',
+    'tests/LobbySecurity',
+    'tests/BridgeLifecycle',
+    'tests/NewComputer',
+    'tests/UiPreferences',
+)
+
+
+def source_paths():
+    paths = [(name, ROOT / name) for name in SOURCE_FILES]
+    for directory in SOURCE_TREES:
+        base = ROOT / directory
+        if not base.is_dir():
+            raise RuntimeError('缺少适配源码目录：' + directory)
+        for path in sorted(base.rglob('*')):
+            relative = path.relative_to(base)
+            if any(part in {'bin', 'obj', 'build', '__pycache__'} for part in relative.parts):
+                continue
+            if path.is_file() and path.suffix in {'.java', '.ps1', '.cs', '.csproj', '.py', '.md'}:
+                paths.append((path.relative_to(ROOT).as_posix(), path))
+    return paths
 
 
 def app_version():
@@ -58,7 +92,7 @@ def main():
     if args.version:
         print(version)
         return
-    paths = [(name, ROOT / name) for name in SOURCE_FILES]
+    paths = source_paths()
     missing = [name for name, path in paths if not path.is_file()]
     if missing:
         raise RuntimeError('无法生成完整源码包，缺少：' + ', '.join(missing))
